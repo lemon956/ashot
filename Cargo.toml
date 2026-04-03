@@ -1,0 +1,48 @@
+[workspace]
+members = [
+    "ashot-app",
+    "ashot-capture",
+    "ashot-cli",
+    "ashot-core",
+    "ashot-ipc",
+]
+default-members = [
+    "ashot-core",
+    "ashot-ipc",
+    "ashot-capture",
+    "ashot-cli",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+authors = ["Codex"]
+repository = "https://example.invalid/ashot"
+
+[workspace.dependencies]
+anyhow = "1.0.100"
+ashpd = { version = "0.12.3", default-features = false, features = ["tokio"] }
+chrono = { version = "0.4.42", features = ["clock", "serde"] }
+clap = { version = "4.5.50", features = ["derive"] }
+directories = "6.0.0"
+font8x8 = "0.3.1"
+gio = "0.20.12"
+glib = "0.20.12"
+gtk4 = "0.9.7"
+image = { version = "0.25.8", default-features = false, features = ["jpeg", "png"] }
+libadwaita = "0.7.2"
+once_cell = "1.21.3"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+tempfile = "3.23.0"
+thiserror = "2.0.17"
+tokio = { version = "1.48.0", features = ["macros", "rt-multi-thread", "sync", "time", "process"] }
+toml = "0.9.8"
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.20", features = ["env-filter", "fmt"] }
+url = { version = "2.5.7", features = ["serde"] }
+uuid = { version = "1.18.1", features = ["serde", "v4"] }
+zbus = { version = "5.14.0", features = ["tokio"] }
+zvariant = "5.10.0"

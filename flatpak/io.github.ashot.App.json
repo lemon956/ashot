@@ -1,0 +1,35 @@
+{
+  "app-id": "io.github.ashot.App",
+  "runtime": "org.gnome.Platform",
+  "runtime-version": "49",
+  "sdk": "org.gnome.Sdk",
+  "command": "ashot-app",
+  "finish-args": [
+    "--share=ipc",
+    "--socket=wayland",
+    "--socket=fallback-x11",
+    "--filesystem=xdg-pictures",
+    "--own-name=io.github.ashot.Service",
+    "--talk-name=org.freedesktop.portal.Desktop",
+    "--device=dri"
+  ],
+  "modules": [
+    {
+      "name": "ashot",
+      "buildsystem": "simple",
+      "build-commands": [
+        "install -Dm755 target/release/ashot-app /app/bin/ashot-app",
+        "install -Dm755 target/release/ashot-cli /app/bin/ashot",
+        "install -Dm644 packaging/io.github.ashot.App.desktop /app/share/applications/io.github.ashot.App.desktop",
+        "install -Dm644 packaging/io.github.ashot.App.metainfo.xml /app/share/metainfo/io.github.ashot.App.metainfo.xml",
+        "install -Dm644 packaging/io.github.ashot.App.svg /app/share/icons/hicolor/scalable/apps/io.github.ashot.App.svg"
+      ],
+      "sources": [
+        {
+          "type": "dir",
+          "path": ".."
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,20 @@
+[package]
+name = "ashot-capture"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+ashot-ipc = { path = "../ashot-ipc" }
+futures-util = "0.3.31"
+serde.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+url.workspace = true
+uuid.workspace = true
+zbus.workspace = true
+zvariant.workspace = true

@@ -1,0 +1,17 @@
+[package]
+name = "ashot-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+ashot-ipc = { path = "../ashot-ipc" }
+clap.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+url.workspace = true
+zbus.workspace = true

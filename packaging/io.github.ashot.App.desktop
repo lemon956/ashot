@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=aShot
+Comment=Wayland-native screenshot workflow for GNOME
+Exec=ashot-app
+Icon=io.github.ashot.App
+Terminal=false
+Type=Application
+Categories=Utility;Graphics;GTK;
+StartupNotify=true

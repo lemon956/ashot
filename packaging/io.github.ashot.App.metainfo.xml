@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.ashot.App</id>
+  <name>aShot</name>
+  <summary>Wayland-native screenshot workflow for GNOME</summary>
+  <metadata_license>MIT</metadata_license>
+  <project_license>MIT</project_license>
+  <description>
+    <p>aShot is a lightweight screenshot tool designed around GNOME, Wayland, and the screenshot portal.</p>
+    <p>It combines native capture, lightweight annotation, clipboard export, and pin-to-screen previews.</p>
+  </description>
+  <launchable type="desktop-id">io.github.ashot.App.desktop</launchable>
+  <categories>
+    <category>Graphics</category>
+    <category>Utility</category>
+  </categories>
+</component>
