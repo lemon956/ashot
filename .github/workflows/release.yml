@@ -15,6 +15,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install flatpak-builder
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y flatpak-builder
+
       - name: Install Rust
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
@@ -22,7 +27,10 @@ jobs:
       - name: Install Flatpak runtime
         run: |
           flatpak remote-add --user --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo
-          flatpak install --user -y flathub org.gnome.Platform//49 org.gnome.Sdk//49
+          flatpak install --user -y flathub \
+            org.gnome.Platform//49 \
+            org.gnome.Sdk//49 \
+            org.freedesktop.Sdk.Extension.rust-stable//25.08
 
       - name: Prepare vendor directory
         run: |
@@ -37,9 +45,17 @@ jobs:
             --force-clean \
             --disable-rofiles-fuse \
             --install-deps-from=flathub \
+            --repo=build-flatpak/repo \
             -y \
             build-flatpak \
             flatpak/io.github.ashot.App.json
+
+      - name: Create Flatpak bundle
+        run: |
+          flatpak build-bundle \
+            build-flatpak/repo \
+            build-flatpak/io.github.ashot.App.flatpak \
+            io.github.ashot.App
 
       - name: Prepare repo
         run: |
