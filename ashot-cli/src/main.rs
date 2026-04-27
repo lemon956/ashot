@@ -284,12 +284,12 @@ fn resolve_app_binary() -> Result<PathBuf> {
         return Ok(PathBuf::from(path));
     }
 
-    if let Ok(current) = env::current_exe() {
-        if let Some(parent) = current.parent() {
-            let sibling = parent.join("ashot-app");
-            if sibling.exists() {
-                return Ok(sibling);
-            }
+    if let Ok(current) = env::current_exe()
+        && let Some(parent) = current.parent()
+    {
+        let sibling = parent.join("ashot-app");
+        if sibling.exists() {
+            return Ok(sibling);
         }
     }
 

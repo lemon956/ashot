@@ -15,23 +15,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Get version
-        id: version
-        run: echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
-
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libgtk-4-dev \
-            libadwaita-1-dev \
-            libglib2.0-dev \
-            pkg-config \
-            libssl-dev
-
-      - name: Install flatpak-builder
-        run: sudo apt-get update && sudo apt-get install -y flatpak-builder
-
       - name: Install Flatpak runtime
         run: |
           flatpak remote-add --user --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo
@@ -55,16 +38,23 @@ jobs:
             build-flatpak \
             flatpak/io.github.ashot.App.json
 
-      - name: Create SBOM
+      - name: Prepare repo
         run: |
-          echo "$VERSION" > build-flatpak/version.txt
           mkdir -p build-flatpak/repo
-          flatpak build-update-repo --title="aShot $VERSION" build-flatpak/repo
+          flatpak build-update-repo build-flatpak/repo
+
+      - name: Create changelog
+        run: |
+          if [ -f CHANGELOG.md ]; then
+            cp CHANGELOG.md /tmp/changelog.md
+          else
+            git log --pretty=format:"- %s" -10 > /tmp/changelog.md
+          fi
 
       - name: Upload to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          body_path: CHANGELOG.md
+          body_path: /tmp/changelog.md
           files: |
             build-flatpak/io.github.ashot.App.flatpak
             build-flatpak/repo/*
