@@ -23,7 +23,8 @@
     "--talk-name=org.freedesktop.DBus",
     "--talk-name=org.freedesktop.portal.Desktop",
     "--talk-name=org.freedesktop.Flatpak",
-    "--device=dri"
+    "--device=dri",
+    "--filesystem=/tmp"
   ],
   "modules": [
     {
