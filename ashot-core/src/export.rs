@@ -282,10 +282,10 @@ fn pixelate_region(image: &mut RgbaImage, rect: Rect, pixel_size: u32) {
             }
             if count > 0 {
                 let average = Rgba([
-                    (total[0] / count) as u8,
-                    (total[1] / count) as u8,
-                    (total[2] / count) as u8,
-                    (total[3] / count) as u8,
+                    (total[0] / count).min(u8::MAX as u32) as u8,
+                    (total[1] / count).min(u8::MAX as u32) as u8,
+                    (total[2] / count).min(u8::MAX as u32) as u8,
+                    (total[3] / count).min(u8::MAX as u32) as u8,
                 ]);
                 for yy in y..y_limit {
                     for xx in x..x_limit {
@@ -337,10 +337,10 @@ fn blur_region(image: &mut RgbaImage, rect: Rect, radius: u32) {
                     x,
                     y,
                     Rgba([
-                        (total[0] / count) as u8,
-                        (total[1] / count) as u8,
-                        (total[2] / count) as u8,
-                        (total[3] / count) as u8,
+                        (total[0] / count).min(u8::MAX as u32) as u8,
+                        (total[1] / count).min(u8::MAX as u32) as u8,
+                        (total[2] / count).min(u8::MAX as u32) as u8,
+                        (total[3] / count).min(u8::MAX as u32) as u8,
                     ]),
                 );
             }

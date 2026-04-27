@@ -321,12 +321,11 @@ impl Document {
 
     pub fn update_text_annotation(&mut self, id: AnnotationId, text: String) -> bool {
         if let Some(annotation) = self.annotations.iter_mut().find(|annotation| annotation.id == id)
+            && let AnnotationData::Text { text: current, .. } = &mut annotation.data
         {
-            if let AnnotationData::Text { text: current, .. } = &mut annotation.data {
-                *current = text;
-                self.selected = Some(id);
-                return true;
-            }
+            *current = text;
+            self.selected = Some(id);
+            return true;
         }
         false
     }
