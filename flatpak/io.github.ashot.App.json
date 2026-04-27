@@ -27,8 +27,6 @@
       "name": "ashot",
       "buildsystem": "simple",
       "build-commands": [
-        "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable",
-        ". $HOME/.cargo/env",
         "cargo --offline build --release --locked -p ashot-app -p ashot-cli",
         "install -Dm755 target/release/ashot-app /app/bin/ashot-app",
         "install -Dm755 target/release/ashot-cli /app/bin/ashot",
