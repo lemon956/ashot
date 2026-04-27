@@ -7,7 +7,7 @@ authors.workspace = true
 repository.workspace = true
 
 [features]
-default = []
+default = ["gtk-ui"]
 gtk-ui = [
     "dep:gio",
     "dep:glib",

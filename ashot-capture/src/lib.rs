@@ -52,13 +52,9 @@ impl CaptureClient {
         mode: CaptureMode,
         parent_window: Option<&str>,
     ) -> Result<Url, CaptureError> {
-        let screenshot = Proxy::new(
-            &self.connection,
-            DESKTOP_DESTINATION,
-            DESKTOP_PATH,
-            SCREENSHOT_INTERFACE,
-        )
-        .await?;
+        let screenshot =
+            Proxy::new(&self.connection, DESKTOP_DESTINATION, DESKTOP_PATH, SCREENSHOT_INTERFACE)
+                .await?;
         let options = ScreenshotOptions::new(mode);
         let request_path: OwnedObjectPath =
             screenshot.call("Screenshot", &(parent_window.unwrap_or(""), options)).await?;
@@ -82,10 +78,9 @@ impl CaptureClient {
                 let uri_value = results
                     .get("uri")
                     .ok_or_else(|| CaptureError::InvalidResponse("missing `uri` result".into()))?;
-                let uri_string =
-                    String::try_from(uri_value.clone()).map_err(|error| {
-                        CaptureError::InvalidResponse(format!("invalid `uri` value: {error}"))
-                    })?;
+                let uri_string = String::try_from(uri_value.clone()).map_err(|error| {
+                    CaptureError::InvalidResponse(format!("invalid `uri` value: {error}"))
+                })?;
                 let uri = Url::parse(&uri_string)
                     .map_err(|error| CaptureError::InvalidResponse(error.to_string()))?;
                 if uri.scheme() != "file" {
@@ -117,5 +112,23 @@ impl ScreenshotOptions {
             modal: Some(true),
             interactive: Some(!matches!(mode, CaptureMode::Screen)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use ashot_ipc::CaptureMode;
+
+    use super::ScreenshotOptions;
+
+    #[test]
+    fn portal_picker_is_interactive_for_area_and_window_capture() {
+        assert_eq!(ScreenshotOptions::new(CaptureMode::Area).interactive, Some(true));
+        assert_eq!(ScreenshotOptions::new(CaptureMode::Window).interactive, Some(true));
+    }
+
+    #[test]
+    fn portal_picker_is_not_interactive_for_fullscreen_capture() {
+        assert_eq!(ScreenshotOptions::new(CaptureMode::Screen).interactive, Some(false));
     }
 }

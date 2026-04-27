@@ -2,7 +2,7 @@
 
 ## Summary
 
-`aShot` is split into small crates so the GNOME/Wayland-sensitive pieces stay isolated from the portable core logic.
+`aShot` is split into small Rust crates so system screenshot capture, DBus integration, GTK UI, and portable annotation/export logic remain separated. The current architecture is portal-first and no longer depends on a GNOME Shell extension.
 
 ## Crates
 
@@ -11,26 +11,28 @@
 - Owns `AppConfig`
 - Owns the annotation/document model
 - Owns undo/redo snapshots
-- Owns final PNG rendering and mosaic application
+- Owns final PNG rendering for Flameshot-style local editing tools
 - Avoids GTK-specific dependencies so rendering and tests stay fast
 
 ### `ashot-ipc`
 
 - Defines DBus constants:
-  - service name `io.github.ashot.App`
+  - service name `io.github.ashot.Service`
   - object path `/io/github/ashot/App`
+  - interface `io.github.ashot.App`
 - Defines serializable operation outcomes
 - Generates the client proxy used by `ashot-cli`
 
 ### `ashot-capture`
 
-- Wraps the screenshot portal using `ashpd`
-- Maps product capture modes to portal request settings
+- Wraps the system screenshot portal
+- Uses interactive portal mode for area/window capture
+- Uses non-interactive portal mode for fullscreen capture
 - Returns a file URI that the editor and pin window can consume
 
 ### `ashot-cli`
 
-- Parses capture and helper commands
+- Parses Flameshot-style commands: `gui`, `full`, `screen`, `launcher`, and `config`
 - Connects to the DBus service
 - Best-effort launches `ashot-app --service` when the service is not yet running
 - Returns meaningful exit codes for cancelled/busy/unsupported/failure states
@@ -44,13 +46,14 @@
 
 ## Data Flow
 
-1. `ashot capture area` runs in the CLI.
-2. The CLI connects to the DBus service and requests a capture.
-3. `ashot-app` uses `ashot-capture` to call the screenshot portal.
-4. The portal returns a file URI.
-5. `ashot-app` optionally opens the editor with that image.
-6. The editor mutates an `ashot-core::Document`.
-7. Saving or pinning renders the document back into a PNG via `ashot-core`.
+1. `ashot gui` runs in the CLI.
+2. The CLI ensures the DBus service is available.
+3. `ashot-app` calls `ashot-capture`.
+4. `ashot-capture` asks the system screenshot portal for an interactive area capture.
+5. The portal returns a file URI.
+6. `ashot-app` opens the GTK editor with that image.
+7. The editor mutates an `ashot-core::Document`.
+8. Saving, copying, or pinning renders the document back into a PNG via `ashot-core`.
 
 ## Editor Model
 
@@ -58,9 +61,10 @@
 - Overlay annotations are tracked separately
 - Undo/redo stores lightweight snapshots of the annotation list
 - Export is a rasterization pass over the immutable base image plus overlays
+- Supported local tools include text, line, arrow, brush, rectangle, ellipse, marker, mosaic, blur, counter, and filled boxes
 
 ## Known Gaps
 
-- The GTK feature could not be compile-validated in this environment because the machine does not provide `gtk4` and `libadwaita-1` development files.
+- `--region`, `--last-region`, and geometry printing depend on desktop support that is not yet implemented.
+- Upload and tray behavior are intentionally not implemented in this migration pass.
 - The current text tool uses a blocking prompt dialog and should later move to a better inline editing affordance.
-- Tray/AppIndicator support is intentionally not hard-required and is not yet implemented in this first repository pass.

@@ -1,4 +1,6 @@
 /target
+/build-flatpak
 /.flatpak-builder
-Cargo.lock
-
+/.superpowers
+/flatpak/vendor
+/flatpak/cargo-config.toml

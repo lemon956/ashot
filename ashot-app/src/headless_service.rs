@@ -1,13 +1,16 @@
-use std::{fs, sync::{Arc, Mutex}};
+use std::{
+    fs,
+    sync::{Arc, Mutex},
+};
 
 use anyhow::{Context, Result};
 use ashot_capture::{CaptureClient, CaptureError};
 use ashot_core::{Annotation, AppConfig, finalize_capture_with_config};
 use ashot_ipc::{CaptureMode, CaptureOutcome, CommandOutcome, DBUS_NAME, DBUS_PATH, OutcomeKind};
-use url::Url;
 use tokio::{runtime::Builder, sync::Mutex as AsyncMutex};
 use tracing::error;
 use tracing_subscriber::{EnvFilter, fmt};
+use url::Url;
 use zbus::connection::Builder as ConnectionBuilder;
 
 pub fn run() -> Result<()> {
@@ -69,8 +72,10 @@ impl HeadlessState {
             Ok(uri) => {
                 let config = self.config_snapshot();
                 let mut message = capture_message(mode).to_string();
-                if config.post_capture_open_editor {
-                    message.push_str("; editor is unavailable in headless build");
+                if mode == CaptureMode::Area || config.post_capture_open_editor {
+                    message.push_str(
+                        "; editor window requires building ashot-app with the `gtk-ui` feature",
+                    );
                 }
                 CaptureOutcome::ok(uri, message)
             }
@@ -110,13 +115,19 @@ impl HeadlessState {
         };
 
         let config = self.config_snapshot();
-        match finalize_capture_with_config(&config, &source_path, &annotations, chrono::Local::now()) {
+        match finalize_capture_with_config(
+            &config,
+            &source_path,
+            &annotations,
+            chrono::Local::now(),
+        ) {
             Ok(output_path) => match Url::from_file_path(&output_path) {
                 Ok(file_uri) => {
                     if source_path != output_path {
                         let _ = fs::remove_file(&source_path);
                     }
-                    let mut message = format!("saved annotated screenshot to {}", output_path.display());
+                    let mut message =
+                        format!("saved annotated screenshot to {}", output_path.display());
                     if config.auto_copy {
                         message.push_str("; clipboard copy is unavailable in headless mode");
                     }
@@ -201,7 +212,11 @@ impl HeadlessDbusService {
     }
 
     #[zbus(name = "FinalizeCapture")]
-    async fn finalize_capture(&self, source_file_uri: &str, annotations_json: &str) -> CaptureOutcome {
+    async fn finalize_capture(
+        &self,
+        source_file_uri: &str,
+        annotations_json: &str,
+    ) -> CaptureOutcome {
         self.state.finalize_capture(source_file_uri, annotations_json)
     }
 }

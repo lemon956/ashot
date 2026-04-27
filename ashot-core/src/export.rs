@@ -12,6 +12,9 @@ pub fn render_document(base: &DynamicImage, annotations: &[Annotation]) -> RgbaI
             AnnotationData::Text { origin, text, style } => {
                 draw_text(&mut canvas, *origin, text, style.size, style.weight, style.color)
             }
+            AnnotationData::Line { start, end, color, stroke_width } => {
+                draw_thick_line(&mut canvas, *start, *end, *color, *stroke_width)
+            }
             AnnotationData::Arrow { start, end, color, stroke_width } => {
                 draw_arrow(&mut canvas, *start, *end, *color, *stroke_width)
             }
@@ -21,8 +24,23 @@ pub fn render_document(base: &DynamicImage, annotations: &[Annotation]) -> RgbaI
             AnnotationData::Rectangle { rect, color, stroke_width } => {
                 draw_rectangle(&mut canvas, *rect, *color, *stroke_width)
             }
+            AnnotationData::Ellipse { rect, color, stroke_width } => {
+                draw_ellipse(&mut canvas, *rect, *color, *stroke_width)
+            }
+            AnnotationData::Marker { points, color, stroke_width } => {
+                draw_brush(&mut canvas, points, *color, *stroke_width)
+            }
             AnnotationData::Mosaic { rect, pixel_size } => {
                 pixelate_region(&mut canvas, *rect, *pixel_size);
+            }
+            AnnotationData::Blur { rect, radius } => {
+                blur_region(&mut canvas, *rect, *radius);
+            }
+            AnnotationData::Counter { center, number, color, radius } => {
+                draw_counter(&mut canvas, *center, *number, *color, *radius);
+            }
+            AnnotationData::FilledBox { rect, color } => {
+                fill_rect(&mut canvas, *rect, *color);
             }
         }
     }
@@ -131,6 +149,56 @@ fn draw_rectangle(image: &mut RgbaImage, rect: Rect, color: Color, stroke_width:
     draw_thick_line(image, Point::new(x1, y2), Point::new(x1, y1), color, stroke_width);
 }
 
+fn fill_rect(image: &mut RgbaImage, rect: Rect, color: Color) {
+    let rgba = color_to_rgba(color);
+    let start_x = rect.x.max(0.0).floor() as u32;
+    let start_y = rect.y.max(0.0).floor() as u32;
+    let end_x = (rect.x + rect.width).min(image.width() as f32).ceil() as u32;
+    let end_y = (rect.y + rect.height).min(image.height() as f32).ceil() as u32;
+    for y in start_y..end_y {
+        for x in start_x..end_x {
+            let Some(pixel) = image.get_pixel_mut_checked(x, y) else {
+                continue;
+            };
+            blend_pixel(pixel, rgba);
+        }
+    }
+}
+
+fn draw_ellipse(image: &mut RgbaImage, rect: Rect, color: Color, stroke_width: u32) {
+    if rect.width <= 0.0 || rect.height <= 0.0 {
+        return;
+    }
+    let center_x = rect.x + rect.width / 2.0;
+    let center_y = rect.y + rect.height / 2.0;
+    let radius_x = (rect.width / 2.0).max(1.0);
+    let radius_y = (rect.height / 2.0).max(1.0);
+    let samples = ((rect.width + rect.height) * 2.0).ceil().max(24.0) as i32;
+    let mut previous = Point::new(center_x + radius_x, center_y);
+    for index in 1..=samples {
+        let angle = index as f32 / samples as f32 * std::f32::consts::TAU;
+        let point =
+            Point::new(center_x + radius_x * angle.cos(), center_y + radius_y * angle.sin());
+        draw_thick_line(image, previous, point, color, stroke_width);
+        previous = point;
+    }
+}
+
+fn draw_counter(image: &mut RgbaImage, center: Point, number: u32, color: Color, radius: u32) {
+    let radius = radius.max(4) as i32;
+    paint_circle(
+        image,
+        center.x.round() as i32,
+        center.y.round() as i32,
+        radius,
+        color_to_rgba(color),
+    );
+    let text = number.to_string();
+    let text_color = Color::rgba(255, 255, 255, 255);
+    let origin = Point::new(center.x - text.chars().count() as f32 * 4.0, center.y - 5.0);
+    draw_text(image, origin, &text, 8, TextWeight::Bold, text_color);
+}
+
 fn draw_text(
     image: &mut RgbaImage,
     origin: Point,
@@ -233,6 +301,55 @@ fn pixelate_region(image: &mut RgbaImage, rect: Rect, pixel_size: u32) {
     *image = output;
 }
 
+fn blur_region(image: &mut RgbaImage, rect: Rect, radius: u32) {
+    let radius = radius.max(1) as i32;
+    let start_x = rect.x.max(0.0).floor() as u32;
+    let start_y = rect.y.max(0.0).floor() as u32;
+    let end_x = (rect.x + rect.width).min(image.width() as f32).ceil() as u32;
+    let end_y = (rect.y + rect.height).min(image.height() as f32).ceil() as u32;
+    let mut output = image.clone();
+
+    for y in start_y..end_y {
+        for x in start_x..end_x {
+            let mut total = [0u32; 4];
+            let mut count = 0u32;
+            for dy in -radius..=radius {
+                for dx in -radius..=radius {
+                    let xx = x as i32 + dx;
+                    let yy = y as i32 + dy;
+                    if xx < start_x as i32
+                        || yy < start_y as i32
+                        || xx >= end_x as i32
+                        || yy >= end_y as i32
+                    {
+                        continue;
+                    }
+                    let pixel = image.get_pixel(xx as u32, yy as u32);
+                    total[0] += pixel[0] as u32;
+                    total[1] += pixel[1] as u32;
+                    total[2] += pixel[2] as u32;
+                    total[3] += pixel[3] as u32;
+                    count += 1;
+                }
+            }
+            if count > 0 {
+                output.put_pixel(
+                    x,
+                    y,
+                    Rgba([
+                        (total[0] / count) as u8,
+                        (total[1] / count) as u8,
+                        (total[2] / count) as u8,
+                        (total[3] / count) as u8,
+                    ]),
+                );
+            }
+        }
+    }
+
+    *image = output;
+}
+
 #[cfg(test)]
 mod tests {
     use image::{DynamicImage, Rgba};
@@ -288,5 +405,59 @@ mod tests {
         let rendered = render_document(&base, &annotations);
         let reference = *rendered.get_pixel(0, 0);
         assert_eq!(reference, *rendered.get_pixel(7, 7));
+    }
+
+    #[test]
+    fn export_renders_flameshot_style_tools() {
+        let base = DynamicImage::new_rgba8(96, 96);
+        let annotations = vec![
+            Annotation::new(AnnotationData::Line {
+                start: Point::new(2.0, 2.0),
+                end: Point::new(32.0, 2.0),
+                color: Color::rgba(255, 0, 0, 255),
+                stroke_width: 3,
+            }),
+            Annotation::new(AnnotationData::Ellipse {
+                rect: Rect { x: 8.0, y: 12.0, width: 22.0, height: 18.0 },
+                color: Color::rgba(0, 255, 0, 255),
+                stroke_width: 3,
+            }),
+            Annotation::new(AnnotationData::Marker {
+                points: vec![Point::new(4.0, 44.0), Point::new(42.0, 44.0)],
+                color: Color::rgba(255, 255, 0, 96),
+                stroke_width: 9,
+            }),
+            Annotation::new(AnnotationData::Counter {
+                center: Point::new(60.0, 20.0),
+                number: 3,
+                color: Color::rgba(255, 0, 0, 255),
+                radius: 10,
+            }),
+            Annotation::new(AnnotationData::FilledBox {
+                rect: Rect { x: 58.0, y: 44.0, width: 18.0, height: 12.0 },
+                color: Color::rgba(0, 0, 255, 255),
+            }),
+        ];
+
+        let rendered = render_document(&base, &annotations);
+
+        assert!(rendered.pixels().filter(|pixel| **pixel != Rgba([0, 0, 0, 0])).count() > 40);
+    }
+
+    #[test]
+    fn export_blurs_region() {
+        let mut base = DynamicImage::new_rgba8(9, 3).to_rgba8();
+        for x in 0..9 {
+            base.put_pixel(x, 1, Rgba([x as u8 * 25, 0, 0, 255]));
+        }
+        let base = DynamicImage::ImageRgba8(base);
+        let annotations = vec![Annotation::new(AnnotationData::Blur {
+            rect: Rect { x: 0.0, y: 0.0, width: 9.0, height: 3.0 },
+            radius: 1,
+        })];
+
+        let rendered = render_document(&base, &annotations);
+
+        assert_ne!(*rendered.get_pixel(4, 1), Rgba([100, 0, 0, 255]));
     }
 }

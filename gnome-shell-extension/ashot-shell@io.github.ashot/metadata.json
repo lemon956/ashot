@@ -1,9 +1,0 @@
-{
-  "extension-id": "ashot-shell",
-  "uuid": "ashot-shell@io.github.ashot",
-  "name": "aShot Shell Overlay",
-  "description": "Flameshot-like in-place area capture overlay for GNOME Shell and Wayland.",
-  "shell-version": ["49"],
-  "url": "https://example.invalid/ashot",
-  "version": 1
-}

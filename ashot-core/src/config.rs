@@ -7,7 +7,13 @@ use directories::BaseDirs;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::document::{Color, DefaultTool};
+use crate::{
+    document::{Color, DefaultTool},
+    ocr::{
+        OcrBackend, default_ocr_backend, default_ocr_filter_symbols, default_ocr_languages,
+        default_ocr_space_engine,
+    },
+};
 
 const CONFIG_DIR_NAME: &str = "ashot";
 const CONFIG_FILE_NAME: &str = "config.toml";
@@ -54,6 +60,16 @@ pub struct AppConfig {
     pub default_tool: DefaultTool,
     pub default_color: Color,
     pub default_stroke_width: u32,
+    #[serde(default = "default_ocr_backend")]
+    pub ocr_backend: OcrBackend,
+    #[serde(default = "default_ocr_languages")]
+    pub ocr_languages: Vec<String>,
+    #[serde(default)]
+    pub ocr_space_api_key: String,
+    #[serde(default = "default_ocr_space_engine")]
+    pub ocr_space_engine: u8,
+    #[serde(default = "default_ocr_filter_symbols")]
+    pub ocr_filter_symbols: bool,
 }
 
 impl Default for AppConfig {
@@ -67,6 +83,11 @@ impl Default for AppConfig {
             default_tool: DefaultTool::Arrow,
             default_color: Color::rgba(232, 62, 38, 255),
             default_stroke_width: 4,
+            ocr_backend: OcrBackend::Tesseract,
+            ocr_languages: default_ocr_languages(),
+            ocr_space_api_key: String::new(),
+            ocr_space_engine: default_ocr_space_engine(),
+            ocr_filter_symbols: default_ocr_filter_symbols(),
         }
     }
 }
@@ -140,6 +161,8 @@ fn default_save_dir() -> PathBuf {
 mod tests {
     use tempfile::tempdir;
 
+    use crate::ocr::OcrBackend;
+
     use super::AppConfig;
 
     #[test]
@@ -152,5 +175,47 @@ mod tests {
 
         let loaded = AppConfig::load_from(&path).expect("load config");
         assert_eq!(config, loaded);
+    }
+
+    #[test]
+    fn ocr_defaults_to_offline_chinese_and_english() {
+        let config = AppConfig::default();
+
+        assert_eq!(config.ocr_backend, OcrBackend::Tesseract);
+        assert_eq!(config.ocr_languages, vec!["chi_sim".to_string(), "eng".to_string()]);
+        assert_eq!(config.ocr_space_engine, 2);
+        assert!(config.ocr_filter_symbols);
+        assert!(config.ocr_space_api_key.is_empty());
+    }
+
+    #[test]
+    fn legacy_config_without_ocr_fields_loads_with_defaults() {
+        let dir = tempdir().expect("tempdir");
+        let save_dir = dir.path().join("shots");
+        std::fs::create_dir_all(&save_dir).expect("save dir");
+        let path = dir.path().join("legacy.toml");
+        std::fs::write(
+            &path,
+            format!(
+                r#"
+default_save_dir = "{}"
+filename_template = "Screenshot.png"
+auto_copy = true
+post_capture_open_editor = true
+pin_after_save = false
+default_tool = "Arrow"
+default_color = {{ r = 232, g = 62, b = 38, a = 255 }}
+default_stroke_width = 4
+"#,
+                save_dir.display()
+            ),
+        )
+        .expect("legacy config");
+
+        let loaded = AppConfig::load_from(&path).expect("load legacy config");
+
+        assert_eq!(loaded.ocr_backend, OcrBackend::Tesseract);
+        assert_eq!(loaded.ocr_languages, vec!["chi_sim".to_string(), "eng".to_string()]);
+        assert!(loaded.ocr_filter_symbols);
     }
 }

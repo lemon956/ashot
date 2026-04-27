@@ -7,6 +7,7 @@ members = [
     "ashot-ipc",
 ]
 default-members = [
+    "ashot-app",
     "ashot-core",
     "ashot-ipc",
     "ashot-capture",

@@ -1,11 +1,14 @@
-use std::{env, path::PathBuf, process::ExitCode, time::Duration};
+use std::{
+    env, fs,
+    io::{self, Write},
+    path::{Path, PathBuf},
+    process::ExitCode,
+    time::Duration,
+};
 
 use anyhow::{Context, Result};
-use ashot_ipc::{
-    AshotProxy, AshotShellProxy, CaptureMode, CommandOutcome, DBUS_NAME, OutcomeKind,
-    SHELL_DBUS_NAME,
-};
-use clap::{Parser, Subcommand, ValueEnum};
+use ashot_ipc::{AshotProxy, CaptureOutcome, CommandOutcome, DBUS_NAME, OutcomeKind};
+use clap::{Args, Parser, Subcommand};
 use tokio::{process::Command, time::sleep};
 use tracing_subscriber::{EnvFilter, fmt};
 use url::Url;
@@ -15,36 +18,72 @@ use zbus::{Connection, fdo::DBusProxy};
 #[command(name = "ashot", about = "GNOME / Wayland native screenshot helper")]
 struct Cli {
     #[command(subcommand)]
-    command: CommandKind,
+    command: Option<CommandKind>,
 }
 
 #[derive(Debug, Subcommand)]
 enum CommandKind {
-    Capture {
-        #[arg(value_enum)]
-        mode: CaptureModeArg,
-    },
-    OpenSettings,
-    Pin {
-        image_path: PathBuf,
-    },
+    Gui(GuiOptions),
+    Full(CaptureOptions),
+    Screen(ScreenOptions),
+    Launcher,
+    Config,
 }
 
-#[derive(Debug, Clone, Copy, ValueEnum)]
-enum CaptureModeArg {
-    Area,
-    Screen,
-    Window,
+#[derive(Debug, Clone, Args, Default)]
+struct GuiOptions {
+    #[arg(short = 'p', long)]
+    path: Option<PathBuf>,
+    #[arg(short = 'c', long)]
+    clipboard: bool,
+    #[arg(short = 'd', long = "delay", default_value_t = 0)]
+    delay_ms: u64,
+    #[arg(short = 'r', long)]
+    raw: bool,
+    #[arg(long)]
+    pin: bool,
+    #[arg(long)]
+    region: Option<String>,
+    #[arg(long)]
+    last_region: bool,
+    #[arg(short = 'g', long)]
+    print_geometry: bool,
+    #[arg(short = 's', long)]
+    accept_on_select: bool,
 }
 
-impl From<CaptureModeArg> for CaptureMode {
-    fn from(value: CaptureModeArg) -> Self {
-        match value {
-            CaptureModeArg::Area => CaptureMode::Area,
-            CaptureModeArg::Screen => CaptureMode::Screen,
-            CaptureModeArg::Window => CaptureMode::Window,
+impl From<&GuiOptions> for CaptureOptions {
+    fn from(value: &GuiOptions) -> Self {
+        Self {
+            path: value.path.clone(),
+            clipboard: value.clipboard,
+            delay_ms: value.delay_ms,
+            raw: value.raw,
+            pin: value.pin,
         }
     }
+}
+
+#[derive(Debug, Clone, Args)]
+struct ScreenOptions {
+    #[command(flatten)]
+    actions: CaptureOptions,
+    #[arg(short = 'n', long)]
+    number: Option<u32>,
+}
+
+#[derive(Debug, Clone, Args)]
+struct CaptureOptions {
+    #[arg(short = 'p', long)]
+    path: Option<PathBuf>,
+    #[arg(short = 'c', long)]
+    clipboard: bool,
+    #[arg(short = 'd', long = "delay", default_value_t = 0)]
+    delay_ms: u64,
+    #[arg(short = 'r', long)]
+    raw: bool,
+    #[arg(long)]
+    pin: bool,
 }
 
 #[tokio::main]
@@ -63,58 +102,141 @@ async fn main() -> ExitCode {
 async fn run() -> Result<ExitCode> {
     let cli = Cli::parse();
 
-    match cli.command {
-        CommandKind::Capture { mode } => {
-            let mode = CaptureMode::from(mode);
-            if mode == CaptureMode::Area {
-                let connection = Connection::session().await?;
-                if !name_has_owner(&connection, SHELL_DBUS_NAME).await? {
-                    eprintln!(
-                        "interactive area capture requires the GNOME Shell extension `ashot-shell@io.github.ashot` to be enabled"
-                    );
-                    return Ok(outcome_to_exit_code(OutcomeKind::Unsupported));
-                }
-
-                let shell = AshotShellProxy::new(&connection).await?;
-                shell.start_capture().await?;
-                eprintln!("interactive area capture started");
-                return Ok(ExitCode::SUCCESS);
-            }
-
+    match resolved_command(cli) {
+        CommandKind::Gui(options) => {
             let connection = ensure_service().await?;
             let proxy = AshotProxy::new(&connection).await?;
-            let outcome = match mode {
-                CaptureMode::Area => proxy.capture_area().await?,
-                CaptureMode::Screen => proxy.capture_screen().await?,
-                CaptureMode::Window => proxy.capture_window().await?,
-            };
-
-            if !outcome.file_uri.is_empty() {
-                println!("{}", outcome.file_uri);
+            if options.last_region || options.region.is_some() || options.print_geometry {
+                eprintln!(
+                    "ashot: --region, --last-region, and --print-geometry are not supported by the current portal backend yet"
+                );
+                return Ok(outcome_to_exit_code(OutcomeKind::Unsupported));
             }
-            if !outcome.message.is_empty() {
-                eprintln!("{}", outcome.message);
-            }
-            Ok(outcome_to_exit_code(outcome.kind))
+            delay_if_needed(options.delay_ms).await;
+            let outcome = proxy.capture_area().await?;
+            let (code, file_uri) =
+                handle_capture_outcome(&proxy, outcome, &CaptureOptions::from(&options)).await?;
+            let _ = file_uri;
+            Ok(code)
         }
-        CommandKind::OpenSettings => {
+        CommandKind::Full(options) => {
+            let connection = ensure_service().await?;
+            let proxy = AshotProxy::new(&connection).await?;
+            delay_if_needed(options.delay_ms).await;
+            let outcome = proxy.capture_screen().await?;
+            let (code, _) = handle_capture_outcome(&proxy, outcome, &options).await?;
+            Ok(code)
+        }
+        CommandKind::Screen(options) => {
+            let connection = ensure_service().await?;
+            let proxy = AshotProxy::new(&connection).await?;
+            if options.number.is_some() {
+                eprintln!(
+                    "ashot: selecting a specific screen is not supported by the current portal backend yet"
+                );
+                return Ok(outcome_to_exit_code(OutcomeKind::Unsupported));
+            }
+            delay_if_needed(options.actions.delay_ms).await;
+            let outcome = proxy.capture_screen().await?;
+            let (code, _) = handle_capture_outcome(&proxy, outcome, &options.actions).await?;
+            Ok(code)
+        }
+        CommandKind::Launcher => {
             let connection = ensure_service().await?;
             let proxy = AshotProxy::new(&connection).await?;
             let outcome = proxy.open_settings().await?;
             print_command_message(&outcome);
             Ok(outcome_to_exit_code(outcome.kind))
         }
-        CommandKind::Pin { image_path } => {
+        CommandKind::Config => {
             let connection = ensure_service().await?;
             let proxy = AshotProxy::new(&connection).await?;
-            let url = Url::from_file_path(&image_path).map_err(|_| {
-                anyhow::anyhow!("failed to convert path to file URI: {image_path:?}")
-            })?;
-            let outcome = proxy.pin_image(url.as_str()).await?;
+            let outcome = proxy.open_settings().await?;
             print_command_message(&outcome);
             Ok(outcome_to_exit_code(outcome.kind))
         }
     }
+}
+
+async fn delay_if_needed(delay_ms: u64) {
+    if delay_ms > 0 {
+        sleep(Duration::from_millis(delay_ms)).await;
+    }
+}
+
+async fn handle_capture_outcome(
+    proxy: &AshotProxy<'_>,
+    outcome: CaptureOutcome,
+    options: &CaptureOptions,
+) -> Result<(ExitCode, String)> {
+    if outcome.kind != OutcomeKind::Ok {
+        if !outcome.message.is_empty() {
+            eprintln!("{}", outcome.message);
+        }
+        return Ok((outcome_to_exit_code(outcome.kind), String::new()));
+    }
+
+    let mut file_uri = outcome.file_uri.clone();
+    if let Some(destination) = &options.path {
+        file_uri = copy_capture_to_destination(&file_uri, destination)?;
+    }
+
+    if options.pin && !file_uri.is_empty() {
+        let pin_outcome = proxy.pin_image(&file_uri).await?;
+        print_command_message(&pin_outcome);
+    }
+
+    if options.clipboard {
+        eprintln!("clipboard final action will run in the GTK editor path when available");
+    }
+
+    if options.raw {
+        write_file_uri_to_stdout(&file_uri)?;
+    } else if !file_uri.is_empty() {
+        println!("{file_uri}");
+    }
+    if !outcome.message.is_empty() {
+        eprintln!("{}", outcome.message);
+    }
+    Ok((ExitCode::SUCCESS, file_uri))
+}
+
+fn resolved_command(cli: Cli) -> CommandKind {
+    cli.command.unwrap_or_else(|| CommandKind::Gui(GuiOptions::default()))
+}
+
+fn copy_capture_to_destination(file_uri: &str, destination: &Path) -> Result<String> {
+    let source = Url::parse(file_uri)
+        .ok()
+        .and_then(|uri| uri.to_file_path().ok())
+        .ok_or_else(|| anyhow::anyhow!("capture did not return a valid file URI"))?;
+    let output = if destination.is_dir() {
+        let filename = source.file_name().unwrap_or_default();
+        destination.join(filename)
+    } else {
+        destination.to_path_buf()
+    };
+    if let Some(parent) = output.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create output directory {}", parent.display()))?;
+    }
+    fs::copy(&source, &output).with_context(|| {
+        format!("failed to copy screenshot from {} to {}", source.display(), output.display())
+    })?;
+    Url::from_file_path(&output).map(|uri| uri.to_string()).map_err(|_| {
+        anyhow::anyhow!("failed to convert output path to file URI: {}", output.display())
+    })
+}
+
+fn write_file_uri_to_stdout(file_uri: &str) -> Result<()> {
+    let source = Url::parse(file_uri)
+        .ok()
+        .and_then(|uri| uri.to_file_path().ok())
+        .ok_or_else(|| anyhow::anyhow!("capture did not return a valid file URI"))?;
+    let data = fs::read(&source).with_context(|| {
+        format!("failed to read screenshot for raw output: {}", source.display())
+    })?;
+    io::stdout().write_all(&data).context("failed to write raw screenshot to stdout")
 }
 
 fn print_command_message(outcome: &CommandOutcome) {
@@ -145,7 +267,7 @@ async fn ensure_service() -> Result<Connection> {
         .spawn()
         .context("failed to launch ashot-app background service")?;
 
-    for _ in 0..10 {
+    for _ in 0..40 {
         sleep(Duration::from_millis(250)).await;
         if let Ok(connection) = Connection::session().await {
             if service_is_running(&connection).await? {
@@ -181,4 +303,68 @@ async fn service_is_running(connection: &Connection) -> Result<bool> {
 async fn name_has_owner(connection: &Connection, name: &str) -> Result<bool> {
     let dbus = DBusProxy::new(connection).await?;
     Ok(dbus.name_has_owner(name.try_into()?).await?)
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::{Cli, CommandKind, resolved_command};
+
+    #[test]
+    fn parses_gui_with_flameshot_final_actions() {
+        let cli = Cli::try_parse_from([
+            "ashot",
+            "gui",
+            "--path",
+            "/tmp/out.png",
+            "--clipboard",
+            "--pin",
+            "--accept-on-select",
+        ])
+        .expect("parse gui");
+
+        match cli.command {
+            Some(CommandKind::Gui(options)) => {
+                assert_eq!(options.path.as_deref(), Some(std::path::Path::new("/tmp/out.png")));
+                assert!(options.clipboard);
+                assert!(options.pin);
+                assert!(options.accept_on_select);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_full_with_delay_and_raw() {
+        let cli =
+            Cli::try_parse_from(["ashot", "full", "--delay", "350", "--raw"]).expect("parse full");
+
+        match cli.command {
+            Some(CommandKind::Full(options)) => {
+                assert_eq!(options.delay_ms, 350);
+                assert!(options.raw);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_removed_capture_command() {
+        let error = Cli::try_parse_from(["ashot", "capture", "area"]).expect_err("old command");
+        assert_eq!(error.kind(), clap::error::ErrorKind::InvalidSubcommand);
+    }
+
+    #[test]
+    fn defaults_to_gui_when_no_subcommand_is_provided() {
+        let cli = Cli::try_parse_from(["ashot"]).expect("parse default");
+
+        match resolved_command(cli) {
+            CommandKind::Gui(options) => {
+                assert_eq!(options.delay_ms, 0);
+                assert!(!options.clipboard);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
 }

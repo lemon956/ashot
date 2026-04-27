@@ -1,3 +1,4 @@
+#[cfg(not(feature = "gtk-ui"))]
 mod headless_service;
 
 #[cfg(feature = "gtk-ui")]

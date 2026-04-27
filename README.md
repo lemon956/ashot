@@ -1,31 +1,26 @@
 # aShot
 
-`aShot` is a GNOME-first screenshot workflow for Wayland. The project now has two layers:
-
-- a Rust app for config, export, saving, pinning, and DBus integration
-- a GNOME Shell extension for the Flameshot-like in-place capture overlay
+`aShot` is a Linux screenshot workflow inspired by Flameshot. It uses the system screenshot portal to capture images, then opens a GTK/libadwaita editor window for annotation, export, copy, and pin actions.
 
 ## Current Status
 
-This repository now contains:
+This repository contains:
 
 - A Rust workspace with `ashot-core`, `ashot-ipc`, `ashot-capture`, `ashot-cli`, and `ashot-app`
-- A GNOME Shell extension under `gnome-shell-extension/ashot-shell@io.github.ashot`
 - XDG config handling and default save-path persistence
-- DBus contracts for screenshot, settings, editor, pin-window actions, and shell-overlay start/finalize flow
-- A portal-backed capture crate using `ashpd`
-- A CLI entrypoint suitable for GNOME custom keyboard shortcuts
-- A GTK/libadwaita app shell under the `gtk-ui` feature
-- Core annotation/export logic for text, arrows, brush, rectangles, and mosaic
+- DBus contracts for screenshot, settings, editor, and pin-window actions
+- A portal-first native capture crate
+- A Flameshot-style CLI surface
+- A GTK/libadwaita editor shell under the `gtk-ui` feature
+- Core annotation/export logic for text, line, arrow, brush, rectangle, ellipse, marker, mosaic, blur, counter, filled-box, and OCR tools
 
 ## Workspace Layout
 
 - `ashot-core`: config, annotation model, export renderer, undo/redo history
 - `ashot-ipc`: DBus constants, proxy definitions, wire-safe outcomes
-- `ashot-capture`: screenshot portal wrapper
-- `ashot-cli`: `ashot capture ...`, `ashot open-settings`, `ashot pin ...`
+- `ashot-capture`: portal-first system screenshot wrapper
+- `ashot-cli`: `ashot gui`, `ashot full`, `ashot screen`, `ashot launcher`, `ashot config`
 - `ashot-app`: DBus service host plus GTK/libadwaita launcher/editor/pin/settings windows
-- `gnome-shell-extension/ashot-shell@io.github.ashot`: fullscreen overlay, region selection, inline toolbar, and save handoff back to Rust
 
 ## Build
 
@@ -34,50 +29,104 @@ Core and CLI crates can be checked with:
 ```bash
 cargo check
 cargo test -p ashot-core
+cargo test -p ashot-cli
 ```
 
-The GTK shell is implemented behind a feature flag:
+For local GUI development, build the workspace from the repository root. This builds both the CLI
+and the GTK app service that the CLI launches:
 
 ```bash
-cargo run -p ashot-app --features gtk-ui
+cargo build
+./target/debug/ashot-cli gui
 ```
 
 This requires system development packages for `gtk4` and `libadwaita-1`.
 
-## Shell Extension
+## Flatpak
 
-The new interactive area workflow lives in the GNOME Shell extension. Install it locally with:
+The recommended local installation path is Flatpak. The manifest builds the Rust
+workspace inside the GNOME SDK and installs two binaries into the sandbox:
+
+- `ashot-app`: the GTK/DBus application service
+- `ashot`: the command-line client
+
+Install the required GNOME runtime once:
 
 ```bash
-./scripts/install-shell-extension.sh
-gnome-extensions enable ashot-shell@io.github.ashot
+flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo
+flatpak install --user flathub org.gnome.Platform//49 org.gnome.Sdk//49
 ```
 
-Once enabled, you can:
+Build and install aShot for the current user:
 
-- click the `aShot` panel icon and choose `Area Capture`
-- or run `ashot capture area`
+```bash
+./scripts/install-flatpak.sh
+```
 
-The `capture area` command now expects the extension to be enabled. It does not silently fall back to the old portal picker.
+This script also applies the Flatpak bus permission needed for the internal
+service process to own `io.github.ashot.Service`.
+
+Or run the Flatpak builder command directly:
+
+```bash
+cargo vendor --locked flatpak/vendor | sed 's#directory = ".*flatpak/vendor"#directory = "vendor"#' > flatpak/cargo-config.toml
+flatpak-builder --user --install --force-clean --disable-rofiles-fuse --install-deps-from=flathub -y build-flatpak flatpak/io.github.ashot.App.json
+```
+
+Use the CLI from the installed Flatpak directly:
+
+```bash
+flatpak run io.github.ashot.App gui
+flatpak run io.github.ashot.App full --delay 500
+flatpak run io.github.ashot.App config
+```
+
+`flatpak run io.github.ashot.App` without a subcommand also opens the GUI.
+
+For a shorter shell command, add an alias:
+
+```bash
+alias ashot='flatpak run io.github.ashot.App'
+```
+
+After that, the normal commands work:
+
+```bash
+ashot gui
+ashot full --path ~/Pictures/Screenshots
+ashot config
+```
+
+## OCR
+
+The editor includes an OCR region tool. By default it uses the local `tesseract`
+command and does not upload screenshots. Open `ashot config`, search for the OCR
+language you need, and copy the suggested Tesseract language package or full
+install command for your Linux distribution.
+
+OCR.space can be enabled as an optional online backend in settings. That backend
+uploads the selected OCR region and requires an API key.
 
 ## CLI
 
 ```bash
-ashot capture area
-ashot capture screen
-ashot capture window
-ashot open-settings
-ashot pin /absolute/path/to/image.png
+ashot gui
+ashot gui --path ~/Pictures/Screenshots --clipboard --pin
+ashot full --delay 500 --path ~/Pictures/Screenshots
+ashot screen --raw > screenshot.png
+ashot launcher
+ashot config
 ```
 
-Recommended GNOME shortcut command:
+Recommended Linux shortcut command:
 
 ```bash
-ashot capture area
+ashot gui
 ```
 
 ## Design Notes
 
-- `capture area` is now intended to go through the Shell extension so the user can keep working inside the live screen context.
-- `capture screen` and `capture window` still go through the Rust service and screenshot backend directly.
-- The old separate GTK editor remains in-tree, but it is no longer the intended primary interaction for region capture.
+- `ashot gui` uses the system screenshot portal for region selection and opens the GTK editor with the captured image.
+- `ashot full` and `ashot screen` use the same portal-first backend for fullscreen capture.
+- GNOME Shell extension integration has been removed; the app no longer depends on Shell-side overlay code.
+- Upload and tray behavior are intentionally out of scope for this migration pass.

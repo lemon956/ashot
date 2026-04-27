@@ -6,9 +6,6 @@ pub const APP_ID: &str = "io.github.ashot.App";
 pub const DBUS_NAME: &str = "io.github.ashot.Service";
 pub const DBUS_PATH: &str = "/io/github/ashot/App";
 pub const DBUS_INTERFACE: &str = "io.github.ashot.App";
-pub const SHELL_DBUS_NAME: &str = "io.github.ashot.Shell";
-pub const SHELL_DBUS_PATH: &str = "/io/github/ashot/Shell";
-pub const SHELL_DBUS_INTERFACE: &str = "io.github.ashot.Shell";
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Type)]
 pub enum CaptureMode {
@@ -89,14 +86,4 @@ pub trait Ashot {
         source_file_uri: &str,
         annotations_json: &str,
     ) -> zbus::Result<CaptureOutcome>;
-}
-
-#[zbus::proxy(
-    interface = "io.github.ashot.Shell",
-    default_service = "io.github.ashot.Shell",
-    default_path = "/io/github/ashot/Shell"
-)]
-pub trait AshotShell {
-    #[zbus(name = "StartCapture")]
-    async fn start_capture(&self) -> zbus::Result<()>;
 }

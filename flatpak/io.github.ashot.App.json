@@ -3,14 +3,26 @@
   "runtime": "org.gnome.Platform",
   "runtime-version": "49",
   "sdk": "org.gnome.Sdk",
-  "command": "ashot-app",
+  "sdk-extensions": [
+    "org.freedesktop.Sdk.Extension.rust-stable"
+  ],
+  "command": "ashot",
+  "build-options": {
+    "append-path": "/usr/lib/sdk/rust-stable/bin",
+    "env": {
+      "CARGO_HOME": "/run/build/ashot/cargo"
+    }
+  },
   "finish-args": [
     "--share=ipc",
     "--socket=wayland",
     "--socket=fallback-x11",
     "--filesystem=xdg-pictures",
     "--own-name=io.github.ashot.Service",
+    "--talk-name=io.github.ashot.Service",
+    "--talk-name=org.freedesktop.DBus",
     "--talk-name=org.freedesktop.portal.Desktop",
+    "--talk-name=org.freedesktop.Flatpak",
     "--device=dri"
   ],
   "modules": [
@@ -18,6 +30,7 @@
       "name": "ashot",
       "buildsystem": "simple",
       "build-commands": [
+        "cargo --offline build --release --locked -p ashot-app -p ashot-cli",
         "install -Dm755 target/release/ashot-app /app/bin/ashot-app",
         "install -Dm755 target/release/ashot-cli /app/bin/ashot",
         "install -Dm644 packaging/io.github.ashot.App.desktop /app/share/applications/io.github.ashot.App.desktop",
@@ -25,6 +38,17 @@
         "install -Dm644 packaging/io.github.ashot.App.svg /app/share/icons/hicolor/scalable/apps/io.github.ashot.App.svg"
       ],
       "sources": [
+        {
+          "type": "dir",
+          "path": "vendor",
+          "dest": "vendor"
+        },
+        {
+          "type": "file",
+          "path": "cargo-config.toml",
+          "dest": "cargo",
+          "dest-filename": "config.toml"
+        },
         {
           "type": "dir",
           "path": ".."

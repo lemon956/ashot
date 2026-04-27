@@ -31,6 +31,18 @@ impl EditorHistory {
         self.past.push(current.to_vec());
         Some(next)
     }
+
+    pub fn undo_count(&self) -> usize {
+        self.past.len()
+    }
+
+    pub fn redo_count(&self) -> usize {
+        self.future.len()
+    }
+
+    pub fn limit(&self) -> usize {
+        self.limit
+    }
 }
 
 #[cfg(test)]
@@ -60,5 +72,40 @@ mod tests {
 
         let redone = history.redo(&undone).expect("redo");
         assert_eq!(redone, vec![a, b]);
+    }
+
+    #[test]
+    fn reports_undo_redo_counts() {
+        let a = Annotation::new(AnnotationData::Rectangle {
+            rect: Rect { x: 1.0, y: 1.0, width: 5.0, height: 5.0 },
+            color: Color::rgba(255, 0, 0, 255),
+            stroke_width: 2,
+        });
+        let b = Annotation::new(AnnotationData::Rectangle {
+            rect: Rect { x: 2.0, y: 2.0, width: 5.0, height: 5.0 },
+            color: Color::rgba(0, 255, 0, 255),
+            stroke_width: 2,
+        });
+
+        let mut history = EditorHistory::new(2);
+        assert_eq!(history.undo_count(), 0);
+        assert_eq!(history.redo_count(), 0);
+        assert_eq!(history.limit(), 2);
+
+        history.snapshot(std::slice::from_ref(&a));
+        history.snapshot(&[a.clone(), b.clone()]);
+        history.snapshot(std::slice::from_ref(&b));
+
+        assert_eq!(history.undo_count(), 2);
+        assert_eq!(history.redo_count(), 0);
+
+        let current = vec![a, b];
+        let _ = history.undo(&current);
+        assert_eq!(history.undo_count(), 1);
+        assert_eq!(history.redo_count(), 1);
+
+        let _ = history.redo(&current);
+        assert_eq!(history.undo_count(), 2);
+        assert_eq!(history.redo_count(), 0);
     }
 }
