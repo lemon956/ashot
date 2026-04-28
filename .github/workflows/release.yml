@@ -61,6 +61,7 @@ jobs:
         run: |
           mkdir -p build-flatpak/repo
           flatpak build-update-repo build-flatpak/repo
+          tar --exclude='.lock' -C build-flatpak -czf build-flatpak/io.github.ashot.App.repo.tar.gz repo
 
       - name: Create changelog
         run: |
@@ -76,7 +77,7 @@ jobs:
           body_path: /tmp/changelog.md
           files: |
             build-flatpak/io.github.ashot.App.flatpak
-            build-flatpak/repo/*
+            build-flatpak/io.github.ashot.App.repo.tar.gz
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
