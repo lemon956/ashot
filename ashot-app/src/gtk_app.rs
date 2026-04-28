@@ -795,12 +795,6 @@ fn present_settings(app: &adw::Application, state: Arc<ServiceState>) {
     ocr_filter_symbols.set_active(config.ocr_filter_symbols);
     root.append(&ocr_filter_symbols);
 
-    let language_search = Entry::builder()
-        .hexpand(true)
-        .placeholder_text("Search OCR languages, e.g. 中文, English, jpn")
-        .build();
-    root.append(&language_search);
-
     let distro = detect_linux_distro_family();
     let selected_ocr_languages = Rc::new(RefCell::new(config.ocr_languages.clone()));
     let selected_ocr_label = Label::new(None);
@@ -808,43 +802,24 @@ fn present_settings(app: &adw::Application, state: Arc<ServiceState>) {
     selected_ocr_label.set_wrap(true);
     root.append(&selected_ocr_label);
 
-    let language_results = GtkBox::new(Orientation::Vertical, 6);
-    root.append(&language_results);
-
     let install_command_label = Label::new(None);
     install_command_label.set_xalign(0.0);
     install_command_label.set_wrap(true);
     install_command_label.add_css_class("dim-label");
     root.append(&install_command_label);
 
+    let language_menu = ocr_language_install_menu(
+        selected_ocr_languages.clone(),
+        selected_ocr_label.clone(),
+        install_command_label.clone(),
+        distro,
+    );
+    root.append(&language_menu);
+
     let install_actions = GtkBox::new(Orientation::Horizontal, 8);
     let copy_install_command = Button::with_label("Copy Install Command");
     install_actions.append(&copy_install_command);
     root.append(&install_actions);
-
-    refresh_ocr_language_settings(
-        &language_results,
-        &selected_ocr_label,
-        &install_command_label,
-        "",
-        selected_ocr_languages.clone(),
-        distro,
-    );
-
-    let language_results_for_search = language_results.clone();
-    let selected_ocr_label_for_search = selected_ocr_label.clone();
-    let install_command_label_for_search = install_command_label.clone();
-    let selected_ocr_languages_for_search = selected_ocr_languages.clone();
-    language_search.connect_changed(move |entry| {
-        refresh_ocr_language_settings(
-            &language_results_for_search,
-            &selected_ocr_label_for_search,
-            &install_command_label_for_search,
-            entry.text().as_str(),
-            selected_ocr_languages_for_search.clone(),
-            distro,
-        );
-    });
 
     let selected_ocr_languages_for_copy = selected_ocr_languages.clone();
     copy_install_command.connect_clicked(move |_| {
@@ -857,8 +832,10 @@ fn present_settings(app: &adw::Application, state: Arc<ServiceState>) {
     let actions = GtkBox::new(Orientation::Horizontal, 8);
     let save = Button::with_label("Save");
     let reset = Button::with_label("Restore defaults");
+    let close = Button::with_label("Close");
     actions.append(&save);
     actions.append(&reset);
+    actions.append(&close);
     root.append(&actions);
 
     let state_for_save = state.clone();
@@ -893,6 +870,7 @@ fn present_settings(app: &adw::Application, state: Arc<ServiceState>) {
     });
 
     let state_for_reset = state.clone();
+    let language_menu_for_reset = language_menu.clone();
     reset.connect_clicked(move |_| {
         let mut updated = state_for_reset.config_snapshot();
         updated.restore_defaults();
@@ -909,14 +887,18 @@ fn present_settings(app: &adw::Application, state: Arc<ServiceState>) {
         if let Ok(mut languages) = selected_ocr_languages.try_borrow_mut() {
             *languages = updated.ocr_languages;
         }
-        refresh_ocr_language_settings(
-            &language_results,
+        refresh_ocr_language_summary(
             &selected_ocr_label,
             &install_command_label,
-            language_search.text().as_str(),
+            Some(&language_menu_for_reset),
             selected_ocr_languages.clone(),
             distro,
         );
+    });
+
+    let window_for_close = window.clone();
+    close.connect_clicked(move |_| {
+        window_for_close.close();
     });
 
     let scrolled = ScrolledWindow::builder()
@@ -928,10 +910,92 @@ fn present_settings(app: &adw::Application, state: Arc<ServiceState>) {
     window.present();
 }
 
+fn refresh_ocr_language_summary(
+    selected_label: &Label,
+    install_command_label: &Label,
+    language_menu: Option<&MenuButton>,
+    selected_languages: Rc<RefCell<Vec<String>>>,
+    distro: LinuxDistroFamily,
+) {
+    let selected_snapshot =
+        selected_languages.try_borrow().map(|languages| languages.clone()).unwrap_or_default();
+    selected_label
+        .set_text(&format!("Selected OCR languages: {}", ocr_language_summary(&selected_snapshot)));
+    install_command_label.set_text(&language_install_command(&selected_snapshot, distro));
+    if let Some(menu) = language_menu {
+        menu.set_label(&ocr_language_label(&selected_snapshot));
+    }
+}
+
+fn ocr_language_install_menu(
+    selected_languages: Rc<RefCell<Vec<String>>>,
+    selected_label: Label,
+    install_command_label: Label,
+    distro: LinuxDistroFamily,
+) -> MenuButton {
+    let menu = MenuButton::new();
+    menu.set_tooltip_text(Some("Select OCR language packages"));
+    menu.set_hexpand(true);
+
+    let popover = Popover::new();
+    let root = GtkBox::new(Orientation::Vertical, 8);
+    root.set_margin_top(8);
+    root.set_margin_bottom(8);
+    root.set_margin_start(8);
+    root.set_margin_end(8);
+
+    let search = Entry::builder()
+        .hexpand(true)
+        .placeholder_text("Search languages, e.g. 中文, English, jpn")
+        .build();
+    root.append(&search);
+
+    let language_results = GtkBox::new(Orientation::Vertical, 6);
+    let scrolled = ScrolledWindow::builder()
+        .hscrollbar_policy(PolicyType::Never)
+        .vscrollbar_policy(PolicyType::Automatic)
+        .min_content_height(260)
+        .child(&language_results)
+        .build();
+    root.append(&scrolled);
+
+    refresh_ocr_language_settings(
+        &language_results,
+        &selected_label,
+        &install_command_label,
+        Some(menu.clone()),
+        "",
+        selected_languages.clone(),
+        distro,
+    );
+
+    let language_results_for_search = language_results.clone();
+    let selected_label_for_search = selected_label.clone();
+    let install_command_label_for_search = install_command_label.clone();
+    let selected_languages_for_search = selected_languages.clone();
+    let menu_for_search = menu.clone();
+    search.connect_changed(move |entry| {
+        refresh_ocr_language_settings(
+            &language_results_for_search,
+            &selected_label_for_search,
+            &install_command_label_for_search,
+            Some(menu_for_search.clone()),
+            entry.text().as_str(),
+            selected_languages_for_search.clone(),
+            distro,
+        );
+    });
+
+    popover.set_child(Some(&root));
+    menu.set_popover(Some(&popover));
+    menu
+}
+
 fn refresh_ocr_language_settings(
     language_results: &GtkBox,
     selected_label: &Label,
     install_command_label: &Label,
+    language_menu: Option<MenuButton>,
     query: &str,
     selected_languages: Rc<RefCell<Vec<String>>>,
     distro: LinuxDistroFamily,
@@ -940,11 +1004,16 @@ fn refresh_ocr_language_settings(
         language_results.remove(&child);
     }
 
+    refresh_ocr_language_summary(
+        selected_label,
+        install_command_label,
+        language_menu.as_ref(),
+        selected_languages.clone(),
+        distro,
+    );
     let selected_snapshot =
         selected_languages.try_borrow().map(|languages| languages.clone()).unwrap_or_default();
-    selected_label
-        .set_text(&format!("Selected OCR languages: {}", ocr_language_summary(&selected_snapshot)));
-    install_command_label.set_text(&language_install_command(&selected_snapshot, distro));
+    let checks = Rc::new(RefCell::new(Vec::<(String, gtk::CheckButton)>::new()));
 
     for language in search_ocr_languages(query).into_iter().take(8) {
         let row = GtkBox::new(Orientation::Vertical, 2);
@@ -955,6 +1024,7 @@ fn refresh_ocr_language_settings(
         ));
         check.set_active(ocr_language_is_selected(&selected_snapshot, language.tesseract_code));
         header.append(&check);
+        checks.borrow_mut().push((language.tesseract_code.to_string(), check.clone()));
 
         let copy_package = Button::with_label("Copy Package");
         if language_package_for_distro(language, distro).is_none() {
@@ -985,15 +1055,31 @@ fn refresh_ocr_language_settings(
         let selected_for_toggle = selected_languages.clone();
         let selected_label_for_toggle = selected_label.clone();
         let install_command_label_for_toggle = install_command_label.clone();
+        let language_menu_for_toggle = language_menu.clone();
+        let checks_for_toggle = checks.clone();
         check.connect_toggled(move |button| {
             let Ok(mut languages) = selected_for_toggle.try_borrow_mut() else {
                 return;
             };
             update_ocr_language_selection(&mut languages, &language_code, button.is_active());
-            selected_label_for_toggle
-                .set_text(&format!("Selected OCR languages: {}", ocr_language_summary(&languages)));
-            install_command_label_for_toggle
-                .set_text(&language_install_command(&languages, distro));
+            drop(languages);
+            refresh_ocr_language_summary(
+                &selected_label_for_toggle,
+                &install_command_label_for_toggle,
+                language_menu_for_toggle.as_ref(),
+                selected_for_toggle.clone(),
+                distro,
+            );
+            if let (Ok(languages), Ok(checks)) =
+                (selected_for_toggle.try_borrow(), checks_for_toggle.try_borrow())
+            {
+                for (code, check) in checks.iter() {
+                    let should_be_active = ocr_language_is_selected(&languages, code);
+                    if check.is_active() != should_be_active {
+                        check.set_active(should_be_active);
+                    }
+                }
+            }
         });
 
         if let Some(package) = language_package_for_distro(language, distro) {
