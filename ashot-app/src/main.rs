@@ -3,6 +3,8 @@ mod headless_service;
 
 #[cfg(feature = "gtk-ui")]
 mod gtk_app;
+#[cfg(feature = "gtk-ui")]
+mod render_cache;
 
 #[cfg(feature = "gtk-ui")]
 fn main() -> anyhow::Result<()> {

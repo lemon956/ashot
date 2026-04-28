@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::{io::Cursor, path::Path};
 
 use font8x8::{BASIC_FONTS, UnicodeFonts};
 use image::{DynamicImage, ImageBuffer, Rgba, RgbaImage};
@@ -6,45 +6,59 @@ use image::{DynamicImage, ImageBuffer, Rgba, RgbaImage};
 use crate::document::{Annotation, AnnotationData, Color, Point, Rect, TextWeight};
 
 pub fn render_document(base: &DynamicImage, annotations: &[Annotation]) -> RgbaImage {
-    let mut canvas = base.to_rgba8();
+    render_document_from_rgba(&base.to_rgba8(), annotations)
+}
+
+pub fn render_document_from_rgba(base: &RgbaImage, annotations: &[Annotation]) -> RgbaImage {
+    let mut canvas = base.clone();
     for annotation in annotations {
-        match &annotation.data {
-            AnnotationData::Text { origin, text, style } => {
-                draw_text(&mut canvas, *origin, text, style.size, style.weight, style.color)
-            }
-            AnnotationData::Line { start, end, color, stroke_width } => {
-                draw_thick_line(&mut canvas, *start, *end, *color, *stroke_width)
-            }
-            AnnotationData::Arrow { start, end, color, stroke_width } => {
-                draw_arrow(&mut canvas, *start, *end, *color, *stroke_width)
-            }
-            AnnotationData::Brush { points, color, stroke_width } => {
-                draw_brush(&mut canvas, points, *color, *stroke_width)
-            }
-            AnnotationData::Rectangle { rect, color, stroke_width } => {
-                draw_rectangle(&mut canvas, *rect, *color, *stroke_width)
-            }
-            AnnotationData::Ellipse { rect, color, stroke_width } => {
-                draw_ellipse(&mut canvas, *rect, *color, *stroke_width)
-            }
-            AnnotationData::Marker { points, color, stroke_width } => {
-                draw_brush(&mut canvas, points, *color, *stroke_width)
-            }
-            AnnotationData::Mosaic { rect, pixel_size } => {
-                pixelate_region(&mut canvas, *rect, *pixel_size);
-            }
-            AnnotationData::Blur { rect, radius } => {
-                blur_region(&mut canvas, *rect, *radius);
-            }
-            AnnotationData::Counter { center, number, color, radius } => {
-                draw_counter(&mut canvas, *center, *number, *color, *radius);
-            }
-            AnnotationData::FilledBox { rect, color } => {
-                fill_rect(&mut canvas, *rect, *color);
-            }
-        }
+        render_annotation_into(&mut canvas, annotation);
     }
     canvas
+}
+
+pub fn render_annotation_into(canvas: &mut RgbaImage, annotation: &Annotation) {
+    match &annotation.data {
+        AnnotationData::Text { origin, text, style } => {
+            draw_text(canvas, *origin, text, style.size, style.weight, style.color)
+        }
+        AnnotationData::Line { start, end, color, stroke_width } => {
+            draw_thick_line(canvas, *start, *end, *color, *stroke_width)
+        }
+        AnnotationData::Arrow { start, end, color, stroke_width } => {
+            draw_arrow(canvas, *start, *end, *color, *stroke_width)
+        }
+        AnnotationData::Brush { points, color, stroke_width } => {
+            draw_brush(canvas, points, *color, *stroke_width)
+        }
+        AnnotationData::Rectangle { rect, color, stroke_width } => {
+            draw_rectangle(canvas, *rect, *color, *stroke_width)
+        }
+        AnnotationData::Ellipse { rect, color, stroke_width } => {
+            draw_ellipse(canvas, *rect, *color, *stroke_width)
+        }
+        AnnotationData::Marker { points, color, stroke_width } => {
+            draw_brush(canvas, points, *color, *stroke_width)
+        }
+        AnnotationData::Mosaic { rect, pixel_size } => {
+            pixelate_region(canvas, *rect, *pixel_size);
+        }
+        AnnotationData::Blur { rect, radius } => {
+            blur_region(canvas, *rect, *radius);
+        }
+        AnnotationData::Counter { center, number, color, radius } => {
+            draw_counter(canvas, *center, *number, *color, *radius);
+        }
+        AnnotationData::FilledBox { rect, color } => {
+            fill_rect(canvas, *rect, *color);
+        }
+    }
+}
+
+pub fn encode_png_bytes(image: &RgbaImage) -> image::ImageResult<Vec<u8>> {
+    let mut cursor = Cursor::new(Vec::new());
+    DynamicImage::ImageRgba8(image.clone()).write_to(&mut cursor, image::ImageFormat::Png)?;
+    Ok(cursor.into_inner())
 }
 
 pub fn save_document_png(
@@ -54,6 +68,213 @@ pub fn save_document_png(
 ) -> image::ImageResult<()> {
     let image = render_document(base, annotations);
     image.save(path)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PixelRect {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+impl PixelRect {
+    fn from_edges(
+        image_width: u32,
+        image_height: u32,
+        left: f32,
+        top: f32,
+        right: f32,
+        bottom: f32,
+    ) -> Option<Self> {
+        if image_width == 0 || image_height == 0 {
+            return None;
+        }
+        let left = left.floor().max(0.0).min(image_width as f32) as u32;
+        let top = top.floor().max(0.0).min(image_height as f32) as u32;
+        let right = right.ceil().max(0.0).min(image_width as f32) as u32;
+        let bottom = bottom.ceil().max(0.0).min(image_height as f32) as u32;
+        if right <= left || bottom <= top {
+            return None;
+        }
+        Some(Self { x: left, y: top, width: right - left, height: bottom - top })
+    }
+
+    fn union(self, other: Self) -> Self {
+        let left = self.x.min(other.x);
+        let top = self.y.min(other.y);
+        let right = (self.x + self.width).max(other.x + other.width);
+        let bottom = (self.y + self.height).max(other.y + other.height);
+        Self { x: left, y: top, width: right - left, height: bottom - top }
+    }
+
+    fn intersects(self, other: Self) -> bool {
+        self.x < other.x + other.width
+            && self.x + self.width > other.x
+            && self.y < other.y + other.height
+            && self.y + self.height > other.y
+    }
+
+    fn area(self) -> u64 {
+        self.width as u64 * self.height as u64
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RenderUpdateKind {
+    Noop,
+    Append,
+    Dirty(PixelRect),
+    Full,
+}
+
+pub fn incremental_render_plan(
+    image_width: u32,
+    image_height: u32,
+    old_annotations: &[Annotation],
+    new_annotations: &[Annotation],
+) -> RenderUpdateKind {
+    if old_annotations == new_annotations {
+        return RenderUpdateKind::Noop;
+    }
+
+    if new_annotations.len() == old_annotations.len() + 1
+        && new_annotations.starts_with(old_annotations)
+    {
+        return RenderUpdateKind::Append;
+    }
+
+    if old_annotations.iter().chain(new_annotations).any(annotation_is_complex_effect) {
+        return RenderUpdateKind::Full;
+    }
+
+    if old_annotations.len() == new_annotations.len()
+        && old_annotations.iter().zip(new_annotations).any(|(old, new)| old.id != new.id)
+    {
+        return RenderUpdateKind::Full;
+    }
+
+    let mut dirty = None::<PixelRect>;
+    for old in old_annotations {
+        let changed =
+            new_annotations.iter().find(|new| new.id == old.id).is_none_or(|new| new != old);
+        if changed && let Some(bounds) = annotation_render_bounds(old, image_width, image_height) {
+            dirty = Some(dirty.map_or(bounds, |current| current.union(bounds)));
+        }
+    }
+    for new in new_annotations {
+        let changed =
+            old_annotations.iter().find(|old| old.id == new.id).is_none_or(|old| old != new);
+        if changed && let Some(bounds) = annotation_render_bounds(new, image_width, image_height) {
+            dirty = Some(dirty.map_or(bounds, |current| current.union(bounds)));
+        }
+    }
+
+    let Some(dirty) = dirty else {
+        return RenderUpdateKind::Full;
+    };
+    let image_area = image_width as u64 * image_height as u64;
+    if image_area == 0 || dirty.area() * 100 > image_area * 45 {
+        RenderUpdateKind::Full
+    } else {
+        RenderUpdateKind::Dirty(dirty)
+    }
+}
+
+pub fn update_rendered_image(
+    base: &RgbaImage,
+    cached: &mut RgbaImage,
+    old_annotations: &[Annotation],
+    new_annotations: &[Annotation],
+) -> RenderUpdateKind {
+    let plan =
+        incremental_render_plan(base.width(), base.height(), old_annotations, new_annotations);
+    match plan {
+        RenderUpdateKind::Noop => {}
+        RenderUpdateKind::Append => {
+            if let Some(annotation) = new_annotations.last() {
+                render_annotation_into(cached, annotation);
+            }
+        }
+        RenderUpdateKind::Dirty(rect) => rebuild_dirty_region(base, cached, new_annotations, rect),
+        RenderUpdateKind::Full => {
+            *cached = render_document_from_rgba(base, new_annotations);
+        }
+    }
+    plan
+}
+
+fn rebuild_dirty_region(
+    base: &RgbaImage,
+    cached: &mut RgbaImage,
+    annotations: &[Annotation],
+    dirty: PixelRect,
+) {
+    let mut tile = ImageBuffer::new(dirty.width, dirty.height);
+    for y in 0..dirty.height {
+        for x in 0..dirty.width {
+            tile.put_pixel(x, y, *base.get_pixel(dirty.x + x, dirty.y + y));
+        }
+    }
+
+    for annotation in annotations {
+        let Some(bounds) = annotation_render_bounds(annotation, base.width(), base.height()) else {
+            continue;
+        };
+        if !bounds.intersects(dirty) {
+            continue;
+        }
+        let mut shifted = annotation.clone();
+        shifted.translate(-(dirty.x as f32), -(dirty.y as f32));
+        render_annotation_into(&mut tile, &shifted);
+    }
+
+    for y in 0..dirty.height {
+        for x in 0..dirty.width {
+            cached.put_pixel(dirty.x + x, dirty.y + y, *tile.get_pixel(x, y));
+        }
+    }
+}
+
+fn annotation_render_bounds(
+    annotation: &Annotation,
+    image_width: u32,
+    image_height: u32,
+) -> Option<PixelRect> {
+    let bounds = annotation.bounds();
+    let padding = annotation_render_padding(annotation);
+    PixelRect::from_edges(
+        image_width,
+        image_height,
+        bounds.x - padding,
+        bounds.y - padding,
+        bounds.x + bounds.width + padding,
+        bounds.y + bounds.height + padding,
+    )
+}
+
+fn annotation_render_padding(annotation: &Annotation) -> f32 {
+    match &annotation.data {
+        AnnotationData::Line { stroke_width, .. }
+        | AnnotationData::Brush { stroke_width, .. }
+        | AnnotationData::Rectangle { stroke_width, .. }
+        | AnnotationData::Ellipse { stroke_width, .. }
+        | AnnotationData::Marker { stroke_width, .. } => *stroke_width as f32 + 3.0,
+        AnnotationData::Arrow { stroke_width, .. } => {
+            let visual = arrow_visual_stroke_width(*stroke_width);
+            let (_, head_width) = arrow_head_dimensions(visual);
+            head_width + 4.0
+        }
+        AnnotationData::Text { style, .. } => style.size as f32 * 0.25 + 3.0,
+        AnnotationData::Counter { radius, .. } => *radius as f32 * 0.2 + 3.0,
+        AnnotationData::Mosaic { .. }
+        | AnnotationData::Blur { .. }
+        | AnnotationData::FilledBox { .. } => 1.0,
+    }
+}
+
+fn annotation_is_complex_effect(annotation: &Annotation) -> bool {
+    matches!(annotation.data, AnnotationData::Mosaic { .. } | AnnotationData::Blur { .. })
 }
 
 fn color_to_rgba(color: Color) -> Rgba<u8> {
@@ -528,7 +749,9 @@ mod tests {
     use crate::document::{Annotation, AnnotationData, Color, Point, Rect, TextStyle, TextWeight};
 
     use super::{
-        arrow_head_geometry, arrow_shape_geometry, arrow_visual_stroke_width, render_document,
+        RenderUpdateKind, arrow_head_geometry, arrow_shape_geometry, arrow_visual_stroke_width,
+        encode_png_bytes, incremental_render_plan, render_document, render_document_from_rgba,
+        update_rendered_image,
     };
 
     #[test]
@@ -675,5 +898,66 @@ mod tests {
         let rendered = render_document(&base, &annotations);
 
         assert_ne!(*rendered.get_pixel(4, 1), Rgba([100, 0, 0, 255]));
+    }
+
+    #[test]
+    fn incremental_append_matches_full_render_and_encodes_png() {
+        let base = DynamicImage::new_rgba8(64, 64).to_rgba8();
+        let first = vec![Annotation::new(AnnotationData::Rectangle {
+            rect: Rect { x: 8.0, y: 8.0, width: 16.0, height: 14.0 },
+            color: Color::rgba(255, 0, 0, 255),
+            stroke_width: 3,
+        })];
+        let mut second = first.clone();
+        second.push(Annotation::new(AnnotationData::Arrow {
+            start: Point::new(4.0, 52.0),
+            end: Point::new(48.0, 18.0),
+            color: Color::rgba(0, 200, 255, 255),
+            stroke_width: 4,
+        }));
+
+        let mut cached = render_document_from_rgba(&base, &first);
+        let update = update_rendered_image(&base, &mut cached, &first, &second);
+        let full = render_document_from_rgba(&base, &second);
+        let bytes = encode_png_bytes(&cached).expect("png bytes");
+
+        assert_eq!(update, RenderUpdateKind::Append);
+        assert_eq!(cached, full);
+        assert!(bytes.starts_with(b"\x89PNG\r\n\x1a\n"));
+    }
+
+    #[test]
+    fn dirty_region_delete_matches_full_render() {
+        let base = DynamicImage::new_rgba8(64, 64).to_rgba8();
+        let keep = Annotation::new(AnnotationData::FilledBox {
+            rect: Rect { x: 2.0, y: 2.0, width: 18.0, height: 16.0 },
+            color: Color::rgba(255, 0, 0, 255),
+        });
+        let remove = Annotation::new(AnnotationData::Line {
+            start: Point::new(5.0, 40.0),
+            end: Point::new(50.0, 40.0),
+            color: Color::rgba(0, 255, 0, 255),
+            stroke_width: 5,
+        });
+        let old = vec![keep.clone(), remove];
+        let new = vec![keep];
+
+        let mut cached = render_document_from_rgba(&base, &old);
+        let update = update_rendered_image(&base, &mut cached, &old, &new);
+        let full = render_document_from_rgba(&base, &new);
+
+        assert!(matches!(update, RenderUpdateKind::Dirty(_)));
+        assert_eq!(cached, full);
+    }
+
+    #[test]
+    fn dirty_region_with_complex_effect_falls_back_to_full_rebuild() {
+        let old = vec![Annotation::new(AnnotationData::Blur {
+            rect: Rect { x: 4.0, y: 4.0, width: 24.0, height: 24.0 },
+            radius: 3,
+        })];
+        let new = Vec::new();
+
+        assert_eq!(incremental_render_plan(64, 64, &old, &new), RenderUpdateKind::Full);
     }
 }
