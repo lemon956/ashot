@@ -2448,18 +2448,100 @@ impl DraftAnnotation {
     }
 }
 
+#[cfg(test)]
 fn arrow_head_points(start: Point, end: Point, stroke_width: u32) -> (Point, Point) {
-    let angle = (end.y - start.y).atan2(end.x - start.x);
-    let head_len = (stroke_width as f32 * 2.6).max(10.0);
-    let left = Point::new(
-        end.x - head_len * (angle - std::f32::consts::FRAC_PI_6).cos(),
-        end.y - head_len * (angle - std::f32::consts::FRAC_PI_6).sin(),
-    );
-    let right = Point::new(
-        end.x - head_len * (angle + std::f32::consts::FRAC_PI_6).cos(),
-        end.y - head_len * (angle + std::f32::consts::FRAC_PI_6).sin(),
-    );
+    let (_, left, right) = arrow_head_geometry(start, end, stroke_width);
     (left, right)
+}
+
+#[cfg(test)]
+fn arrow_head_geometry(start: Point, end: Point, stroke_width: u32) -> (Point, Point, Point) {
+    let dx = end.x - start.x;
+    let dy = end.y - start.y;
+    let length = (dx * dx + dy * dy).sqrt();
+    if length <= f32::EPSILON {
+        return (end, end, end);
+    }
+
+    let unit_x = dx / length;
+    let unit_y = dy / length;
+    let normal_x = -unit_y;
+    let normal_y = unit_x;
+    let (head_len, head_width) = arrow_head_dimensions(stroke_width);
+    let head_len = head_len.min(length * 0.72);
+    let half_width = head_width * 0.5;
+
+    let base = Point::new(end.x - unit_x * head_len, end.y - unit_y * head_len);
+    let left = Point::new(base.x + normal_x * half_width, base.y + normal_y * half_width);
+    let right = Point::new(base.x - normal_x * half_width, base.y - normal_y * half_width);
+    (base, left, right)
+}
+
+fn arrow_head_dimensions(stroke_width: u32) -> (f32, f32) {
+    let stroke = stroke_width.max(1) as f32;
+    ((stroke * 4.8).clamp(18.0, 54.0), (stroke * 5.2).clamp(20.0, 58.0))
+}
+
+fn arrow_visual_stroke_width(stroke_width: u32) -> u32 {
+    ((stroke_width.max(1) as f32) * 1.7).round().clamp(6.0, 24.0) as u32
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ArrowShape {
+    tail_left: Point,
+    body_left: Point,
+    head_left: Point,
+    tip: Point,
+    head_right: Point,
+    body_right: Point,
+    tail_right: Point,
+}
+
+fn arrow_shape_geometry(start: Point, end: Point, stroke_width: u32) -> ArrowShape {
+    let dx = end.x - start.x;
+    let dy = end.y - start.y;
+    let length = (dx * dx + dy * dy).sqrt();
+    if length <= f32::EPSILON {
+        return ArrowShape {
+            tail_left: start,
+            body_left: start,
+            head_left: start,
+            tip: end,
+            head_right: start,
+            body_right: start,
+            tail_right: start,
+        };
+    }
+
+    let unit_x = dx / length;
+    let unit_y = dy / length;
+    let normal_x = -unit_y;
+    let normal_y = unit_x;
+    let (head_len, head_width) = arrow_head_dimensions(stroke_width);
+    let head_len = head_len.min(length * 0.72);
+    let head_half = head_width * 0.5;
+    let body_half = (stroke_width as f32 * 0.7).clamp(4.0, head_half * 0.55);
+    let tail_half = (stroke_width as f32 * 0.24).clamp(1.8, body_half * 0.48);
+    let base = Point::new(end.x - unit_x * head_len, end.y - unit_y * head_len);
+    let body_join_offset = (stroke_width as f32 * 0.75).min(head_len * 0.28).max(0.0);
+    let body_join =
+        Point::new(base.x - unit_x * body_join_offset, base.y - unit_y * body_join_offset);
+
+    ArrowShape {
+        tail_left: Point::new(start.x + normal_x * tail_half, start.y + normal_y * tail_half),
+        body_left: Point::new(
+            body_join.x + normal_x * body_half,
+            body_join.y + normal_y * body_half,
+        ),
+        head_left: Point::new(base.x + normal_x * head_half, base.y + normal_y * head_half),
+        tip: end,
+        head_right: Point::new(base.x - normal_x * head_half, base.y - normal_y * head_half),
+        body_right: Point::new(
+            body_join.x - normal_x * body_half,
+            body_join.y - normal_y * body_half,
+        ),
+        tail_right: Point::new(start.x - normal_x * tail_half, start.y - normal_y * tail_half),
+    }
 }
 
 fn mosaic_pixel_size_for_stroke(stroke_width: u32) -> u32 {
@@ -2489,6 +2571,33 @@ fn draw_cairo_segment(
     cr.set_line_cap(gtk::cairo::LineCap::Round);
     cr.move_to(start.x as f64, start.y as f64);
     cr.line_to(end.x as f64, end.y as f64);
+    let _ = cr.stroke();
+    let _ = cr.restore();
+}
+
+fn draw_cairo_arrow(
+    cr: &gtk::cairo::Context,
+    start: Point,
+    end: Point,
+    color: Color,
+    stroke_width: u32,
+) {
+    let visual_stroke_width = arrow_visual_stroke_width(stroke_width);
+    let shape = arrow_shape_geometry(start, end, visual_stroke_width);
+    let _ = cr.save();
+    set_cairo_color(cr, color);
+    cr.set_line_width((visual_stroke_width as f64 * 0.42).clamp(2.0, 8.0));
+    cr.set_line_cap(gtk::cairo::LineCap::Round);
+    cr.set_line_join(gtk::cairo::LineJoin::Round);
+    cr.move_to(shape.tail_left.x as f64, shape.tail_left.y as f64);
+    cr.line_to(shape.body_left.x as f64, shape.body_left.y as f64);
+    cr.line_to(shape.head_left.x as f64, shape.head_left.y as f64);
+    cr.line_to(shape.tip.x as f64, shape.tip.y as f64);
+    cr.line_to(shape.head_right.x as f64, shape.head_right.y as f64);
+    cr.line_to(shape.body_right.x as f64, shape.body_right.y as f64);
+    cr.line_to(shape.tail_right.x as f64, shape.tail_right.y as f64);
+    cr.close_path();
+    let _ = cr.fill_preserve();
     let _ = cr.stroke();
     let _ = cr.restore();
 }
@@ -2609,10 +2718,7 @@ fn draw_annotation(cr: &gtk::cairo::Context, annotation: &Annotation) {
             draw_cairo_segment(cr, *start, *end, *color, *stroke_width);
         }
         AnnotationData::Arrow { start, end, color, stroke_width } => {
-            draw_cairo_segment(cr, *start, *end, *color, *stroke_width);
-            let (left, right) = arrow_head_points(*start, *end, *stroke_width);
-            draw_cairo_segment(cr, *end, left, *color, *stroke_width);
-            draw_cairo_segment(cr, *end, right, *color, *stroke_width);
+            draw_cairo_arrow(cr, *start, *end, *color, *stroke_width);
         }
         AnnotationData::Brush { points, color, stroke_width }
         | AnnotationData::Marker { points, color, stroke_width } => {
@@ -3157,10 +3263,11 @@ mod tests {
 
     use super::{
         ActiveTextEdit, DraftAnnotation, PinClickAction, annotation_snapshot_for_draw,
-        arrow_head_points, blur_radius_for_stroke, capture_should_use_fresh_anchor,
-        crop_image_region, draft_preview_for_draw, draft_tool_can_draw, editor_color_palette,
-        editor_initial_size, editor_stroke_widths, editor_tool_layout, filter_ocr_symbols,
-        fit_scale, mosaic_pixel_size_for_stroke, moving_delta_and_update, normalized_save_filename,
+        arrow_head_geometry, arrow_head_points, arrow_shape_geometry, arrow_visual_stroke_width,
+        blur_radius_for_stroke, capture_should_use_fresh_anchor, crop_image_region,
+        draft_preview_for_draw, draft_tool_can_draw, editor_color_palette, editor_initial_size,
+        editor_stroke_widths, editor_tool_layout, filter_ocr_symbols, fit_scale,
+        mosaic_pixel_size_for_stroke, moving_delta_and_update, normalized_save_filename,
         ocr_language_label, ocr_space_curl_args, ocr_space_language_arg, parse_ocr_space_response,
         pin_click_action, pin_dimension_label, pin_display_size, pin_initial_scale,
         pin_window_size, pin_window_size_for_scale, pin_zoom_from_scroll, scaled_canvas_point,
@@ -3232,6 +3339,50 @@ mod tests {
         assert!(left.x < end.x);
         assert!(right.x < end.x);
         assert_ne!(left.y, right.y);
+    }
+
+    #[test]
+    fn arrow_preview_uses_filled_head_geometry() {
+        let start = Point::new(10.0, 10.0);
+        let end = Point::new(90.0, 10.0);
+        let (base, left, right) = arrow_head_geometry(start, end, 6);
+
+        assert!(base.x < end.x);
+        assert!(base.x > start.x);
+        assert!(left.x < end.x);
+        assert!(right.x < end.x);
+        assert!((left.y - right.y).abs() >= 31.0);
+        assert!(left.y < end.y || right.y < end.y);
+        assert!(left.y > end.y || right.y > end.y);
+    }
+
+    #[test]
+    fn arrow_preview_uses_tapered_body_instead_of_straight_line() {
+        let start = Point::new(10.0, 10.0);
+        let end = Point::new(90.0, 10.0);
+        let shape = arrow_shape_geometry(start, end, 6);
+        let tail_width = (shape.tail_left.y - shape.tail_right.y).abs();
+        let body_width = (shape.body_left.y - shape.body_right.y).abs();
+        let head_width = (shape.head_left.y - shape.head_right.y).abs();
+
+        assert!(tail_width < body_width);
+        assert!(body_width < head_width);
+        assert!(shape.body_left.x < shape.head_left.x);
+        assert!(shape.body_right.x < shape.head_right.x);
+    }
+
+    #[test]
+    fn arrow_preview_handles_very_short_drag_distance() {
+        let shape = arrow_shape_geometry(Point::new(10.0, 10.0), Point::new(12.0, 10.0), 6);
+
+        assert_eq!(shape.tip, Point::new(12.0, 10.0));
+    }
+
+    #[test]
+    fn arrow_preview_uses_bolder_visual_width_than_plain_line() {
+        assert_eq!(arrow_visual_stroke_width(2), 6);
+        assert_eq!(arrow_visual_stroke_width(4), 7);
+        assert!(arrow_visual_stroke_width(12) > 12);
     }
 
     #[test]

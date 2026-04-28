@@ -114,19 +114,190 @@ fn draw_thick_line(
 }
 
 fn draw_arrow(image: &mut RgbaImage, start: Point, end: Point, color: Color, stroke_width: u32) {
-    draw_thick_line(image, start, end, color, stroke_width);
-    let angle = (end.y - start.y).atan2(end.x - start.x);
-    let head_len = (stroke_width as f32 * 2.6).max(10.0);
-    let left = Point::new(
-        end.x - head_len * (angle - std::f32::consts::FRAC_PI_6).cos(),
-        end.y - head_len * (angle - std::f32::consts::FRAC_PI_6).sin(),
+    let visual_stroke_width = arrow_visual_stroke_width(stroke_width);
+    let shape = arrow_shape_geometry(start, end, visual_stroke_width);
+    let rgba = color_to_rgba(color);
+    fill_polygon(
+        image,
+        &[
+            shape.tail_left,
+            shape.body_left,
+            shape.head_left,
+            shape.tip,
+            shape.head_right,
+            shape.body_right,
+            shape.tail_right,
+        ],
+        rgba,
     );
-    let right = Point::new(
-        end.x - head_len * (angle + std::f32::consts::FRAC_PI_6).cos(),
-        end.y - head_len * (angle + std::f32::consts::FRAC_PI_6).sin(),
+
+    let tip_radius = ((visual_stroke_width as f32) * 0.22).round().clamp(1.0, 4.0) as i32;
+    let corner_radius = ((visual_stroke_width as f32) * 0.32).round().clamp(2.0, 6.0) as i32;
+    paint_circle(image, shape.tip.x.round() as i32, shape.tip.y.round() as i32, tip_radius, rgba);
+    paint_circle(
+        image,
+        shape.head_left.x.round() as i32,
+        shape.head_left.y.round() as i32,
+        corner_radius,
+        rgba,
     );
-    draw_thick_line(image, end, left, color, stroke_width);
-    draw_thick_line(image, end, right, color, stroke_width);
+    paint_circle(
+        image,
+        shape.head_right.x.round() as i32,
+        shape.head_right.y.round() as i32,
+        corner_radius,
+        rgba,
+    );
+    paint_circle(
+        image,
+        start.x.round() as i32,
+        start.y.round() as i32,
+        ((visual_stroke_width as f32) * 0.24).round().clamp(2.0, 5.0) as i32,
+        rgba,
+    );
+}
+
+#[cfg(test)]
+fn arrow_head_geometry(start: Point, end: Point, stroke_width: u32) -> (Point, Point, Point) {
+    let dx = end.x - start.x;
+    let dy = end.y - start.y;
+    let length = (dx * dx + dy * dy).sqrt();
+    if length <= f32::EPSILON {
+        return (end, end, end);
+    }
+
+    let unit_x = dx / length;
+    let unit_y = dy / length;
+    let normal_x = -unit_y;
+    let normal_y = unit_x;
+    let (head_len, head_width) = arrow_head_dimensions(stroke_width);
+    let head_len = head_len.min(length * 0.72);
+    let half_width = head_width * 0.5;
+
+    let base = Point::new(end.x - unit_x * head_len, end.y - unit_y * head_len);
+    let left = Point::new(base.x + normal_x * half_width, base.y + normal_y * half_width);
+    let right = Point::new(base.x - normal_x * half_width, base.y - normal_y * half_width);
+    (base, left, right)
+}
+
+fn arrow_head_dimensions(stroke_width: u32) -> (f32, f32) {
+    let stroke = stroke_width.max(1) as f32;
+    ((stroke * 4.8).clamp(18.0, 54.0), (stroke * 5.2).clamp(20.0, 58.0))
+}
+
+fn arrow_visual_stroke_width(stroke_width: u32) -> u32 {
+    ((stroke_width.max(1) as f32) * 1.7).round().clamp(6.0, 24.0) as u32
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ArrowShape {
+    tail_left: Point,
+    body_left: Point,
+    head_left: Point,
+    tip: Point,
+    head_right: Point,
+    body_right: Point,
+    tail_right: Point,
+}
+
+fn arrow_shape_geometry(start: Point, end: Point, stroke_width: u32) -> ArrowShape {
+    let dx = end.x - start.x;
+    let dy = end.y - start.y;
+    let length = (dx * dx + dy * dy).sqrt();
+    if length <= f32::EPSILON {
+        return ArrowShape {
+            tail_left: start,
+            body_left: start,
+            head_left: start,
+            tip: end,
+            head_right: start,
+            body_right: start,
+            tail_right: start,
+        };
+    }
+
+    let unit_x = dx / length;
+    let unit_y = dy / length;
+    let normal_x = -unit_y;
+    let normal_y = unit_x;
+    let (head_len, head_width) = arrow_head_dimensions(stroke_width);
+    let head_len = head_len.min(length * 0.72);
+    let head_half = head_width * 0.5;
+    let body_half = (stroke_width as f32 * 0.7).clamp(4.0, head_half * 0.55);
+    let tail_half = (stroke_width as f32 * 0.24).clamp(1.8, body_half * 0.48);
+    let base = Point::new(end.x - unit_x * head_len, end.y - unit_y * head_len);
+    let body_join_offset = (stroke_width as f32 * 0.75).min(head_len * 0.28).max(0.0);
+    let body_join =
+        Point::new(base.x - unit_x * body_join_offset, base.y - unit_y * body_join_offset);
+
+    ArrowShape {
+        tail_left: Point::new(start.x + normal_x * tail_half, start.y + normal_y * tail_half),
+        body_left: Point::new(
+            body_join.x + normal_x * body_half,
+            body_join.y + normal_y * body_half,
+        ),
+        head_left: Point::new(base.x + normal_x * head_half, base.y + normal_y * head_half),
+        tip: end,
+        head_right: Point::new(base.x - normal_x * head_half, base.y - normal_y * head_half),
+        body_right: Point::new(
+            body_join.x - normal_x * body_half,
+            body_join.y - normal_y * body_half,
+        ),
+        tail_right: Point::new(start.x - normal_x * tail_half, start.y - normal_y * tail_half),
+    }
+}
+
+fn fill_polygon(image: &mut RgbaImage, points: &[Point], color: Rgba<u8>) {
+    if points.len() < 3 {
+        return;
+    }
+
+    let min_x =
+        points.iter().map(|point| point.x).fold(f32::INFINITY, f32::min).floor().max(0.0) as u32;
+    let min_y =
+        points.iter().map(|point| point.y).fold(f32::INFINITY, f32::min).floor().max(0.0) as u32;
+    let max_x = points
+        .iter()
+        .map(|point| point.x)
+        .fold(f32::NEG_INFINITY, f32::max)
+        .ceil()
+        .min(image.width().saturating_sub(1) as f32) as u32;
+    let max_y = points
+        .iter()
+        .map(|point| point.y)
+        .fold(f32::NEG_INFINITY, f32::max)
+        .ceil()
+        .min(image.height().saturating_sub(1) as f32) as u32;
+
+    for y in min_y..=max_y {
+        for x in min_x..=max_x {
+            let point = Point::new(x as f32 + 0.5, y as f32 + 0.5);
+            if !point_in_polygon(point, points) {
+                continue;
+            }
+            if let Some(pixel) = image.get_pixel_mut_checked(x, y) {
+                blend_pixel(pixel, color);
+            }
+        }
+    }
+}
+
+fn point_in_polygon(point: Point, points: &[Point]) -> bool {
+    let mut inside = false;
+    let mut previous = points[points.len() - 1];
+    for current in points {
+        let crosses_y = (current.y > point.y) != (previous.y > point.y);
+        if crosses_y {
+            let intersection_x = (previous.x - current.x) * (point.y - current.y)
+                / (previous.y - current.y)
+                + current.x;
+            if point.x < intersection_x {
+                inside = !inside;
+            }
+        }
+        previous = *current;
+    }
+    inside
 }
 
 fn draw_brush(image: &mut RgbaImage, points: &[Point], color: Color, stroke_width: u32) {
@@ -356,7 +527,9 @@ mod tests {
 
     use crate::document::{Annotation, AnnotationData, Color, Point, Rect, TextStyle, TextWeight};
 
-    use super::render_document;
+    use super::{
+        arrow_head_geometry, arrow_shape_geometry, arrow_visual_stroke_width, render_document,
+    };
 
     #[test]
     fn export_renders_shapes() {
@@ -386,6 +559,49 @@ mod tests {
 
         let rendered = render_document(&base, &annotations);
         assert!(rendered.pixels().any(|pixel| *pixel != Rgba([0, 0, 0, 0])));
+    }
+
+    #[test]
+    fn export_arrow_uses_filled_head_geometry() {
+        let start = Point::new(8.0, 20.0);
+        let end = Point::new(56.0, 20.0);
+        let (base, left, right) = arrow_head_geometry(start, end, 6);
+
+        assert!(base.x < end.x);
+        assert!(base.x > start.x);
+        assert!(left.x < end.x);
+        assert!(right.x < end.x);
+        assert!((left.y - right.y).abs() >= 31.0);
+        assert_ne!(left.y, right.y);
+    }
+
+    #[test]
+    fn export_arrow_uses_tapered_body_instead_of_straight_line() {
+        let start = Point::new(8.0, 20.0);
+        let end = Point::new(56.0, 20.0);
+        let shape = arrow_shape_geometry(start, end, 6);
+        let tail_width = (shape.tail_left.y - shape.tail_right.y).abs();
+        let body_width = (shape.body_left.y - shape.body_right.y).abs();
+        let head_width = (shape.head_left.y - shape.head_right.y).abs();
+
+        assert!(tail_width < body_width);
+        assert!(body_width < head_width);
+        assert!(shape.body_left.x < shape.head_left.x);
+        assert!(shape.body_right.x < shape.head_right.x);
+    }
+
+    #[test]
+    fn export_arrow_handles_very_short_drag_distance() {
+        let shape = arrow_shape_geometry(Point::new(10.0, 10.0), Point::new(12.0, 10.0), 6);
+
+        assert_eq!(shape.tip, Point::new(12.0, 10.0));
+    }
+
+    #[test]
+    fn export_arrow_uses_bolder_visual_width_than_plain_line() {
+        assert_eq!(arrow_visual_stroke_width(2), 6);
+        assert_eq!(arrow_visual_stroke_width(4), 7);
+        assert!(arrow_visual_stroke_width(12) > 12);
     }
 
     #[test]
