@@ -50,7 +50,7 @@ pub enum ConfigError {
     Serialize(#[from] toml::ser::Error),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AppConfig {
     pub default_save_dir: PathBuf,
     pub filename_template: String,
@@ -60,6 +60,14 @@ pub struct AppConfig {
     pub default_tool: DefaultTool,
     pub default_color: Color,
     pub default_stroke_width: u32,
+    #[serde(default)]
+    pub recent_colors: Vec<Color>,
+    #[serde(default)]
+    pub favorite_colors: Vec<Color>,
+    #[serde(default = "default_pin_scale")]
+    pub last_pin_scale: f64,
+    #[serde(default = "default_pin_opacity")]
+    pub last_pin_opacity: f64,
     #[serde(default = "default_ocr_backend")]
     pub ocr_backend: OcrBackend,
     #[serde(default = "default_ocr_languages")]
@@ -83,6 +91,10 @@ impl Default for AppConfig {
             default_tool: DefaultTool::Arrow,
             default_color: Color::rgba(232, 62, 38, 255),
             default_stroke_width: 4,
+            recent_colors: Vec::new(),
+            favorite_colors: Vec::new(),
+            last_pin_scale: default_pin_scale(),
+            last_pin_opacity: default_pin_opacity(),
             ocr_backend: OcrBackend::Tesseract,
             ocr_languages: default_ocr_languages(),
             ocr_space_api_key: String::new(),
@@ -157,6 +169,14 @@ fn default_save_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("./Screenshots"))
 }
 
+fn default_pin_scale() -> f64 {
+    1.0
+}
+
+fn default_pin_opacity() -> f64 {
+    1.0
+}
+
 #[cfg(test)]
 mod tests {
     use tempfile::tempdir;
@@ -217,5 +237,64 @@ default_stroke_width = 4
         assert_eq!(loaded.ocr_backend, OcrBackend::Tesseract);
         assert_eq!(loaded.ocr_languages, vec!["chi_sim".to_string(), "eng".to_string()]);
         assert!(loaded.ocr_filter_symbols);
+    }
+
+    #[test]
+    fn persistent_editor_state_round_trips() {
+        let dir = tempdir().expect("tempdir");
+        let save_dir = dir.path().join("shots");
+        std::fs::create_dir_all(&save_dir).expect("save dir");
+        let path = dir.path().join("config.toml");
+        let config = AppConfig {
+            default_save_dir: save_dir,
+            recent_colors: vec![
+                crate::document::Color::rgba(1, 2, 3, 255),
+                crate::document::Color::rgba(4, 5, 6, 128),
+            ],
+            favorite_colors: vec![crate::document::Color::rgba(7, 8, 9, 255)],
+            last_pin_scale: 1.75,
+            last_pin_opacity: 0.65,
+            ..AppConfig::default()
+        };
+
+        config.save_to(&path).expect("save config");
+        let loaded = AppConfig::load_from(&path).expect("load config");
+
+        assert_eq!(loaded.recent_colors, config.recent_colors);
+        assert_eq!(loaded.favorite_colors, config.favorite_colors);
+        assert_eq!(loaded.last_pin_scale, 1.75);
+        assert_eq!(loaded.last_pin_opacity, 0.65);
+    }
+
+    #[test]
+    fn legacy_config_without_editor_state_loads_with_defaults() {
+        let dir = tempdir().expect("tempdir");
+        let save_dir = dir.path().join("shots");
+        std::fs::create_dir_all(&save_dir).expect("save dir");
+        let path = dir.path().join("legacy-editor-state.toml");
+        std::fs::write(
+            &path,
+            format!(
+                r#"
+default_save_dir = "{}"
+filename_template = "Screenshot.png"
+auto_copy = true
+post_capture_open_editor = true
+pin_after_save = false
+default_tool = "Arrow"
+default_color = {{ r = 232, g = 62, b = 38, a = 255 }}
+default_stroke_width = 4
+"#,
+                save_dir.display()
+            ),
+        )
+        .expect("legacy config");
+
+        let loaded = AppConfig::load_from(&path).expect("load legacy config");
+
+        assert!(loaded.recent_colors.is_empty());
+        assert!(loaded.favorite_colors.is_empty());
+        assert_eq!(loaded.last_pin_scale, 1.0);
+        assert_eq!(loaded.last_pin_opacity, 1.0);
     }
 }

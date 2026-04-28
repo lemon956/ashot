@@ -250,6 +250,40 @@ impl Annotation {
         }
     }
 
+    pub fn apply_color(&mut self, color: Color) -> bool {
+        match &mut self.data {
+            AnnotationData::Text { style, .. } => style.color = color,
+            AnnotationData::Line { color: current, .. }
+            | AnnotationData::Arrow { color: current, .. }
+            | AnnotationData::Brush { color: current, .. }
+            | AnnotationData::Rectangle { color: current, .. }
+            | AnnotationData::Ellipse { color: current, .. }
+            | AnnotationData::Marker { color: current, .. }
+            | AnnotationData::Counter { color: current, .. }
+            | AnnotationData::FilledBox { color: current, .. } => *current = color,
+            AnnotationData::Mosaic { .. } | AnnotationData::Blur { .. } => return false,
+        }
+        true
+    }
+
+    pub fn apply_stroke_width(&mut self, width: u32) -> bool {
+        let width = width.max(1);
+        match &mut self.data {
+            AnnotationData::Line { stroke_width, .. }
+            | AnnotationData::Arrow { stroke_width, .. }
+            | AnnotationData::Brush { stroke_width, .. }
+            | AnnotationData::Rectangle { stroke_width, .. }
+            | AnnotationData::Ellipse { stroke_width, .. }
+            | AnnotationData::Marker { stroke_width, .. } => *stroke_width = width,
+            AnnotationData::Mosaic { pixel_size, .. } => *pixel_size = width,
+            AnnotationData::Blur { radius, .. } => *radius = width,
+            AnnotationData::Counter { radius, .. } => *radius = width,
+            AnnotationData::Text { style, .. } => style.size = width,
+            AnnotationData::FilledBox { .. } => return false,
+        }
+        true
+    }
+
     pub fn hit_test(&self, point: Point) -> bool {
         self.bounds().contains(point)
     }
@@ -310,6 +344,37 @@ impl Document {
             return true;
         }
         false
+    }
+
+    pub fn duplicate_selected(&mut self, offset: Point) -> Option<AnnotationId> {
+        let id = self.selected?;
+        let mut duplicate = self.annotations.iter().find(|annotation| annotation.id == id)?.clone();
+        duplicate.id = Uuid::new_v4();
+        duplicate.translate(offset.x, offset.y);
+        let duplicate_id = duplicate.id;
+        self.annotations.push(duplicate);
+        self.selected = Some(duplicate_id);
+        Some(duplicate_id)
+    }
+
+    pub fn apply_color_to_selected(&mut self, color: Color) -> bool {
+        let Some(id) = self.selected else {
+            return false;
+        };
+        self.annotations
+            .iter_mut()
+            .find(|annotation| annotation.id == id)
+            .is_some_and(|annotation| annotation.apply_color(color))
+    }
+
+    pub fn apply_stroke_to_selected(&mut self, width: u32) -> bool {
+        let Some(id) = self.selected else {
+            return false;
+        };
+        self.annotations
+            .iter_mut()
+            .find(|annotation| annotation.id == id)
+            .is_some_and(|annotation| annotation.apply_stroke_width(width))
     }
 
     pub fn text_annotation_at(&self, point: Point) -> Option<AnnotationId> {
@@ -482,6 +547,56 @@ mod tests {
         assert!(matches!(
             &document.annotations[0].data,
             AnnotationData::Text { text, .. } if text == "new"
+        ));
+    }
+
+    #[test]
+    fn selected_annotation_can_be_duplicated_with_offset() {
+        let mut document = Document::new(120, 80, DefaultTool::Select);
+        let annotation = Annotation::new(AnnotationData::Rectangle {
+            rect: Rect { x: 10.0, y: 12.0, width: 20.0, height: 24.0 },
+            color: Color::rgba(255, 0, 0, 255),
+            stroke_width: 4,
+        });
+        let original_id = annotation.id;
+        document.add_annotation(annotation);
+        document.selected = Some(original_id);
+
+        let duplicate_id =
+            document.duplicate_selected(Point::new(8.0, 10.0)).expect("duplicate selected");
+
+        assert_ne!(duplicate_id, original_id);
+        assert_eq!(document.selected, Some(duplicate_id));
+        assert_eq!(document.annotations.len(), 2);
+        assert_eq!(
+            document.annotations[1].bounds(),
+            Rect { x: 18.0, y: 22.0, width: 20.0, height: 24.0 }
+        );
+    }
+
+    #[test]
+    fn selected_annotation_accepts_color_and_stroke_changes() {
+        let mut document = Document::new(120, 80, DefaultTool::Select);
+        let annotation = Annotation::new(AnnotationData::Arrow {
+            start: Point::new(10.0, 10.0),
+            end: Point::new(40.0, 40.0),
+            color: Color::rgba(255, 0, 0, 255),
+            stroke_width: 4,
+        });
+        let id = annotation.id;
+        document.add_annotation(annotation);
+        document.selected = Some(id);
+
+        assert!(document.apply_color_to_selected(Color::rgba(0, 0, 255, 255)));
+        assert!(document.apply_stroke_to_selected(8));
+
+        assert!(matches!(
+            document.annotations[0].data,
+            AnnotationData::Arrow {
+                color: Color { r: 0, g: 0, b: 255, a: 255 },
+                stroke_width: 8,
+                ..
+            }
         ));
     }
 }

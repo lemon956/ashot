@@ -15,17 +15,21 @@ use anyhow::{Context, Result};
 use ashot_capture::{CaptureClient, CaptureError};
 use ashot_core::{
     Annotation, AnnotationData, AppConfig, Color, DefaultTool, Document, EditorHistory,
-    LinuxDistroFamily, OcrBackend, Point, Rect, TextStyle, TextWeight, default_ocr_languages,
-    detect_linux_distro_family, finalize_capture_with_config, language_install_command,
-    language_package_for_distro, render_document, render_filename, save_document_png,
-    search_ocr_languages,
+    LinuxDistroFamily, OcrBackend, Point, Rect, ResizeHandle, TextStyle, TextWeight,
+    default_ocr_languages, detect_linux_distro_family, finalize_capture_with_config,
+    language_install_command, language_package_for_distro, render_document, render_filename,
+    save_document_png, search_ocr_languages,
 };
 use ashot_ipc::{
     APP_ID, CaptureMode, CaptureOutcome, CommandOutcome, DBUS_NAME, DBUS_PATH, OutcomeKind,
 };
+use glib::prelude::IsA;
 use glib::translate::ToGlibPtr;
 use gtk::gdk::prelude::ToplevelExt;
-use gtk::prelude::{Cast, EventControllerExt, GestureSingleExt, NativeExt};
+use gtk::prelude::{
+    Cast, EventControllerExt, FileChooserExt, FileChooserExtManual, GestureSingleExt,
+    NativeDialogExt, NativeDialogExtManual, NativeExt, StyleContextExt, WidgetExt,
+};
 use gtk::{
     Align, Box as GtkBox, Button, DrawingArea, Entry, Grid, HeaderBar, Label, MenuButton,
     Orientation, Overlay, Picture, PolicyType, Popover, ScrolledWindow,
@@ -45,10 +49,14 @@ use zbus::connection::Builder as ConnectionBuilder;
 
 const EDITOR_HISTORY_LIMIT: usize = 64;
 const COLOR_ROW_LIMIT: usize = 6;
+const SELECTION_HANDLE_RADIUS: f64 = 6.4;
+const SELECTION_HANDLE_HIT_TOLERANCE: f32 = 13.0;
 
 type ApplicationWindow = adw::ApplicationWindow;
 type ColorCallback = Rc<dyn Fn(Color)>;
 type ColorMemoryButtons = Rc<RefCell<Vec<(Rc<Cell<Color>>, DrawingArea, Button)>>>;
+type StatusCallback = Rc<dyn Fn(Option<String>)>;
+type ToastCallback = Rc<dyn Fn(&str)>;
 
 pub fn run() -> Result<()> {
     let _ = fmt().with_env_filter(EnvFilter::from_env("ASHOT_LOG")).with_target(false).try_init();
@@ -262,6 +270,18 @@ impl ServiceState {
     }
 }
 
+fn persist_config_change<F>(state: &Arc<ServiceState>, update: F)
+where
+    F: FnOnce(&mut AppConfig),
+{
+    let mut config = state.config_snapshot();
+    update(&mut config);
+    if let Err(error) = config.save() {
+        error!("failed to save config: {error}");
+    }
+    state.update_config(config);
+}
+
 fn capture_message(mode: CaptureMode) -> &'static str {
     match mode {
         CaptureMode::Area => "region capture completed",
@@ -422,7 +442,7 @@ fn present_window_command(
             present_settings(app, state);
         }
         WindowCommand::Pin(path) => {
-            present_pin_window(app, path);
+            present_pin_window(app, state, path);
         }
     }
 }
@@ -735,78 +755,76 @@ fn present_launcher(app: &adw::Application, state: Arc<ServiceState>, runtime: H
 }
 
 fn present_settings(app: &adw::Application, state: Arc<ServiceState>) {
-    let window = adw::ApplicationWindow::builder()
+    let window = adw::PreferencesWindow::builder()
         .application(app)
         .title("aShot Settings")
         .default_width(680)
         .default_height(720)
+        .search_enabled(true)
         .build();
 
     let config = state.config_snapshot();
-
-    let root = GtkBox::new(Orientation::Vertical, 12);
-    root.set_margin_top(16);
-    root.set_margin_bottom(16);
-    root.set_margin_start(16);
-    root.set_margin_end(16);
+    let page = adw::PreferencesPage::new();
+    let capture_group = adw::PreferencesGroup::builder().title("Capture and Save").build();
+    let ocr_group = adw::PreferencesGroup::builder()
+        .title("OCR")
+        .description("Configure text recognition and local Tesseract language package hints.")
+        .build();
+    let actions_group = adw::PreferencesGroup::builder().title("Actions").build();
 
     let save_dir_entry = Entry::builder()
         .hexpand(true)
         .text(config.default_save_dir.to_string_lossy().as_ref())
         .build();
-    root.append(&Label::new(Some("Default save directory")));
-    root.append(&save_dir_entry);
+    let save_dir_row = settings_labeled_control("Default save directory", &save_dir_entry);
+    capture_group.add(&save_dir_row);
 
     let template_entry = Entry::builder().hexpand(true).text(&config.filename_template).build();
-    root.append(&Label::new(Some("Filename template")));
-    root.append(&template_entry);
+    let template_row = settings_labeled_control("Filename template", &template_entry);
+    capture_group.add(&template_row);
 
     let auto_copy = gtk::CheckButton::with_label("Auto-copy saved screenshots to clipboard");
     auto_copy.set_active(config.auto_copy);
-    root.append(&auto_copy);
+    capture_group.add(&auto_copy);
 
     let open_editor = gtk::CheckButton::with_label("Open the editor after capture");
     open_editor.set_active(config.post_capture_open_editor);
-    root.append(&open_editor);
+    capture_group.add(&open_editor);
 
     let pin_after_save = gtk::CheckButton::with_label("Pin screenshots after save");
     pin_after_save.set_active(config.pin_after_save);
-    root.append(&pin_after_save);
-
-    let ocr_title = Label::new(Some("OCR"));
-    ocr_title.add_css_class("heading");
-    ocr_title.set_xalign(0.0);
-    root.append(&ocr_title);
+    capture_group.add(&pin_after_save);
 
     let ocr_space_backend = gtk::CheckButton::with_label("Use OCR.space online backend");
     ocr_space_backend
         .set_tooltip_text(Some("When enabled, selected OCR regions are uploaded to OCR.space."));
     ocr_space_backend.set_active(config.ocr_backend == OcrBackend::OcrSpace);
-    root.append(&ocr_space_backend);
+    ocr_group.add(&ocr_space_backend);
 
     let ocr_api_key_entry = Entry::builder()
         .hexpand(true)
         .text(&config.ocr_space_api_key)
         .placeholder_text("OCR.space API key")
         .build();
-    root.append(&ocr_api_key_entry);
+    let api_key_row = settings_labeled_control("OCR.space API key", &ocr_api_key_entry);
+    ocr_group.add(&api_key_row);
 
     let ocr_filter_symbols = gtk::CheckButton::with_label("Filter emoji and symbol noise");
     ocr_filter_symbols.set_active(config.ocr_filter_symbols);
-    root.append(&ocr_filter_symbols);
+    ocr_group.add(&ocr_filter_symbols);
 
     let distro = detect_linux_distro_family();
     let selected_ocr_languages = Rc::new(RefCell::new(config.ocr_languages.clone()));
     let selected_ocr_label = Label::new(None);
     selected_ocr_label.set_xalign(0.0);
     selected_ocr_label.set_wrap(true);
-    root.append(&selected_ocr_label);
+    ocr_group.add(&selected_ocr_label);
 
     let install_command_label = Label::new(None);
     install_command_label.set_xalign(0.0);
     install_command_label.set_wrap(true);
     install_command_label.add_css_class("dim-label");
-    root.append(&install_command_label);
+    ocr_group.add(&install_command_label);
 
     let language_menu = ocr_language_install_menu(
         selected_ocr_languages.clone(),
@@ -814,12 +832,12 @@ fn present_settings(app: &adw::Application, state: Arc<ServiceState>) {
         install_command_label.clone(),
         distro,
     );
-    root.append(&language_menu);
+    ocr_group.add(&language_menu);
 
     let install_actions = GtkBox::new(Orientation::Horizontal, 8);
     let copy_install_command = Button::with_label("Copy Install Command");
     install_actions.append(&copy_install_command);
-    root.append(&install_actions);
+    ocr_group.add(&install_actions);
 
     let selected_ocr_languages_for_copy = selected_ocr_languages.clone();
     copy_install_command.connect_clicked(move |_| {
@@ -833,10 +851,11 @@ fn present_settings(app: &adw::Application, state: Arc<ServiceState>) {
     let save = Button::with_label("Save");
     let reset = Button::with_label("Restore defaults");
     let close = Button::with_label("Close");
+    save.add_css_class("suggested-action");
     actions.append(&save);
     actions.append(&reset);
     actions.append(&close);
-    root.append(&actions);
+    actions_group.add(&actions);
 
     let state_for_save = state.clone();
     let save_dir_entry_for_save = save_dir_entry.clone();
@@ -901,13 +920,25 @@ fn present_settings(app: &adw::Application, state: Arc<ServiceState>) {
         window_for_close.close();
     });
 
-    let scrolled = ScrolledWindow::builder()
-        .hscrollbar_policy(PolicyType::Never)
-        .vscrollbar_policy(PolicyType::Automatic)
-        .child(&root)
-        .build();
-    window.set_content(Some(&scrolled));
+    page.add(&capture_group);
+    page.add(&ocr_group);
+    page.add(&actions_group);
+    window.add(&page);
     window.present();
+}
+
+fn settings_labeled_control(label: &str, control: &impl IsA<gtk::Widget>) -> GtkBox {
+    let row = GtkBox::new(Orientation::Vertical, 6);
+    row.set_margin_top(6);
+    row.set_margin_bottom(6);
+    row.set_margin_start(6);
+    row.set_margin_end(6);
+    let title = Label::new(Some(label));
+    title.set_xalign(0.0);
+    title.add_css_class("dim-label");
+    row.append(&title);
+    row.append(control);
+    row
 }
 
 fn refresh_ocr_language_summary(
@@ -1113,6 +1144,8 @@ fn present_editor(
     info!("present_editor history created");
     let draft = Rc::new(RefCell::new(None::<DraftAnnotation>));
     let moving = Rc::new(RefCell::new(None::<Point>));
+    let resizing = Rc::new(RefCell::new(None::<ResizeHandle>));
+    let brush_cursor_preview = Rc::new(Cell::new(None::<Point>));
     let active_text_edit = Rc::new(RefCell::new(None::<ActiveTextEdit>));
     let active_color = Rc::new(Cell::new(config.default_color));
     let active_stroke = Rc::new(Cell::new(config.default_stroke_width));
@@ -1150,6 +1183,43 @@ fn present_editor(
     root.set_margin_bottom(6);
     root.set_margin_start(6);
     root.set_margin_end(6);
+    let toast_overlay = adw::ToastOverlay::new();
+    toast_overlay.set_child(Some(&root));
+    let show_toast: ToastCallback = {
+        let toast_overlay = toast_overlay.clone();
+        Rc::new(move |message: &str| {
+            toast_overlay.add_toast(adw::Toast::new(message));
+        })
+    };
+
+    let status_label = Label::new(None);
+    status_label.set_xalign(0.0);
+    status_label.add_css_class("dim-label");
+    let refresh_status: StatusCallback = {
+        let status_label = status_label.clone();
+        let document = document.clone();
+        let active_color = active_color.clone();
+        let active_stroke = active_stroke.clone();
+        let state = state.clone();
+        let image_width = base_image.width();
+        let image_height = base_image.height();
+        Rc::new(move |message: Option<String>| {
+            let tool = document
+                .try_borrow()
+                .map(|document| document.active_tool)
+                .unwrap_or(DefaultTool::Select);
+            let config = state.config_snapshot();
+            status_label.set_text(&editor_status_text(
+                tool,
+                active_color.get(),
+                active_stroke.get(),
+                image_width,
+                image_height,
+                &config.default_save_dir,
+                message.as_deref(),
+            ));
+        })
+    };
 
     let header = HeaderBar::new();
     root.append(&header);
@@ -1159,12 +1229,20 @@ fn present_editor(
     let redo = action_icon_button("edit-redo-symbolic", "Redo");
     let copy = action_icon_button("edit-copy-symbolic", "Copy to Clipboard");
     let pin = action_icon_button("view-pin-symbolic", "Pin Screenshot");
-    let save = action_text_button("document-save-symbolic", "Save", "Save");
-    let save_close = action_text_button("document-save-as-symbolic", "Done", "Save and Close");
+    let [save_label, save_to_label, copy_close_label] = output_action_menu_items();
+    let save = action_text_button("document-save-symbolic", save_label, "Save");
+    let save_close = action_text_button(
+        "document-save-as-symbolic",
+        output_action_primary_label(),
+        "Save and Close",
+    );
+    let save_to = action_text_button("folder-save-symbolic", save_to_label, "Save to a folder");
+    let copy_close = action_text_button("edit-copy-symbolic", copy_close_label, "Copy and Close");
 
     let overlay = Overlay::new();
     overlay.set_hexpand(true);
     overlay.set_vexpand(true);
+    overlay.add_css_class("ashot-canvas-surface");
     let picture = Picture::for_filename(&image_path);
     picture.set_can_shrink(true);
     picture.set_halign(Align::Start);
@@ -1190,6 +1268,12 @@ fn present_editor(
     overlay.add_overlay(&text_entry);
     info!("present_editor text entry added");
 
+    let canvas_frame = GtkBox::new(Orientation::Vertical, 0);
+    canvas_frame.add_css_class("ashot-canvas-frame");
+    canvas_frame.set_halign(Align::Start);
+    canvas_frame.set_valign(Align::Start);
+    canvas_frame.append(&overlay);
+
     let scrolled = ScrolledWindow::builder()
         .hscrollbar_policy(PolicyType::Automatic)
         .vscrollbar_policy(PolicyType::Automatic)
@@ -1197,7 +1281,7 @@ fn present_editor(
         .min_content_height(420)
         .hexpand(true)
         .vexpand(true)
-        .child(&overlay)
+        .child(&canvas_frame)
         .build();
     scrolled.add_css_class("view");
 
@@ -1206,6 +1290,7 @@ fn present_editor(
     editor_body.set_vexpand(true);
 
     let left_panel = GtkBox::new(Orientation::Vertical, 10);
+    left_panel.add_css_class("ashot-sidebar");
     left_panel.set_hexpand(false);
     left_panel.set_vexpand(true);
     left_panel.set_margin_top(4);
@@ -1223,10 +1308,11 @@ fn present_editor(
     left_panel.append(&quick_actions);
 
     let output_actions = GtkBox::new(Orientation::Horizontal, 6);
-    save.set_hexpand(true);
     save_close.set_hexpand(true);
-    output_actions.append(&save);
     output_actions.append(&save_close);
+    save_close.add_css_class("ashot-action-primary");
+    let output_more = output_actions_menu(&save, &save_to, &copy_close);
+    output_actions.append(&output_more);
     left_panel.append(&output_actions);
     update_history_action_buttons(&history, &undo, &redo);
 
@@ -1237,23 +1323,28 @@ fn present_editor(
     let tool_buttons = Rc::new(RefCell::new(Vec::<(DefaultTool, Button)>::new()));
     for (index, (label, tool)) in editor_tool_layout().iter().enumerate() {
         let button = Button::new();
-        let icon = Label::new(None);
-        icon.set_markup(&format!(
-            "<span size=\"large\" weight=\"600\">{}</span>",
-            tool_icon_label(*tool)
-        ));
+        let icon = tool_icon_area(*tool);
         button.set_child(Some(&icon));
         button.set_tooltip_text(Some(label));
         button.set_hexpand(true);
         button.set_size_request(48, 38);
+        button.add_css_class("ashot-tool-button");
         let document = document.clone();
         let tool_buttons_for_click = tool_buttons.clone();
+        let canvas_for_tool = canvas.clone();
+        let state_for_tool = state.clone();
+        let refresh_status_for_tool = refresh_status.clone();
         let tool = *tool;
         button.connect_clicked(move |_| {
             if let Ok(mut document) = document.try_borrow_mut() {
                 document.active_tool = tool;
             }
             update_tool_button_selection(&tool_buttons_for_click, tool);
+            apply_editor_cursor(&canvas_for_tool, tool);
+            persist_config_change(&state_for_tool, |config| {
+                config.default_tool = tool;
+            });
+            refresh_status_for_tool(None);
         });
         tool_grid.attach(&button, (index % 3) as i32, (index / 3) as i32, 1, 1);
         tool_buttons.borrow_mut().push((tool, button));
@@ -1262,29 +1353,47 @@ fn present_editor(
     info!("present_editor tool grid added");
 
     left_panel.append(&section_title("OCR"));
-    let ocr_tool_button = Button::with_label("OCR");
+    let ocr_tool_button = Button::new();
+    let ocr_tool_content = GtkBox::new(Orientation::Horizontal, 6);
+    ocr_tool_content.set_halign(Align::Center);
+    ocr_tool_content.append(&tool_icon_area(DefaultTool::Ocr));
+    ocr_tool_content.append(&Label::new(Some("OCR")));
+    ocr_tool_button.set_child(Some(&ocr_tool_content));
     ocr_tool_button.set_tooltip_text(Some("Recognize text from a selected region"));
     ocr_tool_button.set_hexpand(true);
     ocr_tool_button.set_size_request(0, 38);
+    ocr_tool_button.add_css_class("ashot-tool-button");
     let document_for_ocr_button = document.clone();
     let tool_buttons_for_ocr = tool_buttons.clone();
+    let canvas_for_ocr_button = canvas.clone();
+    let state_for_ocr_button = state.clone();
+    let refresh_status_for_ocr = refresh_status.clone();
     ocr_tool_button.connect_clicked(move |_| {
         if let Ok(mut document) = document_for_ocr_button.try_borrow_mut() {
             document.active_tool = DefaultTool::Ocr;
         }
         update_tool_button_selection(&tool_buttons_for_ocr, DefaultTool::Ocr);
+        apply_editor_cursor(&canvas_for_ocr_button, DefaultTool::Ocr);
+        persist_config_change(&state_for_ocr_button, |config| {
+            config.default_tool = DefaultTool::Ocr;
+        });
+        refresh_status_for_ocr(None);
     });
     tool_buttons.borrow_mut().push((DefaultTool::Ocr, ocr_tool_button.clone()));
     left_panel.append(&ocr_tool_button);
-    let ocr_language_selector = ocr_language_menu(active_ocr_languages.clone());
+    let ocr_language_selector = ocr_language_menu(active_ocr_languages.clone(), state.clone());
     left_panel.append(&ocr_language_selector);
     let ocr_filter_symbols_toggle = gtk::CheckButton::with_label("Filter emoji/symbols");
     ocr_filter_symbols_toggle.set_active(config.ocr_filter_symbols);
     ocr_filter_symbols_toggle
         .set_tooltip_text(Some("Remove emoji and decorative symbol noise from OCR text"));
     let active_ocr_filter_symbols_for_toggle = active_ocr_filter_symbols.clone();
+    let state_for_ocr_filter = state.clone();
     ocr_filter_symbols_toggle.connect_toggled(move |button| {
         active_ocr_filter_symbols_for_toggle.set(button.is_active());
+        persist_config_change(&state_for_ocr_filter, |config| {
+            config.ocr_filter_symbols = button.is_active();
+        });
     });
     left_panel.append(&ocr_filter_symbols_toggle);
     info!("present_editor ocr section added");
@@ -1300,13 +1409,30 @@ fn present_editor(
         tool_buttons.clone(),
         color_ui_refresh.clone(),
         recent_color_recorder.clone(),
+        canvas.clone(),
+        state.clone(),
+        history.clone(),
+        undo.clone(),
+        redo.clone(),
+        refresh_status.clone(),
+        show_toast.clone(),
     );
     left_panel.append(&color_picker);
     info!("present_editor color section added");
 
     left_panel.append(&section_title("Stroke / Effect"));
-    let stroke_menu =
-        stroke_width_dropdown(active_stroke.clone(), active_color.clone(), stroke_previews.clone());
+    let stroke_menu = stroke_width_dropdown(
+        active_stroke.clone(),
+        active_color.clone(),
+        stroke_previews.clone(),
+        document.clone(),
+        history.clone(),
+        canvas.clone(),
+        undo.clone(),
+        redo.clone(),
+        state.clone(),
+        refresh_status.clone(),
+    );
     left_panel.append(&stroke_menu);
     info!("present_editor stroke section added");
 
@@ -1336,6 +1462,9 @@ fn present_editor(
     let doc_for_draw = document.clone();
     let draft_for_draw = draft.clone();
     let scale_for_draw = image_scale.clone();
+    let brush_cursor_for_draw = brush_cursor_preview.clone();
+    let active_color_for_draw = active_color.clone();
+    let active_stroke_for_draw = active_stroke.clone();
     canvas.set_draw_func(move |_, cr, _, _| {
         let _ = cr.save();
         cr.scale(scale_for_draw.get(), scale_for_draw.get());
@@ -1346,8 +1475,25 @@ fn present_editor(
                 draw_annotation(cr, annotation);
             }
         }
+        if let Ok(document) = doc_for_draw.try_borrow()
+            && let Some(bounds) = selected_annotation_bounds(&document)
+        {
+            draw_selection_overlay(cr, bounds);
+        }
         if let Some(annotation) = draft_preview_for_draw(&draft_for_draw) {
             draw_annotation(cr, &annotation);
+        }
+        if let Ok(document) = doc_for_draw.try_borrow()
+            && matches!(document.active_tool, DefaultTool::Brush | DefaultTool::Marker)
+            && draft_for_draw.try_borrow().is_ok_and(|draft| draft.is_none())
+            && let Some(point) = brush_cursor_for_draw.get()
+        {
+            draw_brush_cursor_preview(
+                cr,
+                point,
+                active_color_for_draw.get(),
+                active_stroke_for_draw.get(),
+            );
         }
         let _ = cr.restore();
     });
@@ -1453,6 +1599,37 @@ fn present_editor(
     canvas.add_controller(click);
     info!("present_editor click controller added");
 
+    let motion = gtk::EventControllerMotion::new();
+    let doc_for_motion = document.clone();
+    let canvas_for_motion = canvas.clone();
+    let scale_for_motion = image_scale.clone();
+    let brush_cursor_for_motion = brush_cursor_preview.clone();
+    motion.connect_motion(move |_, x, y| {
+        let point = scaled_canvas_point(x, y, scale_for_motion.get());
+        brush_cursor_for_motion.set(Some(point));
+        if let Ok(document) = doc_for_motion.try_borrow() {
+            apply_canvas_hover_cursor(
+                &canvas_for_motion,
+                &document,
+                point,
+                SELECTION_HANDLE_HIT_TOLERANCE / (scale_for_motion.get().max(0.1) as f32),
+            );
+        }
+        canvas_for_motion.queue_draw();
+    });
+    let doc_for_motion_leave = document.clone();
+    let canvas_for_motion_leave = canvas.clone();
+    let brush_cursor_for_leave = brush_cursor_preview.clone();
+    motion.connect_leave(move |_| {
+        brush_cursor_for_leave.set(None);
+        if let Ok(document) = doc_for_motion_leave.try_borrow() {
+            apply_editor_cursor(&canvas_for_motion_leave, document.active_tool);
+        }
+        canvas_for_motion_leave.queue_draw();
+    });
+    canvas.add_controller(motion);
+    info!("present_editor motion controller added");
+
     let doc_for_text_commit = document.clone();
     let history_for_text_commit = history.clone();
     let canvas_for_text_commit = canvas.clone();
@@ -1504,6 +1681,7 @@ fn present_editor(
     let doc_for_drag = document.clone();
     let draft_for_drag = draft.clone();
     let moving_for_drag = moving.clone();
+    let resizing_for_drag = resizing.clone();
     let history_for_drag = history.clone();
     let color_for_drag = active_color.clone();
     let color_ui_refresh_for_drag = color_ui_refresh.clone();
@@ -1515,11 +1693,17 @@ fn present_editor(
     let redo_for_drag = redo.clone();
     drag.connect_drag_begin(move |_, x, y| {
         let point = scaled_canvas_point(x, y, scale_for_drag.get());
-        let Some((annotations, tool)) = ({
+        let Some((annotations, tool, resize_handle)) = ({
             let Ok(document) = doc_for_drag.try_borrow() else {
                 return;
             };
-            Some((document.annotations.clone(), document.active_tool))
+            let handle_tolerance =
+                SELECTION_HANDLE_HIT_TOLERANCE / (scale_for_drag.get().max(0.1) as f32);
+            Some((
+                document.annotations.clone(),
+                document.active_tool,
+                resize_handle_at(&document, point, handle_tolerance),
+            ))
         }) else {
             return;
         };
@@ -1538,31 +1722,41 @@ fn present_editor(
             return;
         }
 
-        let selected = if tool_can_select_existing(tool) {
-            doc_for_drag
+        if tool_can_select_existing(tool) {
+            if let Some(handle) = resize_handle {
+                if let Ok(mut history) = history_for_drag.try_borrow_mut() {
+                    history.snapshot(&annotations);
+                }
+                update_history_action_buttons(&history_for_drag, &undo_for_drag, &redo_for_drag);
+                if let Ok(mut resizing) = resizing_for_drag.try_borrow_mut() {
+                    *resizing = Some(handle);
+                }
+                return;
+            }
+
+            let selected = doc_for_drag
                 .try_borrow_mut()
                 .ok()
                 .and_then(|mut document| document.select_at(point))
-                .is_some()
-        } else {
-            false
-        };
+                .is_some();
+
+            if selected {
+                if let Ok(mut history) = history_for_drag.try_borrow_mut() {
+                    history.snapshot(&annotations);
+                }
+                update_history_action_buttons(&history_for_drag, &undo_for_drag, &redo_for_drag);
+                if let Ok(mut moving) = moving_for_drag.try_borrow_mut() {
+                    *moving = Some(point);
+                }
+            }
+            canvas_for_drag.queue_draw();
+            return;
+        }
 
         if let Ok(mut history) = history_for_drag.try_borrow_mut() {
             history.snapshot(&annotations);
         }
         update_history_action_buttons(&history_for_drag, &undo_for_drag, &redo_for_drag);
-
-        if selected {
-            if let Ok(mut moving) = moving_for_drag.try_borrow_mut() {
-                *moving = Some(point);
-            }
-            return;
-        }
-
-        if tool_can_select_existing(tool) {
-            return;
-        }
 
         if let Ok(mut draft) = draft_for_drag.try_borrow_mut() {
             *draft = Some(DraftAnnotation::new(
@@ -1577,11 +1771,21 @@ fn present_editor(
     let doc_for_update = document.clone();
     let draft_for_update = draft.clone();
     let moving_for_update = moving.clone();
+    let resizing_for_update = resizing.clone();
     let canvas_for_update = canvas.clone();
     let scale_for_update = image_scale.clone();
     drag.connect_drag_update(move |gesture, dx, dy| {
         let (start_x, start_y) = gesture.start_point().unwrap_or((0.0, 0.0));
         let current = scaled_canvas_point(start_x + dx, start_y + dy, scale_for_update.get());
+        let resize_handle = resizing_for_update.try_borrow().ok().and_then(|handle| *handle);
+        if let Some(handle) = resize_handle {
+            if let Ok(mut document) = doc_for_update.try_borrow_mut() {
+                document.resize_selected(handle, current);
+            }
+            canvas_for_update.queue_draw();
+            return;
+        }
+
         if let Some((delta_x, delta_y)) = moving_delta_and_update(&moving_for_update, current) {
             if let Ok(mut document) = doc_for_update.try_borrow_mut() {
                 document.move_selected(delta_x, delta_y);
@@ -1608,6 +1812,7 @@ fn present_editor(
     let doc_for_end = document.clone();
     let draft_for_end = draft.clone();
     let moving_for_end = moving.clone();
+    let resizing_for_end = resizing.clone();
     let canvas_for_end = canvas.clone();
     let state_for_ocr = state.clone();
     let runtime_for_ocr = runtime.clone();
@@ -1615,10 +1820,15 @@ fn present_editor(
     let window_for_ocr = window.clone();
     let active_ocr_languages_for_end = active_ocr_languages.clone();
     let active_ocr_filter_symbols_for_end = active_ocr_filter_symbols.clone();
+    let refresh_status_for_ocr_end = refresh_status.clone();
+    let show_toast_for_ocr_end = show_toast.clone();
     let recent_for_end = recent_color_recorder.clone();
     drag.connect_drag_end(move |_, _, _| {
         if let Ok(mut moving) = moving_for_end.try_borrow_mut() {
             *moving = None;
+        }
+        if let Ok(mut resizing) = resizing_for_end.try_borrow_mut() {
+            *resizing = None;
         }
         let draft = draft_for_end.try_borrow_mut().ok().and_then(|mut draft| draft.take());
         let Some(draft) = draft else {
@@ -1639,6 +1849,8 @@ fn present_editor(
                 draft.bounds(),
                 ocr_languages,
                 active_ocr_filter_symbols_for_end.get(),
+                Some(refresh_status_for_ocr_end.clone()),
+                Some(show_toast_for_ocr_end.clone()),
             );
             canvas_for_end.queue_draw();
             return;
@@ -1647,8 +1859,12 @@ fn present_editor(
         let draft_color = draft.color;
         let annotation = draft.finish();
         if let Some(annotation) = annotation {
+            let keep_selection = annotation_keeps_selection_after_creation(&annotation);
             if let Ok(mut document) = doc_for_end.try_borrow_mut() {
                 document.add_annotation(annotation);
+                if !keep_selection {
+                    document.selected = None;
+                }
             }
             if let Some(record_recent) = recent_for_end.borrow().as_ref().cloned() {
                 record_recent(draft_color);
@@ -1658,6 +1874,8 @@ fn present_editor(
     });
     canvas.add_controller(drag);
     info!("present_editor drag controller added");
+
+    apply_editor_cursor(&canvas, config.default_tool);
 
     let doc_for_undo = document.clone();
     let canvas_for_undo = canvas.clone();
@@ -1699,10 +1917,61 @@ fn present_editor(
         }
     });
 
+    let key_controller = gtk::EventControllerKey::new();
+    let doc_for_keys = document.clone();
+    let history_for_keys = history.clone();
+    let canvas_for_keys = canvas.clone();
+    let undo_for_keys = undo.clone();
+    let redo_for_keys = redo.clone();
+    let active_text_edit_for_keys = active_text_edit.clone();
+    key_controller.connect_key_pressed(move |_, key, _, modifiers| {
+        if active_text_edit_for_keys.try_borrow().is_ok_and(|edit| edit.is_some()) {
+            return glib::Propagation::Proceed;
+        }
+
+        let ctrl = modifiers.contains(gtk::gdk::ModifierType::CONTROL_MASK);
+        let shift = modifiers.contains(gtk::gdk::ModifierType::SHIFT_MASK);
+        let nudge = if shift { 10.0 } else { 1.0 };
+
+        let changed = if let Ok(mut document) = doc_for_keys.try_borrow_mut() {
+            let before = document.annotations.clone();
+            let changed = match key {
+                gtk::gdk::Key::Delete | gtk::gdk::Key::BackSpace => {
+                    document.remove_selected().is_some()
+                }
+                gtk::gdk::Key::d | gtk::gdk::Key::D if ctrl => {
+                    document.duplicate_selected(Point::new(12.0, 12.0)).is_some()
+                }
+                gtk::gdk::Key::Left => document.move_selected(-nudge, 0.0),
+                gtk::gdk::Key::Right => document.move_selected(nudge, 0.0),
+                gtk::gdk::Key::Up => document.move_selected(0.0, -nudge),
+                gtk::gdk::Key::Down => document.move_selected(0.0, nudge),
+                _ => false,
+            };
+            if changed && let Ok(mut history) = history_for_keys.try_borrow_mut() {
+                history.snapshot(&before);
+            }
+            changed
+        } else {
+            false
+        };
+
+        if changed {
+            update_history_action_buttons(&history_for_keys, &undo_for_keys, &redo_for_keys);
+            canvas_for_keys.queue_draw();
+            glib::Propagation::Stop
+        } else {
+            glib::Propagation::Proceed
+        }
+    });
+    window.add_controller(key_controller);
+
     let doc_for_save = document.clone();
     let state_for_save = state.clone();
     let image_for_save = base_image.clone();
     let path_for_save = image_path.clone();
+    let refresh_status_for_save = refresh_status.clone();
+    let show_toast_for_save = show_toast.clone();
     save.connect_clicked(move |button| {
         let config = state_for_save.config_snapshot();
         let initial_filename = suggested_save_filename_at(&config, chrono::Local::now());
@@ -1710,6 +1979,8 @@ fn present_editor(
         let state_for_confirm = state_for_save.clone();
         let image_for_confirm = image_for_save.clone();
         let path_for_confirm = path_for_save.clone();
+        let refresh_status_for_confirm = refresh_status_for_save.clone();
+        let show_toast_for_confirm = show_toast_for_save.clone();
         show_save_filename_popover(button, initial_filename, "Save", move |requested_filename| {
             let config = state_for_confirm.config_snapshot();
             let Some(annotations) = annotation_snapshot_for_draw(&doc_for_confirm) else {
@@ -1726,10 +1997,14 @@ fn present_editor(
                         copy_image_to_clipboard(&output);
                     }
                     info!("saved screenshot based on {}", path_for_confirm.display());
+                    show_toast_for_confirm(&format!("Saved {}", output.display()));
+                    refresh_status_for_confirm(None);
                     true
                 }
                 Err(error) => {
                     error!("{error}");
+                    show_toast_for_confirm(&format!("Save failed: {error}"));
+                    refresh_status_for_confirm(None);
                     false
                 }
             }
@@ -1741,6 +2016,8 @@ fn present_editor(
     let image_for_save_close = base_image.clone();
     let window_for_save_close = window.clone();
     let app_for_save_close = app.clone();
+    let refresh_status_for_save_close = refresh_status.clone();
+    let show_toast_for_save_close = show_toast.clone();
     save_close.connect_clicked(move |button| {
         let config = state_for_save_close.config_snapshot();
         let initial_filename = suggested_save_filename_at(&config, chrono::Local::now());
@@ -1749,6 +2026,8 @@ fn present_editor(
         let image_for_confirm = image_for_save_close.clone();
         let window_for_confirm = window_for_save_close.clone();
         let app_for_confirm = app_for_save_close.clone();
+        let refresh_status_for_confirm = refresh_status_for_save_close.clone();
+        let show_toast_for_confirm = show_toast_for_save_close.clone();
         show_save_filename_popover(button, initial_filename, "Save", move |requested_filename| {
             let config = state_for_confirm.config_snapshot();
             let Some(annotations) = annotation_snapshot_for_draw(&doc_for_confirm) else {
@@ -1765,54 +2044,201 @@ fn present_editor(
                         copy_image_to_clipboard(&output);
                     }
                     if config.pin_after_save {
-                        present_pin_window(&app_for_confirm, output);
+                        present_pin_window(&app_for_confirm, state_for_confirm.clone(), output);
                     }
+                    show_toast_for_confirm("Saved");
+                    refresh_status_for_confirm(None);
                     window_for_confirm.close();
                     true
                 }
                 Err(error) => {
                     error!("{error}");
+                    show_toast_for_confirm(&format!("Save failed: {error}"));
+                    refresh_status_for_confirm(None);
                     false
                 }
             }
         });
     });
 
+    let doc_for_save_to = document.clone();
+    let state_for_save_to = state.clone();
+    let image_for_save_to = base_image.clone();
+    let path_for_save_to = image_path.clone();
+    let window_for_save_to = window.clone();
+    let refresh_status_for_save_to = refresh_status.clone();
+    let show_toast_for_save_to = show_toast.clone();
+    save_to.connect_clicked(move |button| {
+        let config = state_for_save_to.config_snapshot();
+        let initial_filename = suggested_save_filename_at(&config, chrono::Local::now());
+        let dialog = gtk::FileChooserNative::new(
+            Some("Choose Save Folder"),
+            Some(&window_for_save_to),
+            gtk::FileChooserAction::SelectFolder,
+            Some("Select"),
+            Some("Cancel"),
+        );
+        let initial_folder = gio::File::for_path(&config.default_save_dir);
+        let _ = dialog.set_current_folder(Some(&initial_folder));
+
+        let button_for_folder = button.clone();
+        let doc_for_folder = doc_for_save_to.clone();
+        let state_for_folder = state_for_save_to.clone();
+        let image_for_folder = image_for_save_to.clone();
+        let path_for_folder = path_for_save_to.clone();
+        let refresh_status_for_folder = refresh_status_for_save_to.clone();
+        let show_toast_for_folder = show_toast_for_save_to.clone();
+        dialog.run_async(move |dialog, response| {
+            if response != gtk::ResponseType::Accept {
+                refresh_status_for_folder(None);
+                dialog.destroy();
+                return;
+            }
+            let Some(folder) = dialog.file() else {
+                dialog.destroy();
+                error!("no save folder was selected");
+                show_toast_for_folder("Save failed: no folder selected");
+                return;
+            };
+            dialog.destroy();
+            let Some(folder_path) = folder.path() else {
+                error!("selected save folder is not a local path");
+                show_toast_for_folder("Save failed: selected folder is not local");
+                return;
+            };
+
+            let doc_for_confirm = doc_for_folder.clone();
+            let state_for_confirm = state_for_folder.clone();
+            let image_for_confirm = image_for_folder.clone();
+            let path_for_confirm = path_for_folder.clone();
+            let refresh_status_for_confirm = refresh_status_for_folder.clone();
+            let show_toast_for_confirm = show_toast_for_folder.clone();
+            show_save_filename_popover(
+                &button_for_folder,
+                initial_filename,
+                "Save",
+                move |requested_filename| {
+                    let mut config = state_for_confirm.config_snapshot();
+                    let Some(annotations) = annotation_snapshot_for_draw(&doc_for_confirm) else {
+                        return false;
+                    };
+                    match save_editor_document_to_dir_with_filename(
+                        &folder_path,
+                        &image_for_confirm,
+                        &annotations,
+                        &requested_filename,
+                    ) {
+                        Ok(output) => {
+                            config.default_save_dir = folder_path.clone();
+                            if config.auto_copy {
+                                copy_image_to_clipboard(&output);
+                            }
+                            let _ = config.save();
+                            state_for_confirm.update_config(config);
+                            info!(
+                                "saved screenshot based on {} to {}",
+                                path_for_confirm.display(),
+                                output.display()
+                            );
+                            show_toast_for_confirm(&format!("Saved {}", output.display()));
+                            refresh_status_for_confirm(None);
+                            true
+                        }
+                        Err(error) => {
+                            error!("{error}");
+                            show_toast_for_confirm(&format!("Save failed: {error}"));
+                            refresh_status_for_confirm(None);
+                            false
+                        }
+                    }
+                },
+            );
+        });
+    });
+
     let doc_for_copy = document.clone();
     let image_for_copy = base_image.clone();
-    copy.connect_clicked(move |_| {
+    let refresh_status_for_copy = refresh_status.clone();
+    let show_toast_for_copy = show_toast.clone();
+    copy.connect_clicked(move |button| {
+        set_button_loading(button, true);
         let Some(annotations) = annotation_snapshot_for_draw(&doc_for_copy) else {
+            set_button_loading(button, false);
             return;
         };
-        copy_rendered_document_to_clipboard(&image_for_copy, &annotations);
+        match copy_rendered_document_to_clipboard(&image_for_copy, &annotations) {
+            Ok(()) => show_toast_for_copy("Copied"),
+            Err(error) => show_toast_for_copy(&format!("Copy failed: {error}")),
+        }
+        refresh_status_for_copy(None);
+        set_button_loading(button, false);
+    });
+
+    let doc_for_copy_close = document.clone();
+    let image_for_copy_close = base_image.clone();
+    let window_for_copy_close = window.clone();
+    let refresh_status_for_copy_close = refresh_status.clone();
+    let show_toast_for_copy_close = show_toast.clone();
+    copy_close.connect_clicked(move |button| {
+        set_button_loading(button, true);
+        let Some(annotations) = annotation_snapshot_for_draw(&doc_for_copy_close) else {
+            set_button_loading(button, false);
+            return;
+        };
+        match copy_rendered_document_to_clipboard(&image_for_copy_close, &annotations) {
+            Ok(()) => window_for_copy_close.close(),
+            Err(error) => {
+                error!("{error}");
+                show_toast_for_copy_close(&format!("Copy failed: {error}"));
+                refresh_status_for_copy_close(None);
+                set_button_loading(button, false);
+            }
+        }
     });
 
     let doc_for_pin = document.clone();
     let image_for_pin = base_image.clone();
     let app_for_pin = app.clone();
-    pin.connect_clicked(move |_| {
+    let state_for_pin = state.clone();
+    let refresh_status_for_pin = refresh_status.clone();
+    let show_toast_for_pin = show_toast.clone();
+    pin.connect_clicked(move |button| {
+        set_button_loading(button, true);
         let temp = std::env::temp_dir().join("ashot_pin.png");
         let Some(annotations) = annotation_snapshot_for_draw(&doc_for_pin) else {
+            set_button_loading(button, false);
             return;
         };
         if save_document_png(&image_for_pin, &annotations, &temp).is_ok() {
-            present_pin_window(&app_for_pin, temp);
+            present_pin_window(&app_for_pin, state_for_pin.clone(), temp);
+            show_toast_for_pin("Pinned");
+            refresh_status_for_pin(None);
+        } else {
+            show_toast_for_pin("Pin failed");
+            refresh_status_for_pin(None);
         }
+        set_button_loading(button, false);
     });
 
-    root.append(&Label::new(Some(
-        "Drag to draw. Click text on the screenshot to edit it in place.",
-    )));
-    window.set_content(Some(&root));
+    refresh_status(None);
+    root.append(&status_label);
+    window.set_content(Some(&toast_overlay));
     window.present();
     info!("present_editor done: {}", image_path.display());
     Ok(())
 }
 
-fn present_pin_window(app: &adw::Application, image_path: PathBuf) {
+fn present_pin_window(app: &adw::Application, state: Arc<ServiceState>, image_path: PathBuf) {
     let (image_width, image_height) = image::image_dimensions(&image_path).unwrap_or((480, 320));
     let (window_width, window_height) = pin_window_size(image_width, image_height);
-    let initial_scale = pin_initial_scale(image_width, image_height, window_width, window_height);
+    let config = state.config_snapshot();
+    let initial_scale = pin_initial_scale_with_saved(
+        image_width,
+        image_height,
+        window_width,
+        window_height,
+        config.last_pin_scale,
+    );
 
     let window = ApplicationWindow::builder()
         .application(app)
@@ -1820,7 +2246,8 @@ fn present_pin_window(app: &adw::Application, image_path: PathBuf) {
         .default_width(window_width)
         .default_height(window_height)
         .build();
-    window.set_resizable(false);
+    window.set_resizable(true);
+    window.set_opacity(config.last_pin_opacity.clamp(0.35, 1.0));
 
     let image_overlay = Overlay::new();
     image_overlay.set_halign(Align::Start);
@@ -1833,6 +2260,7 @@ fn present_pin_window(app: &adw::Application, image_path: PathBuf) {
 
     let dimension_label = Label::new(None);
     dimension_label.add_css_class("osd");
+    dimension_label.add_css_class("ashot-osd");
     dimension_label.set_halign(Align::Start);
     dimension_label.set_valign(Align::Start);
     dimension_label.set_margin_top(8);
@@ -1858,9 +2286,13 @@ fn present_pin_window(app: &adw::Application, image_path: PathBuf) {
     let picture_for_scroll = picture.clone();
     let dimension_label_for_scroll = dimension_label.clone();
     let scale_for_scroll = scale.clone();
+    let state_for_scroll = state.clone();
     scroll.connect_scroll(move |_, _, dy| {
         let next = pin_zoom_from_scroll(scale_for_scroll.get(), dy);
         scale_for_scroll.set(next);
+        persist_config_change(&state_for_scroll, |config| {
+            config.last_pin_scale = next;
+        });
         apply_pin_zoom(
             &window_for_scroll,
             &image_overlay_for_scroll,
@@ -1878,14 +2310,62 @@ fn present_pin_window(app: &adw::Application, image_path: PathBuf) {
     click.set_button(0);
     click.set_propagation_phase(gtk::PropagationPhase::Capture);
     let window_for_click = window.clone();
+    let image_overlay_for_click = image_overlay.clone();
+    let state_for_click = state.clone();
+    let image_path_for_click = image_path.clone();
     click.connect_pressed(move |gesture, n_press, x, y| {
-        match pin_click_action(n_press, gesture.current_button()) {
-            Some(PinClickAction::Close) => window_for_click.close(),
-            Some(PinClickAction::Move) => begin_pin_window_move(&window_for_click, gesture, x, y),
-            None => {}
+        let button = gesture.current_button();
+        if pin_click_action(n_press, button) == Some(PinClickAction::Close) {
+            window_for_click.close();
+            return;
+        }
+        if n_press == 1 && button == 1 {
+            if let Some(edge) = pin_resize_edge_at(
+                x,
+                y,
+                image_overlay_for_click.allocated_width(),
+                image_overlay_for_click.allocated_height(),
+                8.0,
+            ) {
+                begin_pin_window_resize(&window_for_click, gesture, edge, x, y);
+                return;
+            }
+            begin_pin_window_move(&window_for_click, gesture, x, y);
+            return;
+        }
+        if pin_click_action(n_press, button) == Some(PinClickAction::Menu) {
+            show_pin_context_popover(
+                &image_overlay_for_click,
+                &window_for_click,
+                state_for_click.clone(),
+                image_path_for_click.clone(),
+                x,
+                y,
+            );
         }
     });
     image_overlay.add_controller(click);
+
+    let pin_motion = gtk::EventControllerMotion::new();
+    let image_overlay_for_motion = image_overlay.clone();
+    pin_motion.connect_motion(move |_, x, y| {
+        if let Some(edge) = pin_resize_edge_at(
+            x,
+            y,
+            image_overlay_for_motion.allocated_width(),
+            image_overlay_for_motion.allocated_height(),
+            8.0,
+        ) {
+            image_overlay_for_motion.set_cursor_from_name(Some(cursor_name_for_surface_edge(edge)));
+        } else {
+            image_overlay_for_motion.set_cursor_from_name(Some("move"));
+        }
+    });
+    let image_overlay_for_leave = image_overlay.clone();
+    pin_motion.connect_leave(move |_| {
+        image_overlay_for_leave.set_cursor(None);
+    });
+    image_overlay.add_controller(pin_motion);
 
     window.set_content(Some(&image_overlay));
     window.present();
@@ -1911,6 +2391,50 @@ fn action_text_button(icon_name: &str, label: &str, tooltip: &str) -> Button {
     button
 }
 
+fn output_action_primary_label() -> &'static str {
+    "Done"
+}
+
+fn output_action_menu_items() -> [&'static str; 3] {
+    ["Save", "Save To", "Copy & Close"]
+}
+
+fn output_actions_menu(save: &Button, save_to: &Button, copy_close: &Button) -> MenuButton {
+    let menu = MenuButton::new();
+    menu.set_tooltip_text(Some("More save actions"));
+    menu.set_size_request(42, 36);
+    menu.add_css_class("flat");
+    menu.add_css_class("ashot-output-more");
+    menu.set_icon_name("open-menu-symbolic");
+
+    let popover = Popover::new();
+    let list = GtkBox::new(Orientation::Vertical, 4);
+    list.add_css_class("ashot-output-menu");
+    list.set_margin_top(6);
+    list.set_margin_bottom(6);
+    list.set_margin_start(6);
+    list.set_margin_end(6);
+
+    for button in [save, save_to, copy_close] {
+        button.set_hexpand(true);
+        button.add_css_class("flat");
+        list.append(button);
+    }
+
+    popover.set_child(Some(&list));
+    menu.set_popover(Some(&popover));
+    menu
+}
+
+fn set_button_loading(button: &Button, loading: bool) {
+    button.set_sensitive(!loading);
+    if loading {
+        button.add_css_class("ashot-loading");
+    } else {
+        button.remove_css_class("ashot-loading");
+    }
+}
+
 fn pin_window_size(image_width: u32, image_height: u32) -> (i32, i32) {
     let scale = fit_scale(image_width, image_height, 900, 640);
     let (display_width, display_height) = pin_display_size(image_width, image_height, scale);
@@ -1928,6 +2452,20 @@ fn pin_initial_scale(
     window_height: i32,
 ) -> f64 {
     fit_scale(image_width, image_height, window_width, window_height)
+}
+
+fn pin_initial_scale_with_saved(
+    image_width: u32,
+    image_height: u32,
+    window_width: i32,
+    window_height: i32,
+    saved_scale: f64,
+) -> f64 {
+    if (saved_scale - 1.0).abs() > f64::EPSILON {
+        saved_scale.clamp(0.1, 8.0)
+    } else {
+        pin_initial_scale(image_width, image_height, window_width, window_height)
+    }
 }
 
 fn pin_zoom_from_scroll(current: f64, dy: f64) -> f64 {
@@ -1963,16 +2501,53 @@ fn pin_dimension_label(
 enum PinClickAction {
     Move,
     Close,
+    Menu,
 }
 
 fn pin_click_action(n_press: i32, button: u32) -> Option<PinClickAction> {
-    if button != 1 {
-        return None;
+    if button == 3 && n_press == 1 {
+        return Some(PinClickAction::Menu);
+    }
+    if button == 1 {
+        return match n_press {
+            1 => Some(PinClickAction::Move),
+            2 => Some(PinClickAction::Close),
+            _ => None,
+        };
+    }
+    None
+}
+
+fn pin_context_popover_rect(x: f64, y: f64) -> (i32, i32, i32, i32) {
+    fn coordinate(value: f64) -> i32 {
+        if value.is_finite() { value.round().clamp(0.0, i32::MAX as f64) as i32 } else { 0 }
     }
 
-    match n_press {
-        1 => Some(PinClickAction::Move),
-        2 => Some(PinClickAction::Close),
+    (coordinate(x), coordinate(y), 1, 1)
+}
+
+fn pin_resize_edge_at(
+    x: f64,
+    y: f64,
+    width: i32,
+    height: i32,
+    tolerance: f64,
+) -> Option<gtk::gdk::SurfaceEdge> {
+    let width = width.max(1) as f64;
+    let height = height.max(1) as f64;
+    let west = x <= tolerance;
+    let east = x >= width - tolerance;
+    let north = y <= tolerance;
+    let south = y >= height - tolerance;
+    match (north, east, south, west) {
+        (true, false, false, true) => Some(gtk::gdk::SurfaceEdge::NorthWest),
+        (true, true, false, false) => Some(gtk::gdk::SurfaceEdge::NorthEast),
+        (false, true, true, false) => Some(gtk::gdk::SurfaceEdge::SouthEast),
+        (false, false, true, true) => Some(gtk::gdk::SurfaceEdge::SouthWest),
+        (true, false, false, false) => Some(gtk::gdk::SurfaceEdge::North),
+        (false, true, false, false) => Some(gtk::gdk::SurfaceEdge::East),
+        (false, false, true, false) => Some(gtk::gdk::SurfaceEdge::South),
+        (false, false, false, true) => Some(gtk::gdk::SurfaceEdge::West),
         _ => None,
     }
 }
@@ -1995,6 +2570,156 @@ fn begin_pin_window_move(window: &ApplicationWindow, gesture: &gtk::GestureClick
         y,
         gesture.current_event_time(),
     );
+}
+
+fn begin_pin_window_resize(
+    window: &ApplicationWindow,
+    gesture: &gtk::GestureClick,
+    edge: gtk::gdk::SurfaceEdge,
+    x: f64,
+    y: f64,
+) {
+    let device = gesture.current_event_device();
+    let Some(surface) = window.surface() else {
+        return;
+    };
+    let Ok(toplevel) = surface.downcast::<gtk::gdk::Toplevel>() else {
+        return;
+    };
+
+    toplevel.begin_resize(
+        edge,
+        device.as_ref(),
+        gesture.current_button() as i32,
+        x,
+        y,
+        gesture.current_event_time(),
+    );
+}
+
+fn cursor_name_for_surface_edge(edge: gtk::gdk::SurfaceEdge) -> &'static str {
+    match edge {
+        gtk::gdk::SurfaceEdge::NorthWest | gtk::gdk::SurfaceEdge::SouthEast => "nwse-resize",
+        gtk::gdk::SurfaceEdge::NorthEast | gtk::gdk::SurfaceEdge::SouthWest => "nesw-resize",
+        gtk::gdk::SurfaceEdge::North | gtk::gdk::SurfaceEdge::South => "ns-resize",
+        gtk::gdk::SurfaceEdge::East | gtk::gdk::SurfaceEdge::West => "ew-resize",
+        _ => "move",
+    }
+}
+
+fn show_pin_context_popover(
+    anchor: &Overlay,
+    window: &ApplicationWindow,
+    state: Arc<ServiceState>,
+    image_path: PathBuf,
+    x: f64,
+    y: f64,
+) {
+    let popover = Popover::new();
+    popover.set_parent(anchor);
+    let (x, y, width, height) = pin_context_popover_rect(x, y);
+    let pointing_to = gtk::gdk::Rectangle::new(x, y, width, height);
+    popover.set_pointing_to(Some(&pointing_to));
+
+    let root = GtkBox::new(Orientation::Vertical, 6);
+    root.set_margin_top(8);
+    root.set_margin_bottom(8);
+    root.set_margin_start(8);
+    root.set_margin_end(8);
+
+    let copy = pin_menu_button("edit-copy-symbolic", "Copy");
+    let save = pin_menu_button("document-save-symbolic", "Save");
+    let opacity_100 = pin_menu_button("view-visible-symbolic", "Opacity 100%");
+    let opacity_85 = pin_menu_button("view-visible-symbolic", "Opacity 85%");
+    let opacity_70 = pin_menu_button("view-visible-symbolic", "Opacity 70%");
+    let always_on_top = pin_menu_button("view-pin-symbolic", "Always on Top");
+    always_on_top.set_sensitive(false);
+    always_on_top.set_tooltip_text(Some("Not reliably supported by GTK4 on Wayland"));
+    let close = pin_menu_button("window-close-symbolic", "Close");
+    close.add_css_class("destructive-action");
+
+    for button in [&copy, &save, &opacity_100, &opacity_85, &opacity_70, &always_on_top, &close] {
+        button.set_hexpand(true);
+        root.append(button);
+    }
+
+    let image_for_copy = image_path.clone();
+    copy.connect_clicked(move |_| {
+        copy_image_to_clipboard(&image_for_copy);
+    });
+
+    let image_for_save = image_path.clone();
+    let state_for_save = state.clone();
+    save.connect_clicked(move |button| {
+        let config = state_for_save.config_snapshot();
+        let initial_filename = suggested_save_filename_at(&config, chrono::Local::now());
+        let image_for_confirm = image_for_save.clone();
+        let state_for_confirm = state_for_save.clone();
+        show_save_filename_popover(button, initial_filename, "Save", move |requested_filename| {
+            let config = state_for_confirm.config_snapshot();
+            match save_pinned_image_with_filename(&config, &image_for_confirm, &requested_filename)
+            {
+                Ok(output) => {
+                    info!("saved pinned screenshot to {}", output.display());
+                    true
+                }
+                Err(error) => {
+                    error!("{error}");
+                    false
+                }
+            }
+        });
+    });
+
+    for (button, opacity) in [(&opacity_100, 1.0), (&opacity_85, 0.85), (&opacity_70, 0.70)] {
+        let window = window.clone();
+        let state = state.clone();
+        button.connect_clicked(move |_| {
+            window.set_opacity(opacity);
+            persist_config_change(&state, |config| {
+                config.last_pin_opacity = opacity;
+            });
+        });
+    }
+
+    let window_for_close = window.clone();
+    close.connect_clicked(move |_| {
+        window_for_close.close();
+    });
+
+    popover.set_child(Some(&root));
+    popover.popup();
+}
+
+fn pin_menu_button(icon_name: &str, label: &str) -> Button {
+    let button = Button::new();
+    let content = GtkBox::new(Orientation::Horizontal, 8);
+    content.set_halign(Align::Start);
+    content.append(&gtk::Image::from_icon_name(icon_name));
+    content.append(&Label::new(Some(label)));
+    button.set_child(Some(&content));
+    button.add_css_class("flat");
+    button
+}
+
+fn save_pinned_image_with_filename(
+    config: &AppConfig,
+    image_path: &Path,
+    requested_filename: &str,
+) -> std::result::Result<PathBuf, String> {
+    let filename = normalized_save_filename(requested_filename)
+        .ok_or_else(|| "Enter a file name".to_string())?;
+    fs::create_dir_all(&config.default_save_dir).map_err(|source| {
+        format!(
+            "failed to create screenshot directory {}: {source}",
+            config.default_save_dir.display()
+        )
+    })?;
+    let output = config.default_save_dir.join(filename);
+    fs::copy(image_path, &output).map_err(|source| {
+        format!("failed to save pinned screenshot at {}: {source}", output.display())
+    })?;
+    Ok(output)
 }
 
 fn apply_pin_zoom(
@@ -2024,8 +2749,53 @@ fn apply_pin_zoom(
 fn section_title(text: &str) -> Label {
     let title = Label::new(Some(text));
     title.add_css_class("heading");
+    title.add_css_class("ashot-section-title");
     title.set_xalign(0.0);
     title
+}
+
+fn tool_status_name(tool: DefaultTool) -> &'static str {
+    match tool {
+        DefaultTool::Select => "Select",
+        DefaultTool::Text => "Text",
+        DefaultTool::Line => "Line",
+        DefaultTool::Arrow => "Arrow",
+        DefaultTool::Brush => "Pencil",
+        DefaultTool::Rectangle => "Rect",
+        DefaultTool::Ellipse => "Circle",
+        DefaultTool::Marker => "Marker",
+        DefaultTool::Mosaic => "Pixel",
+        DefaultTool::Blur => "Blur",
+        DefaultTool::Counter => "Count",
+        DefaultTool::FilledBox => "Fill",
+        DefaultTool::ColorPicker => "Color Picker",
+        DefaultTool::Ocr => "OCR",
+    }
+}
+
+fn editor_status_text(
+    tool: DefaultTool,
+    color: Color,
+    stroke_width: u32,
+    image_width: u32,
+    image_height: u32,
+    save_dir: &Path,
+    message: Option<&str>,
+) -> String {
+    let mut text = format!(
+        "Tool: {} · Color: {} · Width: {}px · Image: {} x {} · Path: {}",
+        tool_status_name(tool),
+        color_to_hex(color),
+        stroke_width,
+        image_width,
+        image_height,
+        save_dir.display()
+    );
+    if let Some(message) = message.filter(|message| !message.trim().is_empty()) {
+        text.push_str(" · ");
+        text.push_str(message.trim());
+    }
+    text
 }
 
 fn install_editor_css() {
@@ -2035,6 +2805,29 @@ fn install_editor_css() {
     let provider = gtk::CssProvider::new();
     provider.load_from_data(
         r#"
+        .ashot-sidebar {
+            padding: 4px;
+        }
+        .ashot-section-title {
+            margin-top: 2px;
+            margin-bottom: 1px;
+            color: alpha(currentColor, 0.72);
+            font-size: 0.86em;
+            font-weight: 700;
+            letter-spacing: 0.02em;
+        }
+        .ashot-tool-button {
+            min-width: 48px;
+            min-height: 38px;
+            padding: 0;
+            border-radius: 8px;
+        }
+        .ashot-tool-button:hover {
+            background: alpha(@accent_bg_color, 0.10);
+        }
+        .ashot-tool-icon {
+            color: alpha(currentColor, 0.88);
+        }
         button.active-tool {
             background: @accent_bg_color;
             color: @accent_fg_color;
@@ -2042,6 +2835,54 @@ fn install_editor_css() {
         }
         button.active-tool label {
             color: @accent_fg_color;
+        }
+        .ashot-action-primary {
+            background: @accent_bg_color;
+            color: @accent_fg_color;
+        }
+        .ashot-action-primary image,
+        .ashot-action-primary label {
+            color: @accent_fg_color;
+        }
+        .ashot-output-more {
+            min-width: 42px;
+            min-height: 36px;
+            padding: 0;
+            border-radius: 8px;
+        }
+        .ashot-output-menu button {
+            min-width: 172px;
+            min-height: 36px;
+            border-radius: 7px;
+        }
+        .ashot-canvas-frame {
+            background: mix(@window_bg_color, @view_bg_color, 0.45);
+            border-radius: 10px;
+            padding: 12px;
+        }
+        .ashot-canvas-surface {
+            background: @view_bg_color;
+            box-shadow: 0 8px 28px alpha(black, 0.18), 0 0 0 1px alpha(black, 0.16);
+        }
+        .ashot-popover-panel {
+            padding: 12px;
+        }
+        .ashot-osd {
+            background: alpha(black, 0.68);
+            color: white;
+            border-radius: 7px;
+            padding: 4px 8px;
+            font-size: 0.86em;
+        }
+        .ashot-status {
+            padding: 5px 8px;
+            font-size: 0.86em;
+        }
+        .ashot-loading {
+            opacity: 0.72;
+        }
+        .ashot-error {
+            color: @error_color;
         }
         "#,
     );
@@ -2069,6 +2910,7 @@ fn editor_tool_layout() -> [(&'static str, DefaultTool); 12] {
     ]
 }
 
+#[cfg(test)]
 fn tool_icon_label(tool: DefaultTool) -> &'static str {
     match tool {
         DefaultTool::Select => "↖",
@@ -2088,7 +2930,180 @@ fn tool_icon_label(tool: DefaultTool) -> &'static str {
     }
 }
 
-fn ocr_language_menu(active_languages: Rc<RefCell<Vec<String>>>) -> MenuButton {
+fn tool_icon_area(tool: DefaultTool) -> DrawingArea {
+    let icon = DrawingArea::new();
+    icon.set_content_width(24);
+    icon.set_content_height(24);
+    icon.add_css_class("ashot-tool-icon");
+    icon.set_draw_func(move |area, cr, width, height| {
+        draw_tool_icon(area, cr, tool, width, height);
+    });
+    icon
+}
+
+fn draw_tool_icon(
+    area: &DrawingArea,
+    cr: &gtk::cairo::Context,
+    tool: DefaultTool,
+    width: i32,
+    height: i32,
+) {
+    let size = width.min(height).max(1) as f64;
+    let scale = size / 24.0;
+    let offset_x = (width as f64 - size) * 0.5;
+    let offset_y = (height as f64 - size) * 0.5;
+    let color = area.style_context().color();
+    let _ = cr.save();
+    cr.translate(offset_x, offset_y);
+    cr.scale(scale, scale);
+    cr.set_source_rgba(
+        color.red() as f64,
+        color.green() as f64,
+        color.blue() as f64,
+        color.alpha() as f64,
+    );
+    cr.set_line_width(1.9);
+    cr.set_line_cap(gtk::cairo::LineCap::Round);
+    cr.set_line_join(gtk::cairo::LineJoin::Round);
+
+    match tool {
+        DefaultTool::Select => {
+            cr.move_to(7.0, 4.0);
+            cr.line_to(18.0, 12.0);
+            cr.line_to(13.2, 13.1);
+            cr.line_to(16.0, 20.0);
+            cr.line_to(13.2, 21.0);
+            cr.line_to(10.5, 14.2);
+            cr.line_to(6.5, 17.1);
+            cr.close_path();
+            let _ = cr.stroke();
+        }
+        DefaultTool::Brush => {
+            cr.move_to(6.0, 18.0);
+            cr.curve_to(9.0, 17.0, 10.0, 15.0, 11.2, 12.2);
+            cr.line_to(17.2, 6.2);
+            cr.move_to(13.8, 8.2);
+            cr.line_to(16.2, 10.6);
+            cr.move_to(5.4, 19.0);
+            cr.curve_to(7.6, 21.0, 11.0, 20.7, 12.7, 18.6);
+            let _ = cr.stroke();
+        }
+        DefaultTool::Line => {
+            cr.move_to(6.0, 18.0);
+            cr.line_to(18.0, 6.0);
+            let _ = cr.stroke();
+        }
+        DefaultTool::Arrow => {
+            cr.move_to(5.5, 18.0);
+            cr.line_to(18.0, 5.5);
+            cr.move_to(18.0, 5.5);
+            cr.line_to(17.0, 11.0);
+            cr.move_to(18.0, 5.5);
+            cr.line_to(12.5, 6.5);
+            let _ = cr.stroke();
+        }
+        DefaultTool::Rectangle => {
+            draw_round_rect(cr, 5.0, 6.0, 14.0, 12.0, 2.0);
+            let _ = cr.stroke();
+        }
+        DefaultTool::Ellipse => {
+            let _ = cr.save();
+            cr.translate(12.0, 12.0);
+            cr.scale(1.25, 0.86);
+            cr.arc(0.0, 0.0, 6.0, 0.0, std::f64::consts::TAU);
+            let _ = cr.restore();
+            let _ = cr.stroke();
+        }
+        DefaultTool::Marker => {
+            draw_round_rect(cr, 6.0, 7.0, 12.0, 8.0, 2.0);
+            let _ = cr.stroke();
+            cr.move_to(8.0, 18.0);
+            cr.line_to(16.0, 18.0);
+            cr.move_to(9.2, 10.8);
+            cr.line_to(14.8, 10.8);
+            let _ = cr.stroke();
+        }
+        DefaultTool::Text => {
+            cr.move_to(6.0, 6.0);
+            cr.line_to(18.0, 6.0);
+            cr.move_to(12.0, 6.0);
+            cr.line_to(12.0, 19.0);
+            cr.move_to(9.0, 19.0);
+            cr.line_to(15.0, 19.0);
+            let _ = cr.stroke();
+        }
+        DefaultTool::Counter => {
+            cr.arc(12.0, 12.0, 7.2, 0.0, std::f64::consts::TAU);
+            let _ = cr.stroke();
+            cr.move_to(9.0, 12.0);
+            cr.line_to(15.0, 12.0);
+            cr.move_to(10.0, 9.5);
+            cr.line_to(10.0, 14.5);
+            cr.move_to(14.0, 9.5);
+            cr.line_to(14.0, 14.5);
+            let _ = cr.stroke();
+        }
+        DefaultTool::Mosaic => {
+            for y in 0..3 {
+                for x in 0..3 {
+                    cr.rectangle(6.0 + x as f64 * 4.3, 6.0 + y as f64 * 4.3, 2.7, 2.7);
+                }
+            }
+            let _ = cr.fill();
+        }
+        DefaultTool::Blur => {
+            cr.arc(9.0, 12.0, 3.2, 0.0, std::f64::consts::TAU);
+            cr.arc(14.0, 10.0, 3.0, 0.0, std::f64::consts::TAU);
+            cr.arc(14.5, 15.0, 2.5, 0.0, std::f64::consts::TAU);
+            let _ = cr.stroke();
+        }
+        DefaultTool::FilledBox => {
+            cr.rectangle(6.0, 7.0, 12.0, 10.0);
+            let _ = cr.fill();
+        }
+        DefaultTool::Ocr => {
+            cr.move_to(6.0, 9.0);
+            cr.line_to(6.0, 6.0);
+            cr.line_to(9.0, 6.0);
+            cr.move_to(18.0, 9.0);
+            cr.line_to(18.0, 6.0);
+            cr.line_to(15.0, 6.0);
+            cr.move_to(6.0, 15.0);
+            cr.line_to(6.0, 18.0);
+            cr.line_to(9.0, 18.0);
+            cr.move_to(18.0, 15.0);
+            cr.line_to(18.0, 18.0);
+            cr.line_to(15.0, 18.0);
+            cr.move_to(9.0, 11.0);
+            cr.line_to(15.0, 11.0);
+            cr.move_to(9.0, 14.0);
+            cr.line_to(13.5, 14.0);
+            let _ = cr.stroke();
+        }
+        DefaultTool::ColorPicker => {
+            let _ = cr.save();
+            cr.translate(12.0, 12.0);
+            cr.rotate(-std::f64::consts::FRAC_PI_4);
+            cr.arc(0.0, -6.8, 3.4, 0.0, std::f64::consts::TAU);
+            let _ = cr.stroke();
+            draw_round_rect(cr, -4.6, -2.4, 9.2, 3.6, 1.8);
+            let _ = cr.stroke();
+            cr.move_to(-2.8, 1.2);
+            cr.line_to(-2.8, 8.0);
+            cr.line_to(0.0, 10.5);
+            cr.line_to(2.8, 8.0);
+            cr.line_to(2.8, 1.2);
+            let _ = cr.stroke();
+            let _ = cr.restore();
+        }
+    }
+    let _ = cr.restore();
+}
+
+fn ocr_language_menu(
+    active_languages: Rc<RefCell<Vec<String>>>,
+    state: Arc<ServiceState>,
+) -> MenuButton {
     let menu = MenuButton::new();
     if let Ok(languages) = active_languages.try_borrow() {
         menu.set_label(&ocr_language_label(&languages));
@@ -2114,10 +3129,15 @@ fn ocr_language_menu(active_languages: Rc<RefCell<Vec<String>>>) -> MenuButton {
         let active_languages_for_toggle = active_languages.clone();
         let menu_for_toggle = menu.clone();
         let checks_for_toggle = checks.clone();
+        let state_for_toggle = state.clone();
         check.connect_toggled(move |button| {
             if let Ok(mut languages) = active_languages_for_toggle.try_borrow_mut() {
                 update_ocr_language_selection(&mut languages, &language_code, button.is_active());
                 menu_for_toggle.set_label(&ocr_language_label(&languages));
+                let persisted = languages.clone();
+                persist_config_change(&state_for_toggle, |config| {
+                    config.ocr_languages = persisted;
+                });
             }
             if let (Ok(languages), Ok(checks)) =
                 (active_languages_for_toggle.try_borrow(), checks_for_toggle.try_borrow())
@@ -2422,62 +3442,12 @@ fn dynamic_color_swatch(color: Rc<Cell<Color>>, width: i32, height: i32) -> Draw
 }
 
 fn eyedropper_icon_button() -> Button {
-    let icon = DrawingArea::new();
-    icon.set_content_width(22);
-    icon.set_content_height(22);
-    icon.set_draw_func(move |_, cr, width, height| {
-        let width = width.max(1) as f64;
-        let height = height.max(1) as f64;
-        let _ = cr.save();
-        cr.translate(width * 0.5, height * 0.5);
-        cr.rotate(-std::f64::consts::FRAC_PI_4);
-        cr.set_line_cap(gtk::cairo::LineCap::Round);
-        cr.set_line_join(gtk::cairo::LineJoin::Round);
-        cr.set_source_rgba(0.12, 0.14, 0.18, 0.92);
-        cr.set_line_width(1.45);
-
-        let _ = cr.save();
-        cr.translate(0.0, -8.2);
-        cr.scale(0.68, 1.0);
-        cr.arc(0.0, 0.0, 4.4, 0.0, std::f64::consts::TAU);
-        let _ = cr.stroke();
-        let _ = cr.restore();
-
-        cr.arc(1.35, -9.0, 1.05, -0.9, 1.15);
-        let _ = cr.stroke();
-
-        draw_round_rect(cr, -5.6, -3.9, 11.2, 4.2, 2.1);
-        let _ = cr.stroke();
-
-        cr.move_to(-3.6, -2.0);
-        cr.line_to(-1.8, -2.0);
-        cr.move_to(0.0, -2.0);
-        cr.line_to(1.8, -2.0);
-        cr.move_to(3.6, -2.0);
-        cr.line_to(4.4, -2.0);
-        let _ = cr.stroke();
-
-        cr.move_to(-3.2, 0.2);
-        cr.line_to(-3.2, 7.9);
-        cr.line_to(-1.0, 10.1);
-        cr.move_to(3.2, 0.2);
-        cr.line_to(3.2, 7.9);
-        cr.line_to(1.0, 10.1);
-        cr.move_to(-1.0, 10.1);
-        cr.line_to(1.0, 10.1);
-        cr.move_to(-1.2, 2.2);
-        cr.line_to(-1.2, 7.2);
-        cr.move_to(1.2, 2.2);
-        cr.line_to(1.2, 7.2);
-        let _ = cr.stroke();
-        let _ = cr.restore();
-    });
-
     let button = Button::new();
-    button.set_child(Some(&icon));
+    button.set_child(Some(&tool_icon_area(DefaultTool::ColorPicker)));
     button.set_tooltip_text(Some("Pick color from image"));
     button.set_size_request(34, 34);
     button.add_css_class("flat");
+    button.add_css_class("ashot-tool-button");
     button
 }
 
@@ -2530,6 +3500,7 @@ fn show_favorite_remove_popover(
     favorites: Rc<RefCell<Vec<Color>>>,
     favorite_buttons: ColorMemoryButtons,
     refresh: ColorCallback,
+    state: Arc<ServiceState>,
 ) {
     let popover = Popover::new();
     popover.set_parent(anchor);
@@ -2551,6 +3522,10 @@ fn show_favorite_remove_popover(
             removed = favorites.iter().any(|favorite| *favorite == color);
             remove_favorite_color(&mut favorites, color);
             update_color_memory_buttons(&favorites, &favorite_buttons);
+            let persisted = favorites.clone();
+            persist_config_change(&state, |config| {
+                config.favorite_colors = persisted;
+            });
         }
         if removed {
             refresh(active_color.get());
@@ -2665,6 +3640,13 @@ fn color_picker_section(
     tool_buttons: Rc<RefCell<Vec<(DefaultTool, Button)>>>,
     color_ui_refresh: Rc<RefCell<Option<ColorCallback>>>,
     recent_color_recorder: Rc<RefCell<Option<ColorCallback>>>,
+    canvas: DrawingArea,
+    state: Arc<ServiceState>,
+    history: Rc<RefCell<EditorHistory>>,
+    undo: Button,
+    redo: Button,
+    refresh_status: StatusCallback,
+    show_toast: ToastCallback,
 ) -> GtkBox {
     let container = GtkBox::new(Orientation::Vertical, 6);
     let header = GtkBox::new(Orientation::Horizontal, 6);
@@ -2680,11 +3662,19 @@ fn color_picker_section(
     let eyedropper_button = eyedropper_icon_button();
     let document_for_pick = document.clone();
     let tool_buttons_for_pick = tool_buttons.clone();
+    let canvas_for_pick = canvas.clone();
+    let state_for_pick = state.clone();
+    let refresh_status_for_pick = refresh_status.clone();
     eyedropper_button.connect_clicked(move |_| {
         if let Ok(mut document) = document_for_pick.try_borrow_mut() {
             document.active_tool = DefaultTool::ColorPicker;
         }
         update_tool_button_selection(&tool_buttons_for_pick, DefaultTool::ColorPicker);
+        apply_editor_cursor(&canvas_for_pick, DefaultTool::ColorPicker);
+        persist_config_change(&state_for_pick, |config| {
+            config.default_tool = DefaultTool::ColorPicker;
+        });
+        refresh_status_for_pick(None);
     });
     tool_buttons.borrow_mut().push((DefaultTool::ColorPicker, eyedropper_button.clone()));
     if let Ok(document) = document.try_borrow() {
@@ -2695,25 +3685,31 @@ fn color_picker_section(
 
     let popover = Popover::new();
     let root = GtkBox::new(Orientation::Vertical, 8);
+    root.add_css_class("ashot-popover-panel");
     root.set_margin_top(10);
     root.set_margin_bottom(10);
     root.set_margin_start(10);
     root.set_margin_end(10);
     root.set_halign(Align::Start);
     root.set_hexpand(false);
-    root.set_size_request(240, -1);
+    root.set_size_request(340, -1);
 
     let hsv_state = Rc::new(Cell::new(rgb_to_hsv(active_color.get())));
     let alpha_state = Rc::new(Cell::new(active_color.get().a));
     let refreshing = Rc::new(Cell::new(false));
-    let recent_colors = Rc::new(RefCell::new(Vec::<Color>::new()));
-    let favorite_colors = Rc::new(RefCell::new(
+    let config_snapshot = state.config_snapshot();
+    let recent_colors = Rc::new(RefCell::new(
+        config_snapshot.recent_colors.into_iter().take(COLOR_ROW_LIMIT).collect::<Vec<_>>(),
+    ));
+    let favorite_colors = Rc::new(RefCell::new(if config_snapshot.favorite_colors.is_empty() {
         editor_favorite_palette()
             .iter()
             .take(COLOR_ROW_LIMIT)
             .map(|(_, color)| *color)
-            .collect::<Vec<_>>(),
-    ));
+            .collect::<Vec<_>>()
+    } else {
+        config_snapshot.favorite_colors.into_iter().take(COLOR_ROW_LIMIT).collect::<Vec<_>>()
+    }));
     let recent_buttons =
         Rc::new(RefCell::new(Vec::<(Rc<Cell<Color>>, DrawingArea, Button)>::new()));
     let favorite_buttons =
@@ -2743,8 +3739,8 @@ fn color_picker_section(
     root.append(&top_row);
 
     let hsv_area = DrawingArea::new();
-    hsv_area.set_content_width(220);
-    hsv_area.set_content_height(132);
+    hsv_area.set_content_width(316);
+    hsv_area.set_content_height(150);
     hsv_area.set_halign(Align::Start);
     let hsv_for_draw = hsv_state.clone();
     hsv_area.set_draw_func(move |_, cr, width, height| {
@@ -2782,7 +3778,7 @@ fn color_picker_section(
     hue_label.set_xalign(0.0);
     hue_label.set_width_chars(6);
     let hue_bar = DrawingArea::new();
-    hue_bar.set_content_width(154);
+    hue_bar.set_content_width(248);
     hue_bar.set_content_height(28);
     hue_bar.set_halign(Align::Start);
     let hsv_for_hue_bar = hsv_state.clone();
@@ -2801,7 +3797,7 @@ fn color_picker_section(
     let opacity_value =
         Label::new(Some(&format!("{}%", (active_color.get().a as f64 * 100.0 / 255.0).round())));
     let opacity_bar = DrawingArea::new();
-    opacity_bar.set_content_width(120);
+    opacity_bar.set_content_width(220);
     opacity_bar.set_content_height(28);
     opacity_bar.set_halign(Align::Start);
     let opacity_color = current_color.clone();
@@ -2829,13 +3825,13 @@ fn color_picker_section(
     let hex_entry = Entry::new();
     hex_entry.set_width_chars(9);
     hex_entry.set_max_width_chars(9);
-    hex_entry.set_size_request(132, 34);
+    hex_entry.set_size_request(148, 34);
     hex_entry.set_hexpand(false);
     stack.add_titled(&hex_entry, Some("hex"), "HEX");
 
     let rgb_box = GtkBox::new(Orientation::Horizontal, 8);
     rgb_box.set_halign(Align::Start);
-    rgb_box.set_size_request(220, -1);
+    rgb_box.set_size_request(316, -1);
     let r_entry = Entry::new();
     let g_entry = Entry::new();
     let b_entry = Entry::new();
@@ -2850,7 +3846,7 @@ fn color_picker_section(
 
     let hsl_box = GtkBox::new(Orientation::Horizontal, 8);
     hsl_box.set_halign(Align::Start);
-    hsl_box.set_size_request(220, -1);
+    hsl_box.set_size_request(316, -1);
     let h_entry = Entry::new();
     let s_entry = Entry::new();
     let l_entry = Entry::new();
@@ -2891,9 +3887,36 @@ fn color_picker_section(
         let stroke_previews = stroke_previews.clone();
         let favorite_colors = favorite_colors.clone();
         let favorite_buttons = favorite_buttons.clone();
+        let document = document.clone();
+        let history = history.clone();
+        let undo = undo.clone();
+        let redo = redo.clone();
+        let canvas = canvas.clone();
+        let state = state.clone();
+        let refresh_status = refresh_status.clone();
         Rc::new(move |color: Color| {
             refreshing.set(true);
             active_color.set(color);
+            persist_config_change(&state, |config| {
+                config.default_color = color;
+            });
+            let style_changed = if let Ok(mut document) = document.try_borrow_mut() {
+                if document.active_tool == DefaultTool::Select && document.selected.is_some() {
+                    let before = document.annotations.clone();
+                    if document.apply_color_to_selected(color) {
+                        if let Ok(mut history) = history.try_borrow_mut() {
+                            history.snapshot(&before);
+                        }
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
             let hsv = rgb_to_hsv(color);
             hsv_state.set(hsv);
             alpha_state.set(color.a);
@@ -2929,6 +3952,11 @@ fn color_picker_section(
                     add_favorite.remove_css_class("suggested-action");
                 }
             }
+            if style_changed {
+                update_history_action_buttons(&history, &undo, &redo);
+                canvas.queue_draw();
+            }
+            refresh_status(None);
             refreshing.set(false);
         })
     };
@@ -2936,10 +3964,15 @@ fn color_picker_section(
     *recent_color_recorder.borrow_mut() = Some({
         let recent_colors = recent_colors.clone();
         let recent_buttons = recent_buttons.clone();
+        let state = state.clone();
         Rc::new(move |color: Color| {
             if let Ok(mut recent) = recent_colors.try_borrow_mut() {
                 push_recent_color(&mut recent, color, COLOR_ROW_LIMIT);
                 update_color_memory_buttons(&recent, &recent_buttons);
+                let persisted = recent.clone();
+                persist_config_change(&state, |config| {
+                    config.recent_colors = persisted;
+                });
             }
         })
     });
@@ -3110,6 +4143,7 @@ fn color_picker_section(
             let color_cell_for_remove = color_cell.clone();
             let button_for_remove = button.clone();
             let active_color_for_remove = active_color.clone();
+            let state_for_remove = state.clone();
             let right_click = gtk::GestureClick::new();
             right_click.set_button(3);
             let refresh_after_remove = refresh_ui.clone();
@@ -3125,6 +4159,7 @@ fn color_picker_section(
                     favorites_for_remove.clone(),
                     favorite_buttons_for_remove.clone(),
                     refresh_after_remove.clone(),
+                    state_for_remove.clone(),
                 );
             });
             button.add_controller(right_click);
@@ -3135,6 +4170,8 @@ fn color_picker_section(
     let active_for_favorite = active_color.clone();
     let favorites_for_add = favorite_colors.clone();
     let favorite_buttons_for_add = favorite_buttons.clone();
+    let state_for_favorite = state.clone();
+    let show_toast_for_favorite = show_toast.clone();
     add_favorite.connect_clicked(move |_| {
         favorite_error.set_text("");
         let color = active_for_favorite.get();
@@ -3144,11 +4181,19 @@ fn color_picker_section(
             if favorites.iter().any(|favorite| *favorite == color) {
                 remove_favorite_color(&mut favorites, color);
                 update_color_memory_buttons(&favorites, &favorite_buttons_for_add);
+                let persisted = favorites.clone();
+                persist_config_change(&state_for_favorite, |config| {
+                    config.favorite_colors = persisted;
+                });
                 should_refresh = true;
             } else {
                 match add_favorite_color(&mut favorites, color, COLOR_ROW_LIMIT) {
                     Ok(()) => {
                         update_color_memory_buttons(&favorites, &favorite_buttons_for_add);
+                        let persisted = favorites.clone();
+                        persist_config_change(&state_for_favorite, |config| {
+                            config.favorite_colors = persisted;
+                        });
                         should_refresh = true;
                     }
                     Err(limit) => {
@@ -3158,7 +4203,7 @@ fn color_picker_section(
             }
         }
         if let Some(limit) = favorite_limit {
-            favorite_error.set_text(&format!("Favorite can save up to {limit} colors"));
+            show_toast_for_favorite(&format!("Favorite can save up to {limit} colors"));
         }
         if should_refresh {
             refresh_for_favorite(color);
@@ -3225,6 +4270,13 @@ fn stroke_width_dropdown(
     active_stroke: Rc<Cell<u32>>,
     active_color: Rc<Cell<Color>>,
     stroke_previews: Rc<RefCell<Vec<DrawingArea>>>,
+    document: Rc<RefCell<Document>>,
+    history: Rc<RefCell<EditorHistory>>,
+    canvas: DrawingArea,
+    undo: Button,
+    redo: Button,
+    state: Arc<ServiceState>,
+    refresh_status: StatusCallback,
 ) -> GtkBox {
     let container = GtkBox::new(Orientation::Horizontal, 8);
     let current = current_stroke_preview(active_color.clone(), active_stroke.clone(), 118, 24);
@@ -3259,14 +4311,46 @@ fn stroke_width_dropdown(
         let active_stroke_for_click = active_stroke.clone();
         let stroke_previews_for_click = stroke_previews.clone();
         let menu_button_for_click = menu_button.clone();
+        let document_for_click = document.clone();
+        let history_for_click = history.clone();
+        let canvas_for_click = canvas.clone();
+        let undo_for_click = undo.clone();
+        let redo_for_click = redo.clone();
+        let state_for_click = state.clone();
+        let refresh_status_for_click = refresh_status.clone();
         button.connect_clicked(move |_| {
             active_stroke_for_click.set(width);
+            persist_config_change(&state_for_click, |config| {
+                config.default_stroke_width = width;
+            });
+            let style_changed = if let Ok(mut document) = document_for_click.try_borrow_mut() {
+                if document.active_tool == DefaultTool::Select && document.selected.is_some() {
+                    let before = document.annotations.clone();
+                    if document.apply_stroke_to_selected(width) {
+                        if let Ok(mut history) = history_for_click.try_borrow_mut() {
+                            history.snapshot(&before);
+                        }
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
             menu_button_for_click.set_label(&format!("{width}px"));
             if let Ok(stroke_previews) = stroke_previews_for_click.try_borrow() {
                 for preview in stroke_previews.iter() {
                     preview.queue_draw();
                 }
             }
+            if style_changed {
+                update_history_action_buttons(&history_for_click, &undo_for_click, &redo_for_click);
+                canvas_for_click.queue_draw();
+            }
+            refresh_status_for_click(None);
             menu_button_for_click.popdown();
         });
         list.append(&button);
@@ -3294,6 +4378,142 @@ fn update_tool_button_selection(
             }
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EditorCursorKind {
+    Default,
+    Text,
+    Crosshair,
+    Eyedropper,
+}
+
+fn editor_cursor_kind_for_tool(tool: DefaultTool) -> EditorCursorKind {
+    match tool {
+        DefaultTool::Select => EditorCursorKind::Default,
+        DefaultTool::Text => EditorCursorKind::Text,
+        DefaultTool::ColorPicker => EditorCursorKind::Eyedropper,
+        DefaultTool::Line
+        | DefaultTool::Arrow
+        | DefaultTool::Brush
+        | DefaultTool::Rectangle
+        | DefaultTool::Ellipse
+        | DefaultTool::Marker
+        | DefaultTool::Mosaic
+        | DefaultTool::Blur
+        | DefaultTool::Counter
+        | DefaultTool::FilledBox
+        | DefaultTool::Ocr => EditorCursorKind::Crosshair,
+    }
+}
+
+#[cfg(test)]
+fn editor_cursor_for_tool(tool: DefaultTool) -> Option<&'static str> {
+    match editor_cursor_kind_for_tool(tool) {
+        EditorCursorKind::Default => Some("default"),
+        EditorCursorKind::Text => Some("text"),
+        EditorCursorKind::Crosshair => Some("crosshair"),
+        EditorCursorKind::Eyedropper => None,
+    }
+}
+
+fn apply_editor_cursor(canvas: &DrawingArea, tool: DefaultTool) {
+    match editor_cursor_kind_for_tool(tool) {
+        EditorCursorKind::Default => canvas.set_cursor(None),
+        EditorCursorKind::Text => canvas.set_cursor_from_name(Some("text")),
+        EditorCursorKind::Crosshair => canvas.set_cursor_from_name(Some("crosshair")),
+        EditorCursorKind::Eyedropper => {
+            let cursor = editor_eyedropper_cursor();
+            canvas.set_cursor(Some(&cursor));
+        }
+    }
+}
+
+fn apply_canvas_hover_cursor(
+    canvas: &DrawingArea,
+    document: &Document,
+    point: Point,
+    tolerance: f32,
+) {
+    if document.active_tool != DefaultTool::Select {
+        apply_editor_cursor(canvas, document.active_tool);
+        return;
+    }
+    if let Some(handle) = resize_handle_at(document, point, tolerance) {
+        canvas.set_cursor_from_name(Some(cursor_name_for_resize_handle(handle)));
+        return;
+    }
+    if selected_annotation_bounds(document).is_some_and(|bounds| bounds.contains(point)) {
+        canvas.set_cursor_from_name(Some("move"));
+    } else {
+        canvas.set_cursor(None);
+    }
+}
+
+fn cursor_name_for_resize_handle(handle: ResizeHandle) -> &'static str {
+    match handle {
+        ResizeHandle::TopLeft | ResizeHandle::BottomRight => "nwse-resize",
+        ResizeHandle::TopRight | ResizeHandle::BottomLeft => "nesw-resize",
+        ResizeHandle::Top | ResizeHandle::Bottom => "ns-resize",
+        ResizeHandle::Left | ResizeHandle::Right => "ew-resize",
+    }
+}
+
+fn editor_eyedropper_cursor() -> gtk::gdk::Cursor {
+    let pixels = eyedropper_cursor_pixels();
+    let bytes = glib::Bytes::from_owned(pixels);
+    let texture =
+        gtk::gdk::MemoryTexture::new(32, 32, gtk::gdk::MemoryFormat::R8g8b8a8, &bytes, 32 * 4);
+    let fallback = gtk::gdk::Cursor::from_name("crosshair", None);
+    gtk::gdk::Cursor::from_texture(&texture, 6, 26, fallback.as_ref())
+}
+
+fn eyedropper_cursor_pixels() -> Vec<u8> {
+    let mut pixels = vec![0; 32 * 32 * 4];
+    let white = [255, 255, 255, 240];
+    let black = [18, 18, 18, 255];
+
+    draw_cursor_line(&mut pixels, Point::new(7.0, 25.0), Point::new(20.0, 12.0), 3.4, white);
+    draw_cursor_line(&mut pixels, Point::new(7.0, 25.0), Point::new(20.0, 12.0), 1.35, black);
+    draw_cursor_line(&mut pixels, Point::new(11.0, 21.0), Point::new(24.0, 8.0), 3.4, white);
+    draw_cursor_line(&mut pixels, Point::new(11.0, 21.0), Point::new(24.0, 8.0), 1.35, black);
+    draw_cursor_line(&mut pixels, Point::new(18.0, 8.0), Point::new(26.0, 16.0), 4.6, white);
+    draw_cursor_line(&mut pixels, Point::new(18.0, 8.0), Point::new(26.0, 16.0), 2.2, black);
+    draw_cursor_line(&mut pixels, Point::new(19.0, 9.0), Point::new(25.0, 15.0), 1.2, white);
+    draw_cursor_line(&mut pixels, Point::new(5.0, 27.0), Point::new(8.0, 24.0), 2.9, white);
+    draw_cursor_line(&mut pixels, Point::new(5.0, 27.0), Point::new(8.0, 24.0), 1.25, black);
+
+    pixels
+}
+
+fn draw_cursor_line(pixels: &mut [u8], start: Point, end: Point, radius: f32, color: [u8; 4]) {
+    for y in 0..32 {
+        for x in 0..32 {
+            let point = Point::new(x as f32 + 0.5, y as f32 + 0.5);
+            if distance_to_segment(point, start, end) <= radius {
+                let index = ((y * 32 + x) * 4) as usize;
+                pixels[index..index + 4].copy_from_slice(&color);
+            }
+        }
+    }
+}
+
+fn distance_to_segment(point: Point, start: Point, end: Point) -> f32 {
+    let vx = end.x - start.x;
+    let vy = end.y - start.y;
+    let wx = point.x - start.x;
+    let wy = point.y - start.y;
+    let length_squared = vx * vx + vy * vy;
+    if length_squared <= f32::EPSILON {
+        let dx = point.x - start.x;
+        let dy = point.y - start.y;
+        return (dx * dx + dy * dy).sqrt();
+    }
+    let t = ((wx * vx + wy * vy) / length_squared).clamp(0.0, 1.0);
+    let projection = Point::new(start.x + t * vx, start.y + t * vy);
+    let dx = point.x - projection.x;
+    let dy = point.y - projection.y;
+    (dx * dx + dy * dy).sqrt()
 }
 
 fn update_history_action_buttons(
@@ -3334,6 +4554,85 @@ fn tool_can_select_existing(tool: DefaultTool) -> bool {
 
 fn tool_picks_canvas_color(tool: DefaultTool) -> bool {
     tool == DefaultTool::ColorPicker
+}
+
+fn annotation_shows_selection_overlay(annotation: &Annotation) -> bool {
+    matches!(
+        annotation.data,
+        AnnotationData::Line { .. }
+            | AnnotationData::Arrow { .. }
+            | AnnotationData::Rectangle { .. }
+            | AnnotationData::Ellipse { .. }
+            | AnnotationData::Mosaic { .. }
+            | AnnotationData::Blur { .. }
+            | AnnotationData::Counter { .. }
+            | AnnotationData::FilledBox { .. }
+    )
+}
+
+fn annotation_keeps_selection_after_creation(annotation: &Annotation) -> bool {
+    annotation_shows_selection_overlay(annotation)
+}
+
+fn selected_annotation_bounds(document: &Document) -> Option<Rect> {
+    let id = document.selected?;
+    document
+        .annotations
+        .iter()
+        .find(|annotation| annotation.id == id && annotation_shows_selection_overlay(annotation))
+        .map(Annotation::bounds)
+}
+
+fn resize_handle_points(rect: Rect) -> [(ResizeHandle, Point); 8] {
+    let left = rect.x;
+    let center_x = rect.x + rect.width * 0.5;
+    let right = rect.x + rect.width;
+    let top = rect.y;
+    let center_y = rect.y + rect.height * 0.5;
+    let bottom = rect.y + rect.height;
+    [
+        (ResizeHandle::TopLeft, Point::new(left, top)),
+        (ResizeHandle::Top, Point::new(center_x, top)),
+        (ResizeHandle::TopRight, Point::new(right, top)),
+        (ResizeHandle::Right, Point::new(right, center_y)),
+        (ResizeHandle::BottomRight, Point::new(right, bottom)),
+        (ResizeHandle::Bottom, Point::new(center_x, bottom)),
+        (ResizeHandle::BottomLeft, Point::new(left, bottom)),
+        (ResizeHandle::Left, Point::new(left, center_y)),
+    ]
+}
+
+fn resize_handle_at(document: &Document, point: Point, tolerance: f32) -> Option<ResizeHandle> {
+    let bounds = selected_annotation_bounds(document)?;
+    resize_handle_points(bounds).iter().find_map(|(handle, center)| {
+        let dx = point.x - center.x;
+        let dy = point.y - center.y;
+        ((dx * dx + dy * dy).sqrt() <= tolerance).then_some(*handle)
+    })
+}
+
+fn draw_selection_overlay(cr: &gtk::cairo::Context, rect: Rect) {
+    let _ = cr.save();
+    cr.set_source_rgba(0.13, 0.48, 0.95, 0.88);
+    cr.set_line_width(1.4);
+    cr.rectangle(rect.x as f64, rect.y as f64, rect.width as f64, rect.height as f64);
+    let _ = cr.stroke();
+
+    for (_, center) in resize_handle_points(rect) {
+        cr.set_source_rgba(1.0, 1.0, 1.0, 0.96);
+        cr.arc(
+            center.x as f64,
+            center.y as f64,
+            SELECTION_HANDLE_RADIUS,
+            0.0,
+            std::f64::consts::TAU,
+        );
+        let _ = cr.fill_preserve();
+        cr.set_source_rgba(0.13, 0.48, 0.95, 0.95);
+        cr.set_line_width(1.4);
+        let _ = cr.stroke();
+    }
+    let _ = cr.restore();
 }
 
 #[derive(Debug, Clone)]
@@ -3869,6 +5168,33 @@ fn draw_annotation(cr: &gtk::cairo::Context, annotation: &Annotation) {
     }
 }
 
+fn draw_brush_cursor_preview(
+    cr: &gtk::cairo::Context,
+    point: Point,
+    color: Color,
+    stroke_width: u32,
+) {
+    let radius = (stroke_width.max(2) as f64 * 0.5).max(2.5);
+    let _ = cr.save();
+    cr.set_source_rgba(
+        color.r as f64 / 255.0,
+        color.g as f64 / 255.0,
+        color.b as f64 / 255.0,
+        0.20,
+    );
+    cr.arc(point.x as f64, point.y as f64, radius, 0.0, std::f64::consts::TAU);
+    let _ = cr.fill_preserve();
+    cr.set_source_rgba(
+        color.r as f64 / 255.0,
+        color.g as f64 / 255.0,
+        color.b as f64 / 255.0,
+        0.68,
+    );
+    cr.set_line_width(1.2);
+    let _ = cr.stroke();
+    let _ = cr.restore();
+}
+
 fn set_cairo_color(cr: &gtk::cairo::Context, color: Color) {
     cr.set_source_rgba(
         color.r as f64 / 255.0,
@@ -3904,16 +5230,21 @@ fn render_document_png_bytes(
     Ok(cursor.into_inner())
 }
 
-fn copy_rendered_document_to_clipboard(base: &image::DynamicImage, annotations: &[Annotation]) {
-    let Ok(bytes) = render_document_png_bytes(base, annotations) else {
-        return;
-    };
+fn copy_rendered_document_to_clipboard(
+    base: &image::DynamicImage,
+    annotations: &[Annotation],
+) -> std::result::Result<(), String> {
+    let bytes = render_document_png_bytes(base, annotations)
+        .map_err(|source| format!("failed to render copied image: {source}"))?;
     let Some(display) = gtk::gdk::Display::default() else {
-        return;
+        return Err("clipboard is unavailable".to_string());
     };
     let bytes = glib::Bytes::from_owned(bytes);
     let provider = gtk::gdk::ContentProvider::for_bytes("image/png", &bytes);
-    let _ = display.clipboard().set_content(Some(&provider));
+    display
+        .clipboard()
+        .set_content(Some(&provider))
+        .map_err(|error| format!("failed to copy image to clipboard: {error}"))
 }
 
 fn copy_text_to_clipboard(text: &str) {
@@ -3951,15 +5282,26 @@ fn save_editor_document_with_filename(
     annotations: &[Annotation],
     requested_filename: &str,
 ) -> std::result::Result<PathBuf, String> {
+    save_editor_document_to_dir_with_filename(
+        &config.default_save_dir,
+        base,
+        annotations,
+        requested_filename,
+    )
+}
+
+fn save_editor_document_to_dir_with_filename(
+    save_dir: &Path,
+    base: &image::DynamicImage,
+    annotations: &[Annotation],
+    requested_filename: &str,
+) -> std::result::Result<PathBuf, String> {
     let filename = normalized_save_filename(requested_filename)
         .ok_or_else(|| "Enter a file name".to_string())?;
-    fs::create_dir_all(&config.default_save_dir).map_err(|source| {
-        format!(
-            "failed to create screenshot directory {}: {source}",
-            config.default_save_dir.display()
-        )
+    fs::create_dir_all(save_dir).map_err(|source| {
+        format!("failed to create screenshot directory {}: {source}", save_dir.display())
     })?;
-    let output = config.default_save_dir.join(filename);
+    let output = save_dir.join(filename);
     save_document_png(base, annotations, &output)
         .map_err(|source| format!("failed to save screenshot at {}: {source}", output.display()))?;
     Ok(output)
@@ -3991,8 +5333,16 @@ fn begin_ocr_request(
     rect: Rect,
     languages: Vec<String>,
     filter_symbols: bool,
+    status: Option<StatusCallback>,
+    toast: Option<ToastCallback>,
 ) {
     let Some(crop) = crop_image_region(base_image, rect) else {
+        if let Some(status) = &status {
+            status(None);
+        }
+        if let Some(toast) = &toast {
+            toast("OCR failed: empty region");
+        }
         show_ocr_result_dialog(parent, Err("Select a non-empty OCR region".to_string()));
         return;
     };
@@ -4002,8 +5352,18 @@ fn begin_ocr_request(
         chrono::Local::now().timestamp_nanos_opt().unwrap_or_default()
     ));
     if let Err(error) = crop.save(&crop_path) {
+        if let Some(status) = &status {
+            status(None);
+        }
+        if let Some(toast) = &toast {
+            toast(&format!("OCR failed: {error}"));
+        }
         show_ocr_result_dialog(parent, Err(format!("failed to prepare OCR image: {error}")));
         return;
+    }
+
+    if let Some(status) = &status {
+        status(Some("Recognizing...".to_string()));
     }
 
     let mut config = state.config_snapshot();
@@ -4017,13 +5377,30 @@ fn begin_ocr_request(
     });
 
     let parent_for_poll = parent.clone();
+    let status_for_poll = status.clone();
+    let toast_for_poll = toast.clone();
     glib::timeout_add_local(Duration::from_millis(80), move || match rx.try_recv() {
         Ok(result) => {
+            if let Some(status) = &status_for_poll {
+                status(None);
+            }
+            if let Some(toast) = &toast_for_poll {
+                match &result {
+                    Ok(_) => toast("OCR finished"),
+                    Err(error) => toast(&format!("OCR failed: {error}")),
+                }
+            }
             show_ocr_result_dialog(&parent_for_poll, result);
             glib::ControlFlow::Break
         }
         Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
         Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+            if let Some(status) = &status_for_poll {
+                status(None);
+            }
+            if let Some(toast) = &toast_for_poll {
+                toast("OCR failed: task stopped unexpectedly");
+            }
             show_ocr_result_dialog(&parent_for_poll, Err("OCR task stopped unexpectedly".into()));
             glib::ControlFlow::Break
         }
@@ -4378,23 +5755,30 @@ mod tests {
 
     use ashot_core::{
         Annotation, AnnotationData, AppConfig, Color, DefaultTool, Document, Point, Rect,
+        ResizeHandle,
     };
 
     use super::{
-        ActiveTextEdit, DraftAnnotation, HslColor, PinClickAction, add_favorite_color,
-        annotation_snapshot_for_draw, arrow_head_geometry, arrow_head_points, arrow_shape_geometry,
-        arrow_visual_stroke_width, blur_radius_for_stroke, capture_should_use_fresh_anchor,
-        crop_image_region, draft_preview_for_draw, draft_tool_can_draw, editor_color_palette,
-        editor_favorite_palette, editor_initial_size, editor_stroke_widths, editor_tool_layout,
-        filter_ocr_symbols, fit_scale, hsl_to_color, hsv_to_color, image_color_at,
-        mosaic_pixel_size_for_stroke, moving_delta_and_update, normalized_save_filename,
-        ocr_language_label, ocr_space_curl_args, ocr_space_language_arg, parse_hex_color,
-        parse_ocr_space_response, pin_click_action, pin_dimension_label, pin_display_size,
-        pin_initial_scale, pin_window_size, pin_window_size_for_scale, pin_zoom_from_scroll,
-        push_recent_color, remove_favorite_color, render_document_png_bytes, rgb_to_hsl,
-        rgb_to_hsv, scaled_canvas_point, set_active_text_edit, suggested_save_filename_at,
-        take_active_text_edit, tesseract_command_args, tesseract_command_invocation,
-        text_for_annotation, tool_can_select_existing, tool_icon_label, tool_picks_canvas_color,
+        ActiveTextEdit, DraftAnnotation, EditorCursorKind, HslColor, PinClickAction,
+        SELECTION_HANDLE_HIT_TOLERANCE, add_favorite_color,
+        annotation_keeps_selection_after_creation, annotation_snapshot_for_draw,
+        arrow_head_geometry, arrow_head_points, arrow_shape_geometry, arrow_visual_stroke_width,
+        blur_radius_for_stroke, capture_should_use_fresh_anchor, crop_image_region,
+        cursor_name_for_resize_handle, cursor_name_for_surface_edge, draft_preview_for_draw,
+        draft_tool_can_draw, editor_color_palette, editor_cursor_for_tool,
+        editor_cursor_kind_for_tool, editor_favorite_palette, editor_initial_size,
+        editor_status_text, editor_stroke_widths, editor_tool_layout, filter_ocr_symbols,
+        fit_scale, hsl_to_color, hsv_to_color, image_color_at, mosaic_pixel_size_for_stroke,
+        moving_delta_and_update, normalized_save_filename, ocr_language_label, ocr_space_curl_args,
+        ocr_space_language_arg, output_action_menu_items, output_action_primary_label,
+        parse_hex_color, parse_ocr_space_response, pin_click_action, pin_context_popover_rect,
+        pin_dimension_label, pin_display_size, pin_initial_scale, pin_initial_scale_with_saved,
+        pin_window_size, pin_window_size_for_scale, pin_zoom_from_scroll, push_recent_color,
+        remove_favorite_color, render_document_png_bytes, resize_handle_at, rgb_to_hsl, rgb_to_hsv,
+        save_editor_document_to_dir_with_filename, scaled_canvas_point, selected_annotation_bounds,
+        set_active_text_edit, suggested_save_filename_at, take_active_text_edit,
+        tesseract_command_args, tesseract_command_invocation, text_for_annotation,
+        tool_can_select_existing, tool_icon_label, tool_picks_canvas_color,
         update_ocr_language_selection,
     };
 
@@ -4415,6 +5799,26 @@ mod tests {
         let (small_width, small_height) = editor_initial_size(640, 360);
         assert!(small_width >= 980);
         assert!(small_height >= 620);
+    }
+
+    #[test]
+    fn editor_status_text_reports_tool_style_image_and_save_path() {
+        let text = editor_status_text(
+            DefaultTool::Arrow,
+            Color::rgba(232, 62, 38, 255),
+            4,
+            1920,
+            1080,
+            std::path::Path::new("/tmp/screens"),
+            Some("Saved"),
+        );
+
+        assert!(text.contains("Tool: Arrow"));
+        assert!(text.contains("Color: #E83E26"));
+        assert!(text.contains("Width: 4px"));
+        assert!(text.contains("Image: 1920 x 1080"));
+        assert!(text.contains("Path: /tmp/screens"));
+        assert!(text.contains("Saved"));
     }
 
     #[test]
@@ -4521,6 +5925,12 @@ mod tests {
             assert_ne!(tool_icon_label(tool), name);
         }
         assert_eq!(tool_icon_label(DefaultTool::Text), "T");
+    }
+
+    #[test]
+    fn output_actions_keep_done_primary_and_group_secondary_items() {
+        assert_eq!(output_action_primary_label(), "Done");
+        assert_eq!(output_action_menu_items(), ["Save", "Save To", "Copy & Close"]);
     }
 
     #[test]
@@ -4655,6 +6065,114 @@ mod tests {
     }
 
     #[test]
+    fn resize_handle_hit_testing_uses_selected_bounds() {
+        let mut document = Document::new(120, 80, DefaultTool::Select);
+        let annotation = Annotation::new(AnnotationData::Rectangle {
+            rect: Rect { x: 10.0, y: 20.0, width: 40.0, height: 30.0 },
+            color: Color::rgba(255, 0, 0, 255),
+            stroke_width: 4,
+        });
+        let id = annotation.id;
+        document.add_annotation(annotation);
+        document.selected = Some(id);
+
+        assert_eq!(
+            resize_handle_at(&document, Point::new(50.0, 50.0), 6.0),
+            Some(ResizeHandle::BottomRight)
+        );
+        assert_eq!(resize_handle_at(&document, Point::new(30.0, 35.0), 6.0), None);
+    }
+
+    #[test]
+    fn selection_overlay_is_only_shown_for_resizable_annotations() {
+        let mut document = Document::new(120, 80, DefaultTool::Select);
+        let brush = Annotation::new(AnnotationData::Brush {
+            points: vec![Point::new(10.0, 20.0), Point::new(50.0, 50.0)],
+            color: Color::rgba(255, 0, 0, 255),
+            stroke_width: 4,
+        });
+        let brush_id = brush.id;
+        document.add_annotation(brush);
+        document.selected = Some(brush_id);
+        assert_eq!(selected_annotation_bounds(&document), None);
+
+        let marker = Annotation::new(AnnotationData::Marker {
+            points: vec![Point::new(15.0, 25.0), Point::new(55.0, 65.0)],
+            color: Color::rgba(255, 220, 0, 96),
+            stroke_width: 12,
+        });
+        let marker_id = marker.id;
+        document.add_annotation(marker);
+        document.selected = Some(marker_id);
+        assert_eq!(selected_annotation_bounds(&document), None);
+
+        let text = Annotation::new(AnnotationData::Text {
+            origin: Point::new(12.0, 18.0),
+            text: "note".into(),
+            style: ashot_core::TextStyle {
+                size: 20,
+                weight: ashot_core::TextWeight::Bold,
+                color: Color::rgba(255, 255, 255, 255),
+            },
+        });
+        let text_id = text.id;
+        document.add_annotation(text);
+        document.selected = Some(text_id);
+        assert_eq!(selected_annotation_bounds(&document), None);
+
+        let rect = Annotation::new(AnnotationData::Rectangle {
+            rect: Rect { x: 10.0, y: 20.0, width: 40.0, height: 30.0 },
+            color: Color::rgba(255, 0, 0, 255),
+            stroke_width: 4,
+        });
+        let rect_id = rect.id;
+        document.add_annotation(rect);
+        document.selected = Some(rect_id);
+        assert!(selected_annotation_bounds(&document).is_some());
+    }
+
+    #[test]
+    fn non_resizable_annotations_do_not_keep_selection_after_creation() {
+        let brush = Annotation::new(AnnotationData::Brush {
+            points: vec![Point::new(10.0, 20.0), Point::new(50.0, 50.0)],
+            color: Color::rgba(255, 0, 0, 255),
+            stroke_width: 4,
+        });
+        let marker = Annotation::new(AnnotationData::Marker {
+            points: vec![Point::new(15.0, 25.0), Point::new(55.0, 65.0)],
+            color: Color::rgba(255, 220, 0, 96),
+            stroke_width: 12,
+        });
+        let rect = Annotation::new(AnnotationData::Rectangle {
+            rect: Rect { x: 10.0, y: 20.0, width: 40.0, height: 30.0 },
+            color: Color::rgba(255, 0, 0, 255),
+            stroke_width: 4,
+        });
+
+        assert!(!annotation_keeps_selection_after_creation(&brush));
+        assert!(!annotation_keeps_selection_after_creation(&marker));
+        assert!(annotation_keeps_selection_after_creation(&rect));
+    }
+
+    #[test]
+    fn resize_handles_use_a_larger_default_hit_target() {
+        let mut document = Document::new(120, 80, DefaultTool::Select);
+        let annotation = Annotation::new(AnnotationData::Rectangle {
+            rect: Rect { x: 10.0, y: 20.0, width: 40.0, height: 30.0 },
+            color: Color::rgba(255, 0, 0, 255),
+            stroke_width: 4,
+        });
+        let id = annotation.id;
+        document.add_annotation(annotation);
+        document.selected = Some(id);
+
+        assert_eq!(
+            resize_handle_at(&document, Point::new(58.5, 58.5), SELECTION_HANDLE_HIT_TOLERANCE),
+            Some(ResizeHandle::BottomRight)
+        );
+    }
+
+    #[test]
     fn active_text_edit_helpers_do_not_panic_when_state_is_borrowed() {
         let active_text_edit = Rc::new(RefCell::new(Some(ActiveTextEdit {
             id: None,
@@ -4714,6 +6232,33 @@ mod tests {
         assert!(tool_picks_canvas_color(DefaultTool::ColorPicker));
         assert!(!tool_picks_canvas_color(DefaultTool::Select));
         assert!(!tool_picks_canvas_color(DefaultTool::Brush));
+    }
+
+    #[test]
+    fn cursor_changes_to_match_active_tool_family() {
+        assert_eq!(editor_cursor_kind_for_tool(DefaultTool::Select), EditorCursorKind::Default);
+        assert_eq!(editor_cursor_kind_for_tool(DefaultTool::Text), EditorCursorKind::Text);
+        assert_eq!(
+            editor_cursor_kind_for_tool(DefaultTool::ColorPicker),
+            EditorCursorKind::Eyedropper
+        );
+        assert_eq!(editor_cursor_kind_for_tool(DefaultTool::Arrow), EditorCursorKind::Crosshair);
+
+        assert_eq!(editor_cursor_for_tool(DefaultTool::Select), Some("default"));
+        assert_eq!(editor_cursor_for_tool(DefaultTool::Text), Some("text"));
+        assert_eq!(editor_cursor_for_tool(DefaultTool::ColorPicker), None);
+        assert_eq!(editor_cursor_for_tool(DefaultTool::Arrow), Some("crosshair"));
+        assert_eq!(editor_cursor_for_tool(DefaultTool::Rectangle), Some("crosshair"));
+        assert_eq!(editor_cursor_for_tool(DefaultTool::Ocr), Some("crosshair"));
+    }
+
+    #[test]
+    fn resize_handles_map_to_directional_cursors() {
+        assert_eq!(cursor_name_for_resize_handle(ResizeHandle::TopLeft), "nwse-resize");
+        assert_eq!(cursor_name_for_resize_handle(ResizeHandle::BottomRight), "nwse-resize");
+        assert_eq!(cursor_name_for_resize_handle(ResizeHandle::TopRight), "nesw-resize");
+        assert_eq!(cursor_name_for_resize_handle(ResizeHandle::Left), "ew-resize");
+        assert_eq!(cursor_name_for_resize_handle(ResizeHandle::Bottom), "ns-resize");
     }
 
     #[test]
@@ -4862,6 +6407,11 @@ mod tests {
     }
 
     #[test]
+    fn pin_initial_scale_uses_remembered_non_default_zoom() {
+        assert_eq!(pin_initial_scale_with_saved(1200, 800, 600, 400, 1.5), 1.5);
+    }
+
+    #[test]
     fn pin_wheel_zoom_can_expand_and_shrink() {
         let current = 1.0;
 
@@ -4879,7 +6429,21 @@ mod tests {
     fn pin_clicks_move_or_close_from_image_area() {
         assert_eq!(pin_click_action(1, 1), Some(PinClickAction::Move));
         assert_eq!(pin_click_action(2, 1), Some(PinClickAction::Close));
-        assert_eq!(pin_click_action(1, 3), None);
+        assert_eq!(pin_click_action(1, 3), Some(PinClickAction::Menu));
+    }
+
+    #[test]
+    fn pin_context_menu_anchors_to_click_position() {
+        assert_eq!(pin_context_popover_rect(24.4, 35.6), (24, 36, 1, 1));
+        assert_eq!(pin_context_popover_rect(-8.0, f64::NAN), (0, 0, 1, 1));
+    }
+
+    #[test]
+    fn pin_resize_edges_map_to_directional_cursors() {
+        assert_eq!(cursor_name_for_surface_edge(gtk4::gdk::SurfaceEdge::NorthWest), "nwse-resize");
+        assert_eq!(cursor_name_for_surface_edge(gtk4::gdk::SurfaceEdge::NorthEast), "nesw-resize");
+        assert_eq!(cursor_name_for_surface_edge(gtk4::gdk::SurfaceEdge::East), "ew-resize");
+        assert_eq!(cursor_name_for_surface_edge(gtk4::gdk::SurfaceEdge::South), "ns-resize");
     }
 
     #[test]
@@ -4903,5 +6467,30 @@ mod tests {
         let now = Local.with_ymd_and_hms(2026, 4, 27, 12, 34, 56).unwrap();
 
         assert_eq!(suggested_save_filename_at(&config, now), "Capture_20260427_123456.png");
+    }
+
+    #[test]
+    fn save_to_specific_directory_uses_requested_directory() {
+        let requested_dir = std::env::temp_dir().join(format!(
+            "ashot-save-to-test-{}",
+            chrono::Local::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let base = image::DynamicImage::new_rgba8(16, 16);
+        let annotations = vec![Annotation::new(AnnotationData::FilledBox {
+            rect: Rect::from_points(Point::new(2.0, 2.0), Point::new(8.0, 8.0)),
+            color: Color::rgba(255, 0, 0, 255),
+        })];
+
+        let output = save_editor_document_to_dir_with_filename(
+            &requested_dir,
+            &base,
+            &annotations,
+            "named-shot",
+        )
+        .expect("save to requested dir");
+
+        assert_eq!(output, requested_dir.join("named-shot.png"));
+        assert!(output.exists());
+        let _ = std::fs::remove_dir_all(requested_dir);
     }
 }
