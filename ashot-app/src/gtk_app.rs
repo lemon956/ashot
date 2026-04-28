@@ -3,6 +3,7 @@ use std::{
     env,
     ffi::CStr,
     fs,
+    io::Cursor,
     os::raw::c_char,
     path::{Path, PathBuf},
     rc::Rc,
@@ -16,7 +17,8 @@ use ashot_core::{
     Annotation, AnnotationData, AppConfig, Color, DefaultTool, Document, EditorHistory,
     LinuxDistroFamily, OcrBackend, Point, Rect, TextStyle, TextWeight, default_ocr_languages,
     detect_linux_distro_family, finalize_capture_with_config, language_install_command,
-    language_package_for_distro, render_filename, save_document_png, search_ocr_languages,
+    language_package_for_distro, render_document, render_filename, save_document_png,
+    search_ocr_languages,
 };
 use ashot_ipc::{
     APP_ID, CaptureMode, CaptureOutcome, CommandOutcome, DBUS_NAME, DBUS_PATH, OutcomeKind,
@@ -42,8 +44,11 @@ use url::Url;
 use zbus::connection::Builder as ConnectionBuilder;
 
 const EDITOR_HISTORY_LIMIT: usize = 64;
+const COLOR_ROW_LIMIT: usize = 6;
 
 type ApplicationWindow = adw::ApplicationWindow;
+type ColorCallback = Rc<dyn Fn(Color)>;
+type ColorMemoryButtons = Rc<RefCell<Vec<(Rc<Cell<Color>>, DrawingArea, Button)>>>;
 
 pub fn run() -> Result<()> {
     let _ = fmt().with_env_filter(EnvFilter::from_env("ASHOT_LOG")).with_target(false).try_init();
@@ -1008,6 +1013,7 @@ fn present_editor(
     runtime: Handle,
     image_path: PathBuf,
 ) -> Result<()> {
+    install_editor_css();
     info!("present_editor start: {}", image_path.display());
     let image = image::open(&image_path)
         .with_context(|| format!("failed to load screenshot at {}", image_path.display()))?;
@@ -1144,10 +1150,16 @@ fn present_editor(
     tool_grid.set_column_spacing(6);
     let tool_buttons = Rc::new(RefCell::new(Vec::<(DefaultTool, Button)>::new()));
     for (index, (label, tool)) in editor_tool_layout().iter().enumerate() {
-        let button = Button::with_label(label);
+        let button = Button::new();
+        let icon = Label::new(None);
+        icon.set_markup(&format!(
+            "<span size=\"large\" weight=\"600\">{}</span>",
+            tool_icon_label(*tool)
+        ));
+        button.set_child(Some(&icon));
         button.set_tooltip_text(Some(label));
         button.set_hexpand(true);
-        button.set_size_request(74, 34);
+        button.set_size_request(48, 38);
         let document = document.clone();
         let tool_buttons_for_click = tool_buttons.clone();
         let tool = *tool;
@@ -1192,40 +1204,18 @@ fn present_editor(
     info!("present_editor ocr section added");
     update_tool_button_selection(&tool_buttons, config.default_tool);
 
-    let color_header = GtkBox::new(Orientation::Horizontal, 8);
-    color_header.append(&section_title("Color"));
-    let selected_color_preview = selected_color_preview(active_color.clone());
-    selected_color_preview.set_hexpand(true);
-    selected_color_preview.set_halign(Align::End);
-    color_header.append(&selected_color_preview);
-    left_panel.append(&color_header);
-    let color_grid = Grid::new();
-    color_grid.set_row_spacing(4);
-    color_grid.set_column_spacing(4);
-    let color_buttons = Rc::new(RefCell::new(Vec::<(Color, Button)>::new()));
     let stroke_previews = Rc::new(RefCell::new(Vec::<DrawingArea>::new()));
-    for (index, (name, color)) in editor_color_palette().iter().enumerate() {
-        let button = color_swatch_button(name, *color);
-        let active_color_for_click = active_color.clone();
-        let color_buttons_for_click = color_buttons.clone();
-        let stroke_previews_for_click = stroke_previews.clone();
-        let selected_color_preview_for_click = selected_color_preview.clone();
-        let color = *color;
-        button.connect_clicked(move |_| {
-            active_color_for_click.set(color);
-            update_color_button_selection(&color_buttons_for_click, color);
-            selected_color_preview_for_click.queue_draw();
-            if let Ok(stroke_previews) = stroke_previews_for_click.try_borrow() {
-                for preview in stroke_previews.iter() {
-                    preview.queue_draw();
-                }
-            }
-        });
-        color_grid.attach(&button, (index % 8) as i32, (index / 8) as i32, 1, 1);
-        color_buttons.borrow_mut().push((color, button));
-    }
-    update_color_button_selection(&color_buttons, active_color.get());
-    left_panel.append(&color_grid);
+    let color_ui_refresh = Rc::new(RefCell::new(None::<ColorCallback>));
+    let recent_color_recorder = Rc::new(RefCell::new(None::<ColorCallback>));
+    let color_picker = color_picker_section(
+        active_color.clone(),
+        stroke_previews.clone(),
+        document.clone(),
+        tool_buttons.clone(),
+        color_ui_refresh.clone(),
+        recent_color_recorder.clone(),
+    );
+    left_panel.append(&color_picker);
     info!("present_editor color section added");
 
     left_panel.append(&section_title("Stroke / Effect"));
@@ -1277,11 +1267,15 @@ fn present_editor(
     });
 
     let click = gtk::GestureClick::new();
+    click.set_button(1);
     let doc_for_click = document.clone();
     let draft_for_click = draft.clone();
     let history_for_click = history.clone();
+    let image_for_click = base_image.clone();
     let canvas_for_click = canvas.clone();
     let color_for_click = active_color.clone();
+    let color_ui_refresh_for_click = color_ui_refresh.clone();
+    let recent_for_click = recent_color_recorder.clone();
     let undo_for_click = undo.clone();
     let redo_for_click = redo.clone();
     let scale_for_click = image_scale.clone();
@@ -1294,6 +1288,16 @@ fn present_editor(
         };
         let active_tool = document.active_tool;
         drop(document);
+
+        if tool_picks_canvas_color(active_tool) {
+            let color = image_color_at(&image_for_click, point);
+            color_for_click.set(color);
+            if let Some(refresh) = color_ui_refresh_for_click.borrow().as_ref().cloned() {
+                refresh(color);
+            }
+            canvas_for_click.queue_draw();
+            return;
+        }
 
         if active_tool == DefaultTool::Text {
             let Ok(document) = doc_for_click.try_borrow() else {
@@ -1334,20 +1338,29 @@ fn present_editor(
                 false
             };
             if added {
+                if let Some(record_recent) = recent_for_click.borrow().as_ref().cloned() {
+                    record_recent(color_for_click.get());
+                }
                 update_history_action_buttons(&history_for_click, &undo_for_click, &redo_for_click);
                 canvas_for_click.queue_draw();
             }
             return;
         }
 
-        let selected = doc_for_click
-            .try_borrow_mut()
-            .ok()
-            .and_then(|mut document| document.select_at(point))
-            .is_some();
-        if selected {
-            if let Ok(mut draft) = draft_for_click.try_borrow_mut() {
-                *draft = None;
+        if draft_tool_can_draw(active_tool) {
+            return;
+        }
+
+        if tool_can_select_existing(active_tool) {
+            let selected = doc_for_click
+                .try_borrow_mut()
+                .ok()
+                .and_then(|mut document| document.select_at(point))
+                .is_some();
+            if selected {
+                if let Ok(mut draft) = draft_for_click.try_borrow_mut() {
+                    *draft = None;
+                }
             }
         }
     });
@@ -1360,6 +1373,7 @@ fn present_editor(
     let active_text_edit_for_commit = active_text_edit.clone();
     let undo_for_text_commit = undo.clone();
     let redo_for_text_commit = redo.clone();
+    let recent_for_text_commit = recent_color_recorder.clone();
     text_entry.connect_activate(move |entry| {
         commit_text_entry(
             entry,
@@ -1369,6 +1383,7 @@ fn present_editor(
             &active_text_edit_for_commit,
             &undo_for_text_commit,
             &redo_for_text_commit,
+            &recent_for_text_commit,
         );
     });
 
@@ -1379,6 +1394,7 @@ fn present_editor(
     let active_text_edit_for_focus = active_text_edit.clone();
     let undo_for_text_focus = undo.clone();
     let redo_for_text_focus = redo.clone();
+    let recent_for_text_focus = recent_color_recorder.clone();
     focus.connect_leave(move |controller| {
         if let Some(entry) = controller.widget().and_then(|widget| widget.downcast::<Entry>().ok())
         {
@@ -1390,6 +1406,7 @@ fn present_editor(
                 &active_text_edit_for_focus,
                 &undo_for_text_focus,
                 &redo_for_text_focus,
+                &recent_for_text_focus,
             );
         }
     });
@@ -1397,30 +1414,53 @@ fn present_editor(
     info!("present_editor text focus controller added");
 
     let drag = gtk::GestureDrag::new();
+    drag.set_button(1);
     let doc_for_drag = document.clone();
     let draft_for_drag = draft.clone();
     let moving_for_drag = moving.clone();
     let history_for_drag = history.clone();
     let color_for_drag = active_color.clone();
+    let color_ui_refresh_for_drag = color_ui_refresh.clone();
     let stroke_for_drag = active_stroke.clone();
+    let image_for_drag = base_image.clone();
+    let canvas_for_drag = canvas.clone();
     let scale_for_drag = image_scale.clone();
     let undo_for_drag = undo.clone();
     let redo_for_drag = redo.clone();
     drag.connect_drag_begin(move |_, x, y| {
         let point = scaled_canvas_point(x, y, scale_for_drag.get());
-        let Some((selected, annotations, tool)) = ({
-            let Ok(mut document) = doc_for_drag.try_borrow_mut() else {
+        let Some((annotations, tool)) = ({
+            let Ok(document) = doc_for_drag.try_borrow() else {
                 return;
             };
-            let selected = document.select_at(point).is_some();
-            Some((selected, document.annotations.clone(), document.active_tool))
+            Some((document.annotations.clone(), document.active_tool))
         }) else {
             return;
         };
 
-        if !selected && !draft_tool_can_draw(tool) {
+        if tool_picks_canvas_color(tool) {
+            let color = image_color_at(&image_for_drag, point);
+            color_for_drag.set(color);
+            if let Some(refresh) = color_ui_refresh_for_drag.borrow().as_ref().cloned() {
+                refresh(color);
+            }
+            canvas_for_drag.queue_draw();
             return;
         }
+
+        if !tool_can_select_existing(tool) && !draft_tool_can_draw(tool) {
+            return;
+        }
+
+        let selected = if tool_can_select_existing(tool) {
+            doc_for_drag
+                .try_borrow_mut()
+                .ok()
+                .and_then(|mut document| document.select_at(point))
+                .is_some()
+        } else {
+            false
+        };
 
         if let Ok(mut history) = history_for_drag.try_borrow_mut() {
             history.snapshot(&annotations);
@@ -1431,6 +1471,10 @@ fn present_editor(
             if let Ok(mut moving) = moving_for_drag.try_borrow_mut() {
                 *moving = Some(point);
             }
+            return;
+        }
+
+        if tool_can_select_existing(tool) {
             return;
         }
 
@@ -1485,6 +1529,7 @@ fn present_editor(
     let window_for_ocr = window.clone();
     let active_ocr_languages_for_end = active_ocr_languages.clone();
     let active_ocr_filter_symbols_for_end = active_ocr_filter_symbols.clone();
+    let recent_for_end = recent_color_recorder.clone();
     drag.connect_drag_end(move |_, _, _| {
         if let Ok(mut moving) = moving_for_end.try_borrow_mut() {
             *moving = None;
@@ -1513,10 +1558,14 @@ fn present_editor(
             return;
         }
 
+        let draft_color = draft.color;
         let annotation = draft.finish();
         if let Some(annotation) = annotation {
             if let Ok(mut document) = doc_for_end.try_borrow_mut() {
                 document.add_annotation(annotation);
+            }
+            if let Some(record_recent) = recent_for_end.borrow().as_ref().cloned() {
+                record_recent(draft_color);
             }
         }
         canvas_for_end.queue_draw();
@@ -1646,13 +1695,10 @@ fn present_editor(
     let doc_for_copy = document.clone();
     let image_for_copy = base_image.clone();
     copy.connect_clicked(move |_| {
-        let temp = std::env::temp_dir().join("ashot_clipboard.png");
         let Some(annotations) = annotation_snapshot_for_draw(&doc_for_copy) else {
             return;
         };
-        if save_document_png(&image_for_copy, &annotations, &temp).is_ok() {
-            copy_image_to_clipboard(&temp);
-        }
+        copy_rendered_document_to_clipboard(&image_for_copy, &annotations);
     });
 
     let doc_for_pin = document.clone();
@@ -1896,6 +1942,30 @@ fn section_title(text: &str) -> Label {
     title
 }
 
+fn install_editor_css() {
+    let Some(display) = gtk::gdk::Display::default() else {
+        return;
+    };
+    let provider = gtk::CssProvider::new();
+    provider.load_from_data(
+        r#"
+        button.active-tool {
+            background: @accent_bg_color;
+            color: @accent_fg_color;
+            box-shadow: inset 0 0 0 1px alpha(@accent_fg_color, 0.18);
+        }
+        button.active-tool label {
+            color: @accent_fg_color;
+        }
+        "#,
+    );
+    gtk::style_context_add_provider_for_display(
+        &display,
+        &provider,
+        gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+    );
+}
+
 fn editor_tool_layout() -> [(&'static str, DefaultTool); 12] {
     [
         ("Select", DefaultTool::Select),
@@ -1911,6 +1981,25 @@ fn editor_tool_layout() -> [(&'static str, DefaultTool); 12] {
         ("Blur", DefaultTool::Blur),
         ("Fill", DefaultTool::FilledBox),
     ]
+}
+
+fn tool_icon_label(tool: DefaultTool) -> &'static str {
+    match tool {
+        DefaultTool::Select => "↖",
+        DefaultTool::Brush => "✎",
+        DefaultTool::Line => "╱",
+        DefaultTool::Arrow => "➜",
+        DefaultTool::Rectangle => "□",
+        DefaultTool::Ellipse => "○",
+        DefaultTool::Marker => "▰",
+        DefaultTool::Text => "T",
+        DefaultTool::Counter => "#",
+        DefaultTool::Mosaic => "▦",
+        DefaultTool::Blur => "◌",
+        DefaultTool::FilledBox => "■",
+        DefaultTool::Ocr => "OCR",
+        DefaultTool::ColorPicker => "◉",
+    }
 }
 
 fn ocr_language_menu(active_languages: Rc<RefCell<Vec<String>>>) -> MenuButton {
@@ -2006,6 +2095,157 @@ fn update_ocr_language_selection(languages: &mut Vec<String>, code: &str, active
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct HsvColor {
+    hue: f64,
+    saturation: f64,
+    value: f64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct HslColor {
+    hue: f64,
+    saturation: f64,
+    lightness: f64,
+}
+
+fn color_to_hex(color: Color) -> String {
+    if color.a == 255 {
+        format!("#{:02X}{:02X}{:02X}", color.r, color.g, color.b)
+    } else {
+        format!("#{:02X}{:02X}{:02X}{:02X}", color.r, color.g, color.b, color.a)
+    }
+}
+
+fn parse_hex_color(input: &str, fallback_alpha: u8) -> Option<Color> {
+    let value = input.trim().trim_start_matches('#');
+    let expanded = match value.len() {
+        3 => value.chars().flat_map(|ch| [ch, ch]).collect::<String>(),
+        4 => value.chars().flat_map(|ch| [ch, ch]).collect::<String>(),
+        6 | 8 => value.to_string(),
+        _ => return None,
+    };
+
+    let r = u8::from_str_radix(&expanded[0..2], 16).ok()?;
+    let g = u8::from_str_radix(&expanded[2..4], 16).ok()?;
+    let b = u8::from_str_radix(&expanded[4..6], 16).ok()?;
+    let a = if expanded.len() == 8 {
+        u8::from_str_radix(&expanded[6..8], 16).ok()?
+    } else {
+        fallback_alpha
+    };
+    Some(Color::rgba(r, g, b, a))
+}
+
+fn rgb_to_hsv(color: Color) -> HsvColor {
+    let r = color.r as f64 / 255.0;
+    let g = color.g as f64 / 255.0;
+    let b = color.b as f64 / 255.0;
+    let max = r.max(g).max(b);
+    let min = r.min(g).min(b);
+    let delta = max - min;
+
+    let hue = if delta <= f64::EPSILON {
+        0.0
+    } else if (max - r).abs() <= f64::EPSILON {
+        60.0 * ((g - b) / delta).rem_euclid(6.0)
+    } else if (max - g).abs() <= f64::EPSILON {
+        60.0 * ((b - r) / delta + 2.0)
+    } else {
+        60.0 * ((r - g) / delta + 4.0)
+    };
+    let saturation = if max <= f64::EPSILON { 0.0 } else { delta / max };
+
+    HsvColor { hue, saturation, value: max }
+}
+
+fn hsv_to_color(hsv: HsvColor, alpha: u8) -> Color {
+    let hue = hsv.hue.rem_euclid(360.0);
+    let saturation = hsv.saturation.clamp(0.0, 1.0);
+    let value = hsv.value.clamp(0.0, 1.0);
+    let chroma = value * saturation;
+    let x = chroma * (1.0 - ((hue / 60.0).rem_euclid(2.0) - 1.0).abs());
+    let m = value - chroma;
+    let (r1, g1, b1) = match hue {
+        h if h < 60.0 => (chroma, x, 0.0),
+        h if h < 120.0 => (x, chroma, 0.0),
+        h if h < 180.0 => (0.0, chroma, x),
+        h if h < 240.0 => (0.0, x, chroma),
+        h if h < 300.0 => (x, 0.0, chroma),
+        _ => (chroma, 0.0, x),
+    };
+
+    Color::rgba(
+        ((r1 + m) * 255.0).round().clamp(0.0, 255.0) as u8,
+        ((g1 + m) * 255.0).round().clamp(0.0, 255.0) as u8,
+        ((b1 + m) * 255.0).round().clamp(0.0, 255.0) as u8,
+        alpha,
+    )
+}
+
+fn rgb_to_hsl(color: Color) -> HslColor {
+    let r = color.r as f64 / 255.0;
+    let g = color.g as f64 / 255.0;
+    let b = color.b as f64 / 255.0;
+    let max = r.max(g).max(b);
+    let min = r.min(g).min(b);
+    let delta = max - min;
+    let lightness = (max + min) * 0.5;
+    let saturation =
+        if delta <= f64::EPSILON { 0.0 } else { delta / (1.0 - (2.0 * lightness - 1.0).abs()) };
+    let hue = rgb_to_hsv(color).hue;
+
+    HslColor { hue, saturation, lightness }
+}
+
+fn hsl_to_color(hsl: HslColor, alpha: u8) -> Color {
+    let hue = hsl.hue.rem_euclid(360.0);
+    let saturation = hsl.saturation.clamp(0.0, 1.0);
+    let lightness = hsl.lightness.clamp(0.0, 1.0);
+    let chroma = (1.0 - (2.0 * lightness - 1.0).abs()) * saturation;
+    let x = chroma * (1.0 - ((hue / 60.0).rem_euclid(2.0) - 1.0).abs());
+    let m = lightness - chroma * 0.5;
+    let (r1, g1, b1) = match hue {
+        h if h < 60.0 => (chroma, x, 0.0),
+        h if h < 120.0 => (x, chroma, 0.0),
+        h if h < 180.0 => (0.0, chroma, x),
+        h if h < 240.0 => (0.0, x, chroma),
+        h if h < 300.0 => (x, 0.0, chroma),
+        _ => (chroma, 0.0, x),
+    };
+
+    Color::rgba(
+        ((r1 + m) * 255.0).round().clamp(0.0, 255.0) as u8,
+        ((g1 + m) * 255.0).round().clamp(0.0, 255.0) as u8,
+        ((b1 + m) * 255.0).round().clamp(0.0, 255.0) as u8,
+        alpha,
+    )
+}
+
+fn push_recent_color(recent: &mut Vec<Color>, color: Color, limit: usize) {
+    recent.retain(|item| *item != color);
+    recent.insert(0, color);
+    recent.truncate(limit);
+}
+
+fn add_favorite_color(favorites: &mut Vec<Color>, color: Color, limit: usize) -> Result<(), usize> {
+    if let Some(index) = favorites.iter().position(|item| *item == color) {
+        let color = favorites.remove(index);
+        favorites.insert(0, color);
+        return Ok(());
+    }
+    if favorites.len() >= limit {
+        return Err(limit);
+    }
+    favorites.insert(0, color);
+    Ok(())
+}
+
+fn remove_favorite_color(favorites: &mut Vec<Color>, color: Color) {
+    favorites.retain(|item| *item != color);
+}
+
+#[cfg(test)]
 fn editor_color_palette() -> [(&'static str, Color); 32] {
     [
         ("White", Color { r: 255, g: 255, b: 255, a: 255 }),
@@ -2043,32 +2283,17 @@ fn editor_color_palette() -> [(&'static str, Color); 32] {
     ]
 }
 
-fn editor_stroke_widths() -> [u32; 5] {
-    [2, 4, 6, 8, 12]
+fn editor_favorite_palette() -> [(&'static str, Color); 4] {
+    [
+        ("Red", Color { r: 239, g: 68, b: 68, a: 255 }),
+        ("Yellow", Color { r: 234, g: 179, b: 8, a: 255 }),
+        ("Blue", Color { r: 37, g: 99, b: 235, a: 255 }),
+        ("Black", Color { r: 15, g: 23, b: 42, a: 255 }),
+    ]
 }
 
-fn color_swatch_button(name: &str, color: Color) -> Button {
-    let area = DrawingArea::new();
-    area.set_content_width(22);
-    area.set_content_height(22);
-    area.set_draw_func(move |_, cr, width, height| {
-        cr.set_source_rgba(0.0, 0.0, 0.0, 0.12);
-        cr.rectangle(1.0, 1.0, width as f64 - 2.0, height as f64 - 2.0);
-        let _ = cr.fill();
-        set_cairo_color(cr, color);
-        cr.rectangle(2.0, 2.0, width as f64 - 4.0, height as f64 - 4.0);
-        let _ = cr.fill_preserve();
-        cr.set_source_rgba(0.0, 0.0, 0.0, 0.35);
-        cr.set_line_width(1.0);
-        let _ = cr.stroke();
-    });
-
-    let button = Button::new();
-    button.set_child(Some(&area));
-    button.set_tooltip_text(Some(name));
-    button.set_size_request(28, 28);
-    button.add_css_class("flat");
-    button
+fn editor_stroke_widths() -> [u32; 5] {
+    [2, 4, 6, 8, 12]
 }
 
 fn selected_color_preview(active_color: Rc<Cell<Color>>) -> DrawingArea {
@@ -2084,6 +2309,780 @@ fn selected_color_preview(active_color: Rc<Cell<Color>>) -> DrawingArea {
         let _ = cr.fill();
     });
     area
+}
+
+fn dynamic_color_swatch(color: Rc<Cell<Color>>, width: i32, height: i32) -> DrawingArea {
+    let area = DrawingArea::new();
+    area.set_content_width(width);
+    area.set_content_height(height);
+    area.set_draw_func(move |_, cr, draw_width, draw_height| {
+        let color = color.get();
+        cr.set_source_rgba(0.0, 0.0, 0.0, 0.18);
+        cr.rectangle(0.5, 0.5, draw_width as f64 - 1.0, draw_height as f64 - 1.0);
+        let _ = cr.stroke();
+        if color.a == 0 {
+            cr.set_source_rgba(0.45, 0.48, 0.53, 0.35);
+            cr.move_to(4.0, draw_height as f64 - 4.0);
+            cr.line_to(draw_width as f64 - 4.0, 4.0);
+            cr.set_line_width(1.0);
+            let _ = cr.stroke();
+            return;
+        }
+        set_cairo_color(cr, color);
+        cr.rectangle(3.0, 3.0, draw_width as f64 - 6.0, draw_height as f64 - 6.0);
+        let _ = cr.fill();
+    });
+    area
+}
+
+fn eyedropper_icon_button() -> Button {
+    let icon = DrawingArea::new();
+    icon.set_content_width(22);
+    icon.set_content_height(22);
+    icon.set_draw_func(move |_, cr, width, height| {
+        let width = width.max(1) as f64;
+        let height = height.max(1) as f64;
+        let _ = cr.save();
+        cr.translate(width * 0.5, height * 0.5);
+        cr.rotate(-std::f64::consts::FRAC_PI_4);
+        cr.set_line_cap(gtk::cairo::LineCap::Round);
+        cr.set_line_join(gtk::cairo::LineJoin::Round);
+        cr.set_source_rgba(0.12, 0.14, 0.18, 0.92);
+        cr.set_line_width(1.45);
+
+        let _ = cr.save();
+        cr.translate(0.0, -8.2);
+        cr.scale(0.68, 1.0);
+        cr.arc(0.0, 0.0, 4.4, 0.0, std::f64::consts::TAU);
+        let _ = cr.stroke();
+        let _ = cr.restore();
+
+        cr.arc(1.35, -9.0, 1.05, -0.9, 1.15);
+        let _ = cr.stroke();
+
+        draw_round_rect(cr, -5.6, -3.9, 11.2, 4.2, 2.1);
+        let _ = cr.stroke();
+
+        cr.move_to(-3.6, -2.0);
+        cr.line_to(-1.8, -2.0);
+        cr.move_to(0.0, -2.0);
+        cr.line_to(1.8, -2.0);
+        cr.move_to(3.6, -2.0);
+        cr.line_to(4.4, -2.0);
+        let _ = cr.stroke();
+
+        cr.move_to(-3.2, 0.2);
+        cr.line_to(-3.2, 7.9);
+        cr.line_to(-1.0, 10.1);
+        cr.move_to(3.2, 0.2);
+        cr.line_to(3.2, 7.9);
+        cr.line_to(1.0, 10.1);
+        cr.move_to(-1.0, 10.1);
+        cr.line_to(1.0, 10.1);
+        cr.move_to(-1.2, 2.2);
+        cr.line_to(-1.2, 7.2);
+        cr.move_to(1.2, 2.2);
+        cr.line_to(1.2, 7.2);
+        let _ = cr.stroke();
+        let _ = cr.restore();
+    });
+
+    let button = Button::new();
+    button.set_child(Some(&icon));
+    button.set_tooltip_text(Some("Pick color from image"));
+    button.set_size_request(34, 34);
+    button.add_css_class("flat");
+    button
+}
+
+fn color_memory_row(title: &str, buttons: &ColorMemoryButtons) -> GtkBox {
+    let row = GtkBox::new(Orientation::Horizontal, 6);
+    let label = Label::new(Some(title));
+    label.set_xalign(0.0);
+    label.set_width_chars(7);
+    row.append(&label);
+
+    let grid = Grid::new();
+    grid.set_row_spacing(4);
+    grid.set_column_spacing(4);
+    for index in 0..COLOR_ROW_LIMIT {
+        let color_cell = Rc::new(Cell::new(Color::rgba(0, 0, 0, 0)));
+        let swatch = dynamic_color_swatch(color_cell.clone(), 22, 22);
+        let button = Button::new();
+        button.set_child(Some(&swatch));
+        button.set_sensitive(false);
+        button.set_size_request(26, 26);
+        button.add_css_class("flat");
+        grid.attach(&button, index as i32, 0, 1, 1);
+        buttons.borrow_mut().push((color_cell, swatch, button));
+    }
+    row.append(&grid);
+    row
+}
+
+fn update_color_memory_buttons(colors: &[Color], buttons: &ColorMemoryButtons) {
+    if let Ok(buttons) = buttons.try_borrow() {
+        for (index, (color_cell, swatch, button)) in buttons.iter().enumerate() {
+            if let Some(color) = colors.get(index) {
+                color_cell.set(*color);
+                button.set_sensitive(true);
+                button.set_tooltip_text(Some(&color_to_hex(*color)));
+            } else {
+                color_cell.set(Color::rgba(0, 0, 0, 0));
+                button.set_sensitive(false);
+                button.set_tooltip_text(None);
+            }
+            swatch.queue_draw();
+        }
+    }
+}
+
+fn show_favorite_remove_popover(
+    anchor: &Button,
+    color: Color,
+    active_color: Rc<Cell<Color>>,
+    favorites: Rc<RefCell<Vec<Color>>>,
+    favorite_buttons: ColorMemoryButtons,
+    refresh: ColorCallback,
+) {
+    let popover = Popover::new();
+    popover.set_parent(anchor);
+
+    let root = GtkBox::new(Orientation::Vertical, 6);
+    root.set_margin_top(8);
+    root.set_margin_bottom(8);
+    root.set_margin_start(8);
+    root.set_margin_end(8);
+
+    let delete = Button::with_label("Remove");
+    delete.add_css_class("destructive-action");
+    root.append(&delete);
+
+    let popover_for_delete = popover.clone();
+    delete.connect_clicked(move |_| {
+        let mut removed = false;
+        if let Ok(mut favorites) = favorites.try_borrow_mut() {
+            removed = favorites.iter().any(|favorite| *favorite == color);
+            remove_favorite_color(&mut favorites, color);
+            update_color_memory_buttons(&favorites, &favorite_buttons);
+        }
+        if removed {
+            refresh(active_color.get());
+        }
+        popover_for_delete.popdown();
+        popover_for_delete.unparent();
+    });
+
+    popover.set_child(Some(&root));
+    popover.popup();
+}
+
+fn draw_round_rect(cr: &gtk::cairo::Context, x: f64, y: f64, width: f64, height: f64, radius: f64) {
+    let r = radius.min(width * 0.5).min(height * 0.5);
+    cr.new_sub_path();
+    cr.arc(x + width - r, y + r, r, -std::f64::consts::FRAC_PI_2, 0.0);
+    cr.arc(x + width - r, y + height - r, r, 0.0, std::f64::consts::FRAC_PI_2);
+    cr.arc(x + r, y + height - r, r, std::f64::consts::FRAC_PI_2, std::f64::consts::PI);
+    cr.arc(x + r, y + r, r, std::f64::consts::PI, std::f64::consts::PI * 1.5);
+    cr.close_path();
+}
+
+fn slider_value_from_x(area: &DrawingArea, x: f64) -> f64 {
+    let width = area.allocated_width().max(1) as f64;
+    (x / width).clamp(0.0, 1.0)
+}
+
+fn draw_hue_slider_bar(cr: &gtk::cairo::Context, width: i32, height: i32, hue: f64) {
+    let width_f = width.max(1) as f64;
+    let height_f = height.max(1) as f64;
+    let radius = height_f * 0.34;
+    let _ = cr.save();
+    draw_round_rect(cr, 1.0, 2.0, width_f - 2.0, height_f - 4.0, radius);
+    cr.clip();
+    for x in 0..width {
+        let color = hsv_to_color(
+            HsvColor {
+                hue: x as f64 * 360.0 / (width - 1).max(1) as f64,
+                saturation: 1.0,
+                value: 1.0,
+            },
+            255,
+        );
+        cr.set_source_rgb(color.r as f64 / 255.0, color.g as f64 / 255.0, color.b as f64 / 255.0);
+        cr.rectangle(x as f64, 0.0, 1.0, height_f);
+        let _ = cr.fill();
+    }
+    let _ = cr.restore();
+    draw_slider_knob(cr, hue.rem_euclid(360.0) / 360.0, width_f, height_f);
+}
+
+fn draw_opacity_slider_bar(cr: &gtk::cairo::Context, width: i32, height: i32, color: Color) {
+    let width_f = width.max(1) as f64;
+    let height_f = height.max(1) as f64;
+    let radius = height_f * 0.34;
+    let _ = cr.save();
+    draw_round_rect(cr, 1.0, 2.0, width_f - 2.0, height_f - 4.0, radius);
+    cr.clip();
+    for x in 0..width {
+        let alpha = x as f64 / (width - 1).max(1) as f64;
+        cr.set_source_rgba(
+            color.r as f64 / 255.0,
+            color.g as f64 / 255.0,
+            color.b as f64 / 255.0,
+            alpha,
+        );
+        cr.rectangle(x as f64, 0.0, 1.0, height_f);
+        let _ = cr.fill();
+    }
+    let _ = cr.restore();
+    draw_slider_knob(cr, color.a as f64 / 255.0, width_f, height_f);
+}
+
+fn draw_slider_knob(cr: &gtk::cairo::Context, value: f64, width: f64, height: f64) {
+    let knob_width = 16.0;
+    let knob_height = (height - 2.0).max(18.0);
+    let x = (value.clamp(0.0, 1.0) * width).clamp(knob_width * 0.5, width - knob_width * 0.5);
+    let y = (height - knob_height) * 0.5;
+    cr.set_source_rgba(0.0, 0.0, 0.0, 0.22);
+    draw_round_rect(cr, x - knob_width * 0.5 + 1.0, y + 1.0, knob_width, knob_height, 7.0);
+    let _ = cr.fill();
+    cr.set_source_rgba(1.0, 1.0, 1.0, 0.98);
+    draw_round_rect(cr, x - knob_width * 0.5, y, knob_width, knob_height, 7.0);
+    let _ = cr.fill_preserve();
+    cr.set_source_rgba(0.0, 0.0, 0.0, 0.18);
+    cr.set_line_width(1.0);
+    let _ = cr.stroke();
+}
+
+fn format_percent(value: f64) -> String {
+    format!("{}%", (value * 100.0).round() as i32)
+}
+
+fn set_entry_text_if_needed(entry: &Entry, value: &str) {
+    if entry.text().as_str() != value {
+        entry.set_text(value);
+    }
+}
+
+fn image_color_at(base: &image::DynamicImage, point: Point) -> Color {
+    let image_x = point.x.floor().clamp(0.0, base.width().saturating_sub(1) as f32) as u32;
+    let image_y = point.y.floor().clamp(0.0, base.height().saturating_sub(1) as f32) as u32;
+    let rgba_image = base.to_rgba8();
+    let pixel = rgba_image.get_pixel(image_x, image_y).0;
+    Color::rgba(pixel[0], pixel[1], pixel[2], pixel[3])
+}
+
+fn color_picker_section(
+    active_color: Rc<Cell<Color>>,
+    stroke_previews: Rc<RefCell<Vec<DrawingArea>>>,
+    document: Rc<RefCell<Document>>,
+    tool_buttons: Rc<RefCell<Vec<(DefaultTool, Button)>>>,
+    color_ui_refresh: Rc<RefCell<Option<ColorCallback>>>,
+    recent_color_recorder: Rc<RefCell<Option<ColorCallback>>>,
+) -> GtkBox {
+    let container = GtkBox::new(Orientation::Vertical, 6);
+    let header = GtkBox::new(Orientation::Horizontal, 6);
+    header.append(&section_title("Color"));
+    let header_preview = selected_color_preview(active_color.clone());
+    header.append(&header_preview);
+
+    let menu_button = MenuButton::new();
+    menu_button.set_label(&color_to_hex(active_color.get()));
+    menu_button.set_tooltip_text(Some("Open color picker"));
+    menu_button.set_size_request(92, 34);
+    header.append(&menu_button);
+    let eyedropper_button = eyedropper_icon_button();
+    let document_for_pick = document.clone();
+    let tool_buttons_for_pick = tool_buttons.clone();
+    eyedropper_button.connect_clicked(move |_| {
+        if let Ok(mut document) = document_for_pick.try_borrow_mut() {
+            document.active_tool = DefaultTool::ColorPicker;
+        }
+        update_tool_button_selection(&tool_buttons_for_pick, DefaultTool::ColorPicker);
+    });
+    tool_buttons.borrow_mut().push((DefaultTool::ColorPicker, eyedropper_button.clone()));
+    if let Ok(document) = document.try_borrow() {
+        update_tool_button_selection(&tool_buttons, document.active_tool);
+    }
+    header.append(&eyedropper_button);
+    container.append(&header);
+
+    let popover = Popover::new();
+    let root = GtkBox::new(Orientation::Vertical, 8);
+    root.set_margin_top(10);
+    root.set_margin_bottom(10);
+    root.set_margin_start(10);
+    root.set_margin_end(10);
+    root.set_halign(Align::Start);
+    root.set_hexpand(false);
+    root.set_size_request(240, -1);
+
+    let hsv_state = Rc::new(Cell::new(rgb_to_hsv(active_color.get())));
+    let alpha_state = Rc::new(Cell::new(active_color.get().a));
+    let refreshing = Rc::new(Cell::new(false));
+    let recent_colors = Rc::new(RefCell::new(Vec::<Color>::new()));
+    let favorite_colors = Rc::new(RefCell::new(
+        editor_favorite_palette()
+            .iter()
+            .take(COLOR_ROW_LIMIT)
+            .map(|(_, color)| *color)
+            .collect::<Vec<_>>(),
+    ));
+    let recent_buttons =
+        Rc::new(RefCell::new(Vec::<(Rc<Cell<Color>>, DrawingArea, Button)>::new()));
+    let favorite_buttons =
+        Rc::new(RefCell::new(Vec::<(Rc<Cell<Color>>, DrawingArea, Button)>::new()));
+
+    let recent_row = color_memory_row("Recent", &recent_buttons);
+    let favorite_row = color_memory_row("Favorite", &favorite_buttons);
+    container.append(&recent_row);
+    container.append(&favorite_row);
+
+    let top_row = GtkBox::new(Orientation::Horizontal, 8);
+    top_row.set_halign(Align::Start);
+    let current_color = Rc::new(Cell::new(active_color.get()));
+    let current_preview = dynamic_color_swatch(current_color.clone(), 38, 30);
+    let hex_label = Label::new(Some(&color_to_hex(active_color.get())));
+    hex_label.set_xalign(0.0);
+    hex_label.set_width_chars(10);
+    let favorite_error = Label::new(None);
+    favorite_error.add_css_class("error");
+    favorite_error.set_xalign(0.0);
+    let add_favorite = Button::with_label("☆");
+    add_favorite.set_tooltip_text(Some("Add or remove favorite"));
+    add_favorite.set_size_request(38, 32);
+    top_row.append(&current_preview);
+    top_row.append(&hex_label);
+    top_row.append(&add_favorite);
+    root.append(&top_row);
+
+    let hsv_area = DrawingArea::new();
+    hsv_area.set_content_width(220);
+    hsv_area.set_content_height(132);
+    hsv_area.set_halign(Align::Start);
+    let hsv_for_draw = hsv_state.clone();
+    hsv_area.set_draw_func(move |_, cr, width, height| {
+        let hsv = hsv_for_draw.get();
+        for y in (0..height).step_by(2) {
+            let value = 1.0 - (y as f64 / (height - 1).max(1) as f64);
+            for x in (0..width).step_by(2) {
+                let saturation = x as f64 / (width - 1).max(1) as f64;
+                let color = hsv_to_color(HsvColor { hue: hsv.hue, saturation, value }, 255);
+                cr.set_source_rgb(
+                    color.r as f64 / 255.0,
+                    color.g as f64 / 255.0,
+                    color.b as f64 / 255.0,
+                );
+                cr.rectangle(x as f64, y as f64, 2.0, 2.0);
+                let _ = cr.fill();
+            }
+        }
+        let knob_x = hsv.saturation * width as f64;
+        let knob_y = (1.0 - hsv.value) * height as f64;
+        cr.set_source_rgba(1.0, 1.0, 1.0, 0.95);
+        cr.arc(knob_x, knob_y, 5.5, 0.0, std::f64::consts::TAU);
+        cr.set_line_width(2.0);
+        let _ = cr.stroke();
+        cr.set_source_rgba(0.0, 0.0, 0.0, 0.65);
+        cr.arc(knob_x, knob_y, 7.0, 0.0, std::f64::consts::TAU);
+        cr.set_line_width(1.0);
+        let _ = cr.stroke();
+    });
+    root.append(&hsv_area);
+
+    let hue_row = GtkBox::new(Orientation::Horizontal, 8);
+    hue_row.set_halign(Align::Start);
+    let hue_label = Label::new(Some("Hue"));
+    hue_label.set_xalign(0.0);
+    hue_label.set_width_chars(6);
+    let hue_bar = DrawingArea::new();
+    hue_bar.set_content_width(154);
+    hue_bar.set_content_height(28);
+    hue_bar.set_halign(Align::Start);
+    let hsv_for_hue_bar = hsv_state.clone();
+    hue_bar.set_draw_func(move |_, cr, width, height| {
+        draw_hue_slider_bar(cr, width, height, hsv_for_hue_bar.get().hue);
+    });
+    hue_row.append(&hue_label);
+    hue_row.append(&hue_bar);
+    root.append(&hue_row);
+
+    let opacity_row = GtkBox::new(Orientation::Horizontal, 8);
+    opacity_row.set_halign(Align::Start);
+    let opacity_label = Label::new(Some("Opacity"));
+    opacity_label.set_xalign(0.0);
+    opacity_label.set_width_chars(6);
+    let opacity_value =
+        Label::new(Some(&format!("{}%", (active_color.get().a as f64 * 100.0 / 255.0).round())));
+    let opacity_bar = DrawingArea::new();
+    opacity_bar.set_content_width(120);
+    opacity_bar.set_content_height(28);
+    opacity_bar.set_halign(Align::Start);
+    let opacity_color = current_color.clone();
+    opacity_bar.set_draw_func(move |_, cr, width, height| {
+        draw_opacity_slider_bar(cr, width, height, opacity_color.get());
+    });
+    opacity_row.append(&opacity_label);
+    opacity_row.append(&opacity_bar);
+    opacity_row.append(&opacity_value);
+    root.append(&opacity_row);
+
+    let tab_row = GtkBox::new(Orientation::Horizontal, 4);
+    tab_row.set_halign(Align::Start);
+    let hex_tab = Button::with_label("HEX");
+    let rgb_tab = Button::with_label("RGB");
+    let hsl_tab = Button::with_label("HSL");
+    tab_row.append(&hex_tab);
+    tab_row.append(&rgb_tab);
+    tab_row.append(&hsl_tab);
+    root.append(&tab_row);
+
+    let stack = gtk::Stack::new();
+    stack.set_halign(Align::Start);
+    stack.set_hexpand(false);
+    let hex_entry = Entry::new();
+    hex_entry.set_width_chars(9);
+    hex_entry.set_max_width_chars(9);
+    hex_entry.set_size_request(132, 34);
+    hex_entry.set_hexpand(false);
+    stack.add_titled(&hex_entry, Some("hex"), "HEX");
+
+    let rgb_box = GtkBox::new(Orientation::Horizontal, 8);
+    rgb_box.set_halign(Align::Start);
+    rgb_box.set_size_request(220, -1);
+    let r_entry = Entry::new();
+    let g_entry = Entry::new();
+    let b_entry = Entry::new();
+    for (label, entry) in [("R", &r_entry), ("G", &g_entry), ("B", &b_entry)] {
+        rgb_box.append(&Label::new(Some(label)));
+        entry.set_width_chars(4);
+        entry.set_max_width_chars(4);
+        entry.set_hexpand(false);
+        rgb_box.append(entry);
+    }
+    stack.add_titled(&rgb_box, Some("rgb"), "RGB");
+
+    let hsl_box = GtkBox::new(Orientation::Horizontal, 8);
+    hsl_box.set_halign(Align::Start);
+    hsl_box.set_size_request(220, -1);
+    let h_entry = Entry::new();
+    let s_entry = Entry::new();
+    let l_entry = Entry::new();
+    for (label, entry, width) in [("H", &h_entry, 4), ("S", &s_entry, 5), ("L", &l_entry, 5)] {
+        hsl_box.append(&Label::new(Some(label)));
+        entry.set_width_chars(width);
+        entry.set_max_width_chars(width);
+        entry.set_hexpand(false);
+        hsl_box.append(entry);
+    }
+    stack.add_titled(&hsl_box, Some("hsl"), "HSL");
+    root.append(&stack);
+
+    root.append(&favorite_error);
+
+    let refresh_ui: Rc<dyn Fn(Color)> = {
+        let active_color = active_color.clone();
+        let hsv_state = hsv_state.clone();
+        let alpha_state = alpha_state.clone();
+        let refreshing = refreshing.clone();
+        let header_preview = header_preview.clone();
+        let current_color = current_color.clone();
+        let current_preview = current_preview.clone();
+        let hex_label = hex_label.clone();
+        let menu_button = menu_button.clone();
+        let add_favorite = add_favorite.clone();
+        let hsv_area = hsv_area.clone();
+        let hue_bar = hue_bar.clone();
+        let opacity_bar = opacity_bar.clone();
+        let opacity_value = opacity_value.clone();
+        let hex_entry = hex_entry.clone();
+        let r_entry = r_entry.clone();
+        let g_entry = g_entry.clone();
+        let b_entry = b_entry.clone();
+        let h_entry = h_entry.clone();
+        let s_entry = s_entry.clone();
+        let l_entry = l_entry.clone();
+        let stroke_previews = stroke_previews.clone();
+        let favorite_colors = favorite_colors.clone();
+        let favorite_buttons = favorite_buttons.clone();
+        Rc::new(move |color: Color| {
+            refreshing.set(true);
+            active_color.set(color);
+            let hsv = rgb_to_hsv(color);
+            hsv_state.set(hsv);
+            alpha_state.set(color.a);
+            current_color.set(color);
+            hex_label.set_text(&color_to_hex(color));
+            menu_button.set_label(&color_to_hex(color));
+            set_entry_text_if_needed(&hex_entry, &color_to_hex(color));
+            set_entry_text_if_needed(&r_entry, &color.r.to_string());
+            set_entry_text_if_needed(&g_entry, &color.g.to_string());
+            set_entry_text_if_needed(&b_entry, &color.b.to_string());
+            let hsl = rgb_to_hsl(color);
+            set_entry_text_if_needed(&h_entry, &format!("{}", hsl.hue.round() as i32));
+            set_entry_text_if_needed(&s_entry, &format_percent(hsl.saturation));
+            set_entry_text_if_needed(&l_entry, &format_percent(hsl.lightness));
+            opacity_value.set_text(&format!("{}%", (color.a as f64 * 100.0 / 255.0).round()));
+            header_preview.queue_draw();
+            current_preview.queue_draw();
+            hsv_area.queue_draw();
+            hue_bar.queue_draw();
+            opacity_bar.queue_draw();
+            if let Ok(stroke_previews) = stroke_previews.try_borrow() {
+                for preview in stroke_previews.iter() {
+                    preview.queue_draw();
+                }
+            }
+            if let Ok(favorites) = favorite_colors.try_borrow() {
+                update_color_memory_buttons(&favorites, &favorite_buttons);
+                if favorites.iter().any(|favorite| *favorite == color) {
+                    add_favorite.set_label("★");
+                    add_favorite.add_css_class("suggested-action");
+                } else {
+                    add_favorite.set_label("☆");
+                    add_favorite.remove_css_class("suggested-action");
+                }
+            }
+            refreshing.set(false);
+        })
+    };
+    *color_ui_refresh.borrow_mut() = Some(refresh_ui.clone());
+    *recent_color_recorder.borrow_mut() = Some({
+        let recent_colors = recent_colors.clone();
+        let recent_buttons = recent_buttons.clone();
+        Rc::new(move |color: Color| {
+            if let Ok(mut recent) = recent_colors.try_borrow_mut() {
+                push_recent_color(&mut recent, color, COLOR_ROW_LIMIT);
+                update_color_memory_buttons(&recent, &recent_buttons);
+            }
+        })
+    });
+
+    let apply_hsv_from_position: Rc<dyn Fn(&DrawingArea, f64, f64)> = {
+        let hsv_state = hsv_state.clone();
+        let alpha_state = alpha_state.clone();
+        let refresh_ui = refresh_ui.clone();
+        Rc::new(move |area: &DrawingArea, x: f64, y: f64| {
+            let width = area.allocated_width().max(1) as f64;
+            let height = area.allocated_height().max(1) as f64;
+            let mut hsv = hsv_state.get();
+            hsv.saturation = (x / width).clamp(0.0, 1.0);
+            hsv.value = (1.0 - y / height).clamp(0.0, 1.0);
+            refresh_ui(hsv_to_color(hsv, alpha_state.get()));
+        })
+    };
+
+    let hsv_click = gtk::GestureClick::new();
+    let hsv_area_for_click = hsv_area.clone();
+    let apply_for_click = apply_hsv_from_position.clone();
+    hsv_click.connect_pressed(move |_, _, x, y| {
+        apply_for_click(&hsv_area_for_click, x, y);
+    });
+    hsv_area.add_controller(hsv_click);
+
+    let hsv_drag = gtk::GestureDrag::new();
+    let hsv_area_for_drag = hsv_area.clone();
+    hsv_drag.connect_drag_update(move |gesture, dx, dy| {
+        let (start_x, start_y) = gesture.start_point().unwrap_or((0.0, 0.0));
+        apply_hsv_from_position(&hsv_area_for_drag, start_x + dx, start_y + dy);
+    });
+    hsv_area.add_controller(hsv_drag);
+
+    let apply_hue_from_position: Rc<dyn Fn(&DrawingArea, f64)> = {
+        let refresh = refresh_ui.clone();
+        let hsv_state = hsv_state.clone();
+        let alpha_state = alpha_state.clone();
+        Rc::new(move |area: &DrawingArea, x: f64| {
+            let mut hsv = hsv_state.get();
+            hsv.hue = slider_value_from_x(area, x) * 360.0;
+            refresh(hsv_to_color(hsv, alpha_state.get()));
+        })
+    };
+    let hue_click = gtk::GestureClick::new();
+    let hue_bar_for_click = hue_bar.clone();
+    let apply_hue_for_click = apply_hue_from_position.clone();
+    hue_click.connect_pressed(move |_, _, x, _| {
+        apply_hue_for_click(&hue_bar_for_click, x);
+    });
+    hue_bar.add_controller(hue_click);
+    let hue_drag = gtk::GestureDrag::new();
+    let hue_bar_for_drag = hue_bar.clone();
+    hue_drag.connect_drag_update(move |gesture, dx, _| {
+        let (start_x, _) = gesture.start_point().unwrap_or((0.0, 0.0));
+        apply_hue_from_position(&hue_bar_for_drag, start_x + dx);
+    });
+    hue_bar.add_controller(hue_drag);
+
+    let apply_opacity_from_position: Rc<dyn Fn(&DrawingArea, f64)> = {
+        let refresh = refresh_ui.clone();
+        let hsv_state = hsv_state.clone();
+        Rc::new(move |area: &DrawingArea, x: f64| {
+            let alpha = (slider_value_from_x(area, x) * 255.0).round().clamp(0.0, 255.0) as u8;
+            refresh(hsv_to_color(hsv_state.get(), alpha));
+        })
+    };
+    let opacity_click = gtk::GestureClick::new();
+    let opacity_bar_for_click = opacity_bar.clone();
+    let apply_opacity_for_click = apply_opacity_from_position.clone();
+    opacity_click.connect_pressed(move |_, _, x, _| {
+        apply_opacity_for_click(&opacity_bar_for_click, x);
+    });
+    opacity_bar.add_controller(opacity_click);
+    let opacity_drag = gtk::GestureDrag::new();
+    let opacity_bar_for_drag = opacity_bar.clone();
+    opacity_drag.connect_drag_update(move |gesture, dx, _| {
+        let (start_x, _) = gesture.start_point().unwrap_or((0.0, 0.0));
+        apply_opacity_from_position(&opacity_bar_for_drag, start_x + dx);
+    });
+    opacity_bar.add_controller(opacity_drag);
+
+    for (button, name) in [(&hex_tab, "hex"), (&rgb_tab, "rgb"), (&hsl_tab, "hsl")] {
+        let stack = stack.clone();
+        button.connect_clicked(move |_| {
+            stack.set_visible_child_name(name);
+        });
+    }
+
+    let refresh_for_hex = refresh_ui.clone();
+    let alpha_for_hex = alpha_state.clone();
+    hex_entry.connect_activate(move |entry| {
+        if let Some(color) = parse_hex_color(entry.text().as_str(), alpha_for_hex.get()) {
+            refresh_for_hex(color);
+        }
+    });
+
+    for entry in [&r_entry, &g_entry, &b_entry] {
+        let refresh = refresh_ui.clone();
+        let r_entry = r_entry.clone();
+        let g_entry = g_entry.clone();
+        let b_entry = b_entry.clone();
+        let alpha = alpha_state.clone();
+        entry.connect_activate(move |_| {
+            let parse = |entry: &Entry| entry.text().parse::<u8>().ok();
+            if let (Some(r), Some(g), Some(b)) = (parse(&r_entry), parse(&g_entry), parse(&b_entry))
+            {
+                refresh(Color::rgba(r, g, b, alpha.get()));
+            }
+        });
+    }
+
+    for entry in [&h_entry, &s_entry, &l_entry] {
+        let refresh = refresh_ui.clone();
+        let h_entry = h_entry.clone();
+        let s_entry = s_entry.clone();
+        let l_entry = l_entry.clone();
+        let alpha = alpha_state.clone();
+        entry.connect_activate(move |_| {
+            let parse_percent = |entry: &Entry| {
+                entry
+                    .text()
+                    .trim()
+                    .trim_end_matches('%')
+                    .parse::<f64>()
+                    .ok()
+                    .map(|value| (value / 100.0).clamp(0.0, 1.0))
+            };
+            if let (Ok(hue), Some(saturation), Some(lightness)) = (
+                h_entry.text().trim().parse::<f64>(),
+                parse_percent(&s_entry),
+                parse_percent(&l_entry),
+            ) {
+                refresh(hsl_to_color(HslColor { hue, saturation, lightness }, alpha.get()));
+            }
+        });
+    }
+
+    if let Ok(buttons) = recent_buttons.try_borrow() {
+        for (color_cell, _, button) in buttons.iter() {
+            let refresh = refresh_ui.clone();
+            let color_cell = color_cell.clone();
+            button.connect_clicked(move |_| {
+                let color = color_cell.get();
+                if color.a > 0 {
+                    refresh(color);
+                }
+            });
+        }
+    }
+
+    if let Ok(buttons) = favorite_buttons.try_borrow() {
+        for (color_cell, _, button) in buttons.iter() {
+            let refresh = refresh_ui.clone();
+            let color_cell_for_click = color_cell.clone();
+            let left_click = gtk::GestureClick::new();
+            left_click.set_button(1);
+            left_click.connect_pressed(move |_, _, _, _| {
+                let color = color_cell_for_click.get();
+                if color.a > 0 {
+                    refresh(color);
+                }
+            });
+            button.add_controller(left_click);
+
+            let favorites_for_remove = favorite_colors.clone();
+            let favorite_buttons_for_remove = favorite_buttons.clone();
+            let color_cell_for_remove = color_cell.clone();
+            let button_for_remove = button.clone();
+            let active_color_for_remove = active_color.clone();
+            let right_click = gtk::GestureClick::new();
+            right_click.set_button(3);
+            let refresh_after_remove = refresh_ui.clone();
+            right_click.connect_pressed(move |_, _, _, _| {
+                let color = color_cell_for_remove.get();
+                if color.a == 0 {
+                    return;
+                }
+                show_favorite_remove_popover(
+                    &button_for_remove,
+                    color,
+                    active_color_for_remove.clone(),
+                    favorites_for_remove.clone(),
+                    favorite_buttons_for_remove.clone(),
+                    refresh_after_remove.clone(),
+                );
+            });
+            button.add_controller(right_click);
+        }
+    }
+
+    let refresh_for_favorite = refresh_ui.clone();
+    let active_for_favorite = active_color.clone();
+    let favorites_for_add = favorite_colors.clone();
+    let favorite_buttons_for_add = favorite_buttons.clone();
+    add_favorite.connect_clicked(move |_| {
+        favorite_error.set_text("");
+        let color = active_for_favorite.get();
+        let mut should_refresh = false;
+        let mut favorite_limit = None;
+        if let Ok(mut favorites) = favorites_for_add.try_borrow_mut() {
+            if favorites.iter().any(|favorite| *favorite == color) {
+                remove_favorite_color(&mut favorites, color);
+                update_color_memory_buttons(&favorites, &favorite_buttons_for_add);
+                should_refresh = true;
+            } else {
+                match add_favorite_color(&mut favorites, color, COLOR_ROW_LIMIT) {
+                    Ok(()) => {
+                        update_color_memory_buttons(&favorites, &favorite_buttons_for_add);
+                        should_refresh = true;
+                    }
+                    Err(limit) => {
+                        favorite_limit = Some(limit);
+                    }
+                }
+            }
+        }
+        if let Some(limit) = favorite_limit {
+            favorite_error.set_text(&format!("Favorite can save up to {limit} colors"));
+        }
+        if should_refresh {
+            refresh_for_favorite(color);
+        }
+    });
+
+    refresh_ui(active_color.get());
+    popover.set_child(Some(&root));
+    menu_button.set_popover(Some(&popover));
+    container
 }
 
 fn current_stroke_preview(
@@ -2201,20 +3200,10 @@ fn update_tool_button_selection(
     if let Ok(buttons) = buttons.try_borrow() {
         for (tool, button) in buttons.iter() {
             if *tool == selected {
+                button.add_css_class("active-tool");
                 button.add_css_class("suggested-action");
             } else {
-                button.remove_css_class("suggested-action");
-            }
-        }
-    }
-}
-
-fn update_color_button_selection(buttons: &Rc<RefCell<Vec<(Color, Button)>>>, selected: Color) {
-    if let Ok(buttons) = buttons.try_borrow() {
-        for (color, button) in buttons.iter() {
-            if *color == selected {
-                button.add_css_class("suggested-action");
-            } else {
+                button.remove_css_class("active-tool");
                 button.remove_css_class("suggested-action");
             }
         }
@@ -2251,6 +3240,14 @@ fn draft_tool_can_draw(tool: DefaultTool) -> bool {
             | DefaultTool::FilledBox
             | DefaultTool::Ocr
     )
+}
+
+fn tool_can_select_existing(tool: DefaultTool) -> bool {
+    tool == DefaultTool::Select
+}
+
+fn tool_picks_canvas_color(tool: DefaultTool) -> bool {
+    tool == DefaultTool::ColorPicker
 }
 
 #[derive(Debug, Clone)]
@@ -2325,6 +3322,7 @@ fn commit_text_entry(
     active_text_edit: &Rc<RefCell<Option<ActiveTextEdit>>>,
     undo: &Button,
     redo: &Button,
+    recent_recorder: &Rc<RefCell<Option<ColorCallback>>>,
 ) {
     let Some(edit) = take_active_text_edit(active_text_edit) else {
         return;
@@ -2336,6 +3334,7 @@ fn commit_text_entry(
         entry.set_text("");
         return;
     }
+    let edit_color = edit.color;
 
     let committed = if let Ok(mut document) = document.try_borrow_mut() {
         if let Ok(mut history) = history.try_borrow_mut() {
@@ -2356,6 +3355,9 @@ fn commit_text_entry(
     };
 
     if committed {
+        if let Some(record_recent) = recent_recorder.borrow().as_ref().cloned() {
+            record_recent(edit_color);
+        }
         update_history_action_buttons(history, undo, redo);
         entry.set_visible(false);
         entry.set_text("");
@@ -2792,11 +3794,40 @@ fn set_cairo_color(cr: &gtk::cairo::Context, color: Color) {
 
 fn copy_image_to_clipboard(path: &std::path::Path) {
     if let Some(display) = gtk::gdk::Display::default() {
+        if let Ok(bytes) = fs::read(path) {
+            let bytes = glib::Bytes::from_owned(bytes);
+            let provider = gtk::gdk::ContentProvider::for_bytes("image/png", &bytes);
+            if display.clipboard().set_content(Some(&provider)).is_ok() {
+                return;
+            }
+        }
         let file = gio::File::for_path(path);
         if let Ok(texture) = gtk::gdk::Texture::from_file(&file) {
             display.clipboard().set_texture(&texture);
         }
     }
+}
+
+fn render_document_png_bytes(
+    base: &image::DynamicImage,
+    annotations: &[Annotation],
+) -> image::ImageResult<Vec<u8>> {
+    let rendered = render_document(base, annotations);
+    let mut cursor = Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgba8(rendered).write_to(&mut cursor, image::ImageFormat::Png)?;
+    Ok(cursor.into_inner())
+}
+
+fn copy_rendered_document_to_clipboard(base: &image::DynamicImage, annotations: &[Annotation]) {
+    let Ok(bytes) = render_document_png_bytes(base, annotations) else {
+        return;
+    };
+    let Some(display) = gtk::gdk::Display::default() else {
+        return;
+    };
+    let bytes = glib::Bytes::from_owned(bytes);
+    let provider = gtk::gdk::ContentProvider::for_bytes("image/png", &bytes);
+    let _ = display.clipboard().set_content(Some(&provider));
 }
 
 fn copy_text_to_clipboard(text: &str) {
@@ -3259,20 +4290,25 @@ fn show_save_filename_popover<F>(
 mod tests {
     use std::{cell::RefCell, rc::Rc};
 
-    use ashot_core::{AnnotationData, AppConfig, Color, DefaultTool, Document, Point, Rect};
+    use ashot_core::{
+        Annotation, AnnotationData, AppConfig, Color, DefaultTool, Document, Point, Rect,
+    };
 
     use super::{
-        ActiveTextEdit, DraftAnnotation, PinClickAction, annotation_snapshot_for_draw,
-        arrow_head_geometry, arrow_head_points, arrow_shape_geometry, arrow_visual_stroke_width,
-        blur_radius_for_stroke, capture_should_use_fresh_anchor, crop_image_region,
-        draft_preview_for_draw, draft_tool_can_draw, editor_color_palette, editor_initial_size,
-        editor_stroke_widths, editor_tool_layout, filter_ocr_symbols, fit_scale,
+        ActiveTextEdit, DraftAnnotation, HslColor, PinClickAction, add_favorite_color,
+        annotation_snapshot_for_draw, arrow_head_geometry, arrow_head_points, arrow_shape_geometry,
+        arrow_visual_stroke_width, blur_radius_for_stroke, capture_should_use_fresh_anchor,
+        crop_image_region, draft_preview_for_draw, draft_tool_can_draw, editor_color_palette,
+        editor_favorite_palette, editor_initial_size, editor_stroke_widths, editor_tool_layout,
+        filter_ocr_symbols, fit_scale, hsl_to_color, hsv_to_color, image_color_at,
         mosaic_pixel_size_for_stroke, moving_delta_and_update, normalized_save_filename,
-        ocr_language_label, ocr_space_curl_args, ocr_space_language_arg, parse_ocr_space_response,
-        pin_click_action, pin_dimension_label, pin_display_size, pin_initial_scale,
-        pin_window_size, pin_window_size_for_scale, pin_zoom_from_scroll, scaled_canvas_point,
-        set_active_text_edit, suggested_save_filename_at, take_active_text_edit,
-        tesseract_command_args, tesseract_command_invocation, text_for_annotation,
+        ocr_language_label, ocr_space_curl_args, ocr_space_language_arg, parse_hex_color,
+        parse_ocr_space_response, pin_click_action, pin_dimension_label, pin_display_size,
+        pin_initial_scale, pin_window_size, pin_window_size_for_scale, pin_zoom_from_scroll,
+        push_recent_color, remove_favorite_color, render_document_png_bytes, rgb_to_hsl,
+        rgb_to_hsv, scaled_canvas_point, set_active_text_edit, suggested_save_filename_at,
+        take_active_text_edit, tesseract_command_args, tesseract_command_invocation,
+        text_for_annotation, tool_can_select_existing, tool_icon_label, tool_picks_canvas_color,
         update_ocr_language_selection,
     };
 
@@ -3327,6 +4363,78 @@ mod tests {
         let preview = draft.preview_annotation().expect("preview annotation");
 
         assert!(matches!(preview.data, AnnotationData::Rectangle { .. }));
+    }
+
+    #[test]
+    fn color_picker_converts_between_hex_hsv_and_hsl() {
+        let red = Color::rgba(244, 67, 54, 255);
+
+        assert_eq!(parse_hex_color("#F44336", 255), Some(red));
+        assert_eq!(hsv_to_color(rgb_to_hsv(red), 255), red);
+        assert_eq!(
+            hsl_to_color(
+                HslColor {
+                    hue: rgb_to_hsl(red).hue,
+                    saturation: rgb_to_hsl(red).saturation,
+                    lightness: rgb_to_hsl(red).lightness,
+                },
+                255,
+            ),
+            red
+        );
+    }
+
+    #[test]
+    fn color_picker_supports_alpha_hex_and_recent_deduplication() {
+        let translucent = Color::rgba(244, 67, 54, 128);
+        assert_eq!(parse_hex_color("#F4433680", 255), Some(translucent));
+
+        let mut recent = vec![Color::rgba(1, 2, 3, 255), translucent];
+        push_recent_color(&mut recent, translucent, 2);
+
+        assert_eq!(recent, vec![translucent, Color::rgba(1, 2, 3, 255)]);
+    }
+
+    #[test]
+    fn clipboard_render_bytes_include_annotations() {
+        let base = image::DynamicImage::new_rgba8(24, 24);
+        let annotations = vec![Annotation::new(AnnotationData::FilledBox {
+            rect: Rect::from_points(Point::new(4.0, 4.0), Point::new(12.0, 12.0)),
+            color: Color::rgba(255, 0, 0, 255),
+        })];
+
+        let bytes = render_document_png_bytes(&base, &annotations).expect("render png bytes");
+        let rendered = image::load_from_memory(&bytes).expect("decode copied png").to_rgba8();
+
+        assert_eq!(rendered.get_pixel(6, 6).0, [255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn color_picker_has_focused_favorite_palette() {
+        let palette = editor_favorite_palette();
+
+        assert_eq!(palette.len(), 4);
+        assert!(palette.iter().any(|(name, _)| *name == "Red"));
+        assert!(palette.iter().any(|(name, _)| *name == "Black"));
+    }
+
+    #[test]
+    fn color_picker_limits_and_removes_favorites() {
+        let mut favorites = vec![Color::rgba(1, 1, 1, 255), Color::rgba(2, 2, 2, 255)];
+
+        assert_eq!(add_favorite_color(&mut favorites, Color::rgba(3, 3, 3, 255), 3), Ok(()));
+        assert_eq!(add_favorite_color(&mut favorites, Color::rgba(4, 4, 4, 255), 3), Err(3));
+
+        remove_favorite_color(&mut favorites, Color::rgba(2, 2, 2, 255));
+        assert!(!favorites.contains(&Color::rgba(2, 2, 2, 255)));
+    }
+
+    #[test]
+    fn tool_buttons_use_icons_with_tooltips_for_names() {
+        for (name, tool) in editor_tool_layout() {
+            assert_ne!(tool_icon_label(tool), name);
+        }
+        assert_eq!(tool_icon_label(DefaultTool::Text), "T");
     }
 
     #[test]
@@ -3495,14 +4603,41 @@ mod tests {
 
     #[test]
     fn only_drawing_tools_create_drag_snapshots() {
+        assert!(draft_tool_can_draw(DefaultTool::Arrow));
         assert!(draft_tool_can_draw(DefaultTool::Rectangle));
         assert!(draft_tool_can_draw(DefaultTool::Brush));
+        assert!(draft_tool_can_draw(DefaultTool::Mosaic));
         assert!(draft_tool_can_draw(DefaultTool::Blur));
         assert!(draft_tool_can_draw(DefaultTool::Ocr));
 
         assert!(!draft_tool_can_draw(DefaultTool::Select));
         assert!(!draft_tool_can_draw(DefaultTool::Text));
         assert!(!draft_tool_can_draw(DefaultTool::Counter));
+    }
+
+    #[test]
+    fn only_select_tool_uses_existing_annotation_selection() {
+        assert!(tool_can_select_existing(DefaultTool::Select));
+        assert!(!tool_can_select_existing(DefaultTool::Arrow));
+        assert!(!tool_can_select_existing(DefaultTool::Ocr));
+        assert!(!tool_can_select_existing(DefaultTool::ColorPicker));
+    }
+
+    #[test]
+    fn only_color_picker_samples_canvas_color() {
+        assert!(tool_picks_canvas_color(DefaultTool::ColorPicker));
+        assert!(!tool_picks_canvas_color(DefaultTool::Select));
+        assert!(!tool_picks_canvas_color(DefaultTool::Brush));
+    }
+
+    #[test]
+    fn color_picker_samples_and_clamps_base_image_pixels() {
+        let mut image = image::DynamicImage::new_rgba8(2, 2).to_rgba8();
+        image.put_pixel(1, 1, image::Rgba([3, 5, 8, 255]));
+        let image = image::DynamicImage::ImageRgba8(image);
+
+        assert_eq!(image_color_at(&image, Point::new(1.0, 1.0)), Color::rgba(3, 5, 8, 255));
+        assert_eq!(image_color_at(&image, Point::new(100.0, 100.0)), Color::rgba(3, 5, 8, 255));
     }
 
     #[test]
