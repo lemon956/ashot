@@ -16,7 +16,6 @@
   "finish-args": [
     "--share=ipc",
     "--socket=wayland",
-    "--socket=fallback-x11",
     "--filesystem=xdg-pictures",
     "--own-name=io.github.ashot.Service",
     "--talk-name=io.github.ashot.Service",

@@ -52,16 +52,18 @@ jobs:
 
       - name: Create Flatpak bundle
         run: |
+          ASHOT_VERSION=${GITHUB_REF_NAME}
           flatpak build-bundle \
             build-flatpak/repo \
-            build-flatpak/io.github.ashot.App.flatpak \
+            build-flatpak/io.github.ashot.App-${ASHOT_VERSION}.flatpak \
             io.github.ashot.App
 
       - name: Prepare repo
         run: |
+          ASHOT_VERSION=${GITHUB_REF_NAME}
           mkdir -p build-flatpak/repo
           flatpak build-update-repo build-flatpak/repo
-          tar --exclude='.lock' -C build-flatpak -czf build-flatpak/io.github.ashot.App.repo.tar.gz repo
+          tar --exclude='.lock' -C build-flatpak -czf build-flatpak/io.github.ashot.App-${ASHOT_VERSION}.repo.tar.gz repo
 
       - name: Create changelog
         run: |
@@ -76,8 +78,8 @@ jobs:
         with:
           body_path: /tmp/changelog.md
           files: |
-            build-flatpak/io.github.ashot.App.flatpak
-            build-flatpak/io.github.ashot.App.repo.tar.gz
+            build-flatpak/io.github.ashot.App-${{ github.ref_name }}.flatpak
+            build-flatpak/io.github.ashot.App-${{ github.ref_name }}.repo.tar.gz
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

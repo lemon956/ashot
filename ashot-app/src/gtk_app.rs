@@ -8311,6 +8311,56 @@ mod tests {
     }
 
     #[test]
+    fn flatpak_manifest_is_wayland_only() {
+        let manifest: serde_json::Value =
+            serde_json::from_str(include_str!("../../flatpak/io.github.ashot.App.json"))
+                .expect("valid Flatpak manifest JSON");
+        let finish_args = manifest
+            .get("finish-args")
+            .and_then(serde_json::Value::as_array)
+            .expect("finish-args array");
+        let finish_args = finish_args
+            .iter()
+            .map(|arg| arg.as_str().expect("finish-args values are strings"))
+            .collect::<Vec<_>>();
+
+        assert!(finish_args.contains(&"--socket=wayland"));
+        assert!(
+            finish_args.iter().all(|arg| !arg.to_ascii_lowercase().contains("x11")),
+            "Wayland-only Flatpak must not request X11 sockets: {finish_args:?}"
+        );
+    }
+
+    #[test]
+    fn flatpak_release_artifacts_include_git_tag_version() {
+        let release = include_str!("../../.github/workflows/release.yml");
+        let ci = include_str!("../../.github/workflows/ci.yml");
+
+        assert!(release.contains("ASHOT_VERSION=${GITHUB_REF_NAME}"));
+        assert!(release.contains("io.github.ashot.App-${ASHOT_VERSION}.flatpak"));
+        assert!(release.contains("io.github.ashot.App-${ASHOT_VERSION}.repo.tar.gz"));
+
+        assert!(ci.contains("ASHOT_VERSION=ci-${GITHUB_SHA::7}"));
+        assert!(ci.contains("io.github.ashot.App-${ASHOT_VERSION}.flatpak"));
+        assert!(!release.contains("build-flatpak/io.github.ashot.App.flatpak"));
+        assert!(!ci.contains("build-flatpak/io.github.ashot.App.flatpak"));
+    }
+
+    #[test]
+    fn flatpak_install_script_writes_versioned_bundle() {
+        let script = include_str!("../../scripts/install-flatpak.sh");
+
+        assert!(script.contains("ASHOT_VERSION="));
+        assert!(script.contains("git -C \"${ROOT_DIR}\" describe --tags --exact-match"));
+        assert!(script.contains("git -C \"${ROOT_DIR}\" rev-parse --short=7 HEAD"));
+        assert!(script.contains("ASHOT_VERSION=\"dev-${SHORT_COMMIT:-unknown}\""));
+        assert!(!script.contains("cargo metadata"));
+        assert!(script.contains("io.github.ashot.App-${ASHOT_VERSION}.flatpak"));
+        assert!(script.contains("--repo=\"${BUILD_DIR}/repo\""));
+        assert!(script.contains("flatpak build-bundle"));
+    }
+
+    #[test]
     fn ocr_space_uses_single_language_or_auto_for_multiple() {
         assert_eq!(ocr_space_language_arg(&["chi_sim".to_string()]), "chs");
         assert_eq!(ocr_space_language_arg(&["chi_sim".to_string(), "eng".to_string()]), "auto");

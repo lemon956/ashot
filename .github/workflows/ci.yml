@@ -104,13 +104,14 @@ jobs:
 
       - name: Create Flatpak bundle
         run: |
+          ASHOT_VERSION=ci-${GITHUB_SHA::7}
           flatpak build-bundle \
             build-flatpak/repo \
-            build-flatpak/io.github.ashot.App.flatpak \
+            build-flatpak/io.github.ashot.App-${ASHOT_VERSION}.flatpak \
             io.github.ashot.App
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
           name: flatpak-artifact
-          path: build-flatpak/io.github.ashot.App.flatpak
+          path: build-flatpak/io.github.ashot.App-ci-*.flatpak

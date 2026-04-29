@@ -27,6 +27,7 @@
 ## Packaging
 
 - Flatpak manifest builds successfully
+- Flatpak permissions include `--socket=wayland` and do not request X11 or `fallback-x11`
 - Desktop file installs under the correct app id
 - AppStream metadata validates
 - Icon is present
@@ -35,4 +36,4 @@
 ## Environment Caveats
 
 - Confirm that no GNOME Shell extension is required
-- Confirm that no X11-only dependencies are required for the screenshot path
+- Confirm that the screenshot and editor workflows are validated on a Wayland session

@@ -64,7 +64,11 @@ Build and install aShot for the current user:
 ```
 
 This script also applies the Flatpak bus permission needed for the internal
-service process to own `io.github.ashot.Service`.
+service process to own `io.github.ashot.Service`. If the current commit is
+checked out at an exact Git tag, the generated bundle uses that tag in its
+filename, for example `build-flatpak/io.github.ashot.App-v0.1.1.flatpak`.
+Otherwise it falls back to the current commit, for example
+`build-flatpak/io.github.ashot.App-dev-a1b2c3d.flatpak`.
 
 Or run the Flatpak builder command directly:
 
