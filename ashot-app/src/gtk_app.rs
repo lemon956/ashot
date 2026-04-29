@@ -3342,6 +3342,50 @@ fn install_editor_css() {
         .ashot-error {
             color: @error_color;
         }
+        .ashot-ocr-dialog {
+            background: @window_bg_color;
+        }
+        .ashot-ocr-header {
+            padding: 4px 2px 8px 2px;
+        }
+        .ashot-ocr-status-icon {
+            min-width: 34px;
+            min-height: 34px;
+            border-radius: 999px;
+            background: alpha(@accent_bg_color, 0.13);
+            color: @accent_bg_color;
+        }
+        .ashot-ocr-status-icon.error {
+            background: alpha(@error_color, 0.13);
+            color: @error_color;
+        }
+        .ashot-ocr-card {
+            background: alpha(@view_bg_color, 0.72);
+            border: 1px solid alpha(currentColor, 0.08);
+            border-radius: 10px;
+            padding: 1px;
+        }
+        .ashot-ocr-card.error {
+            border-color: alpha(@error_color, 0.34);
+            background: alpha(@error_color, 0.07);
+        }
+        .ashot-ocr-text-view {
+            background: transparent;
+            font-size: 0.98em;
+        }
+        .ashot-ocr-command {
+            background: alpha(@view_bg_color, 0.82);
+            border: 1px solid alpha(currentColor, 0.10);
+            border-radius: 9px;
+            padding: 8px;
+        }
+        .ashot-ocr-command label {
+            font-family: monospace;
+            font-size: 0.88em;
+        }
+        .ashot-ocr-actions {
+            padding-top: 2px;
+        }
         "#,
     );
     gtk::style_context_add_provider_for_display(
@@ -6288,34 +6332,56 @@ async fn run_ocr_space_ocr(config: &AppConfig, crop_path: &Path) -> Result<Strin
 }
 
 fn show_ocr_result_dialog(parent: &ApplicationWindow, result: Result<String, String>) {
+    let is_success = result.is_ok();
     let window = gtk::Window::builder()
         .title("OCR Result")
-        .default_width(520)
-        .default_height(360)
+        .default_width(560)
+        .default_height(420)
         .transient_for(parent)
         .build();
+    window.add_css_class("ashot-ocr-dialog");
 
     let root = GtkBox::new(Orientation::Vertical, 10);
-    root.set_margin_top(14);
+    root.set_margin_top(16);
     root.set_margin_bottom(14);
-    root.set_margin_start(14);
-    root.set_margin_end(14);
+    root.set_margin_start(16);
+    root.set_margin_end(16);
 
-    let title = Label::new(Some(match result {
-        Ok(_) => "Recognized Text",
-        Err(_) => "OCR Failed",
-    }));
+    let header = GtkBox::new(Orientation::Horizontal, 10);
+    header.add_css_class("ashot-ocr-header");
+    let status_icon = Label::new(Some(if is_success { "OK" } else { "!" }));
+    status_icon.add_css_class("ashot-ocr-status-icon");
+    if !is_success {
+        status_icon.add_css_class("error");
+    }
+    header.append(&status_icon);
+
+    let title_box = GtkBox::new(Orientation::Vertical, 2);
+    title_box.set_hexpand(true);
+    let title = Label::new(Some(ocr_result_title(&result)));
     title.add_css_class("heading");
     title.set_xalign(0.0);
-    root.append(&title);
+    let subtitle = Label::new(Some(ocr_result_subtitle(&result)));
+    subtitle.add_css_class("dim-label");
+    subtitle.set_xalign(0.0);
+    subtitle.set_wrap(true);
+    title_box.append(&title);
+    title_box.append(&subtitle);
+    header.append(&title_box);
+    root.append(&header);
 
-    let text = match result {
-        Ok(text) => text,
-        Err(error) => error,
-    };
+    let text = ocr_result_body_text(&result);
+    let install_command = extract_ocr_install_command(&text);
     let text_view = gtk::TextView::new();
     text_view.set_wrap_mode(gtk::WrapMode::WordChar);
     text_view.set_monospace(false);
+    text_view.set_editable(is_success);
+    text_view.set_cursor_visible(is_success);
+    text_view.set_left_margin(10);
+    text_view.set_right_margin(10);
+    text_view.set_top_margin(10);
+    text_view.set_bottom_margin(10);
+    text_view.add_css_class("ashot-ocr-text-view");
     text_view.buffer().set_text(&text);
     let scrolled = ScrolledWindow::builder()
         .hscrollbar_policy(PolicyType::Automatic)
@@ -6324,30 +6390,67 @@ fn show_ocr_result_dialog(parent: &ApplicationWindow, result: Result<String, Str
         .vexpand(true)
         .child(&text_view)
         .build();
+    scrolled.add_css_class("ashot-ocr-card");
+    if !is_success {
+        scrolled.add_css_class("error");
+    }
     root.append(&scrolled);
 
+    if let Some(command) = install_command.clone() {
+        let command_row = GtkBox::new(Orientation::Horizontal, 8);
+        command_row.add_css_class("ashot-ocr-command");
+        let command_label = Label::new(Some(&command));
+        command_label.set_selectable(true);
+        command_label.set_xalign(0.0);
+        command_label.set_wrap(true);
+        command_label.set_hexpand(true);
+        let copy_command = Button::with_label("Copy Command");
+        command_row.append(&command_label);
+        command_row.append(&copy_command);
+        let command_for_copy = command.clone();
+        copy_command.connect_clicked(move |_| {
+            copy_text_to_clipboard(&command_for_copy);
+        });
+        root.append(&command_row);
+    }
+
     let actions = GtkBox::new(Orientation::Horizontal, 8);
+    actions.add_css_class("ashot-ocr-actions");
     actions.set_halign(Align::End);
+    let feedback = Label::new(None);
+    feedback.add_css_class("dim-label");
+    feedback.set_xalign(0.0);
+    feedback.set_hexpand(true);
     let copy_selected = Button::with_label("Copy Selected");
     let copy_all = Button::with_label("Copy All");
+    let primary = Button::with_label(ocr_result_primary_action(&result));
+    primary.add_css_class("suggested-action");
     let close = Button::with_label("Close");
+    actions.append(&feedback);
     actions.append(&copy_selected);
     actions.append(&copy_all);
     actions.append(&close);
+    actions.append(&primary);
     root.append(&actions);
 
     let text_view_for_selected = text_view.clone();
+    let feedback_for_selected = feedback.clone();
     copy_selected.connect_clicked(move |_| {
         let buffer = text_view_for_selected.buffer();
         if let Some((start, end)) = buffer.selection_bounds() {
             let selected = buffer.text(&start, &end, true);
             copy_text_to_clipboard(selected.as_str());
+            feedback_for_selected.set_text("Copied selected text");
+        } else {
+            feedback_for_selected.set_text("Select text first");
         }
     });
 
     let text_for_all = text.clone();
+    let feedback_for_all = feedback.clone();
     copy_all.connect_clicked(move |_| {
         copy_text_to_clipboard(&text_for_all);
+        feedback_for_all.set_text("Copied all text");
     });
 
     let window_for_close = window.clone();
@@ -6355,8 +6458,57 @@ fn show_ocr_result_dialog(parent: &ApplicationWindow, result: Result<String, Str
         window_for_close.close();
     });
 
+    let text_for_primary = text.clone();
+    let window_for_primary = window.clone();
+    let feedback_for_primary = feedback.clone();
+    primary.connect_clicked(move |_| {
+        copy_text_to_clipboard(&text_for_primary);
+        if is_success {
+            window_for_primary.close();
+        } else {
+            feedback_for_primary.set_text("Copied error");
+        }
+    });
+
     window.set_child(Some(&root));
     window.present();
+}
+
+fn ocr_result_title(result: &Result<String, String>) -> &'static str {
+    if result.is_ok() { "Recognized Text" } else { "OCR Failed" }
+}
+
+fn ocr_result_subtitle(result: &Result<String, String>) -> &'static str {
+    if result.is_ok() {
+        "Edit the recognized text if needed, then copy it back to your workflow."
+    } else {
+        "Review the message below. Copy the install command if a language pack is missing."
+    }
+}
+
+fn ocr_result_primary_action(result: &Result<String, String>) -> &'static str {
+    if result.is_ok() { "Copy & Close" } else { "Copy Error" }
+}
+
+fn ocr_result_body_text(result: &Result<String, String>) -> String {
+    match result {
+        Ok(text) if text.trim().is_empty() => "No text recognized.".to_string(),
+        Ok(text) => text.clone(),
+        Err(error) if error.trim().is_empty() => "OCR failed without an error message.".to_string(),
+        Err(error) => error.clone(),
+    }
+}
+
+fn extract_ocr_install_command(text: &str) -> Option<String> {
+    text.lines()
+        .map(str::trim)
+        .find(|line| {
+            line.starts_with("sudo apt ")
+                || line.starts_with("sudo dnf ")
+                || line.starts_with("sudo pacman ")
+                || line.starts_with("sudo zypper ")
+        })
+        .map(ToOwned::to_owned)
 }
 
 fn tesseract_command_args(image_path: &Path, languages: &[String]) -> Vec<String> {
@@ -6637,20 +6789,21 @@ mod tests {
         cursor_name_for_surface_edge, draft_preview_for_draw, draft_tool_can_draw,
         editor_color_palette, editor_cursor_for_tool, editor_cursor_kind_for_tool,
         editor_favorite_palette, editor_initial_size, editor_status_text, editor_stroke_widths,
-        editor_tool_layout, eyedropper_magnifier_point, filter_ocr_symbols, fit_scale,
-        format_magnifier_zoom, hsl_to_color, hsv_to_color, image_color_at, magnifier_geometry,
-        magnifier_size_for_zoom, mosaic_pixel_size_for_stroke, moving_delta_and_update,
-        normalized_save_filename, ocr_language_label, ocr_space_curl_args, ocr_space_language_arg,
-        output_action_menu_items, output_action_primary_label, parse_hex_color,
-        parse_ocr_space_response, pin_click_action, pin_context_popover_rect, pin_dimension_label,
-        pin_display_size, pin_initial_scale, pin_initial_scale_with_saved, pin_window_size,
-        pin_window_size_for_scale, pin_zoom_from_scroll, push_recent_color, remove_favorite_color,
-        render_document_png_bytes, resize_handle_at, rgb_to_hsl, rgb_to_hsv, rgba_color_at,
-        save_editor_document_to_dir_with_filename, scaled_canvas_point, selected_annotation_bounds,
-        set_active_text_edit, suggested_save_filename_at, take_active_text_edit,
-        tesseract_command_args, tesseract_command_invocation, text_for_annotation,
-        tool_can_select_existing, tool_icon_label, tool_icon_stroke_width, tool_picks_canvas_color,
-        update_ocr_language_selection,
+        editor_tool_layout, extract_ocr_install_command, eyedropper_magnifier_point,
+        filter_ocr_symbols, fit_scale, format_magnifier_zoom, hsl_to_color, hsv_to_color,
+        image_color_at, magnifier_geometry, magnifier_size_for_zoom, mosaic_pixel_size_for_stroke,
+        moving_delta_and_update, normalized_save_filename, ocr_language_label,
+        ocr_result_body_text, ocr_result_primary_action, ocr_result_title, ocr_space_curl_args,
+        ocr_space_language_arg, output_action_menu_items, output_action_primary_label,
+        parse_hex_color, parse_ocr_space_response, pin_click_action, pin_context_popover_rect,
+        pin_dimension_label, pin_display_size, pin_initial_scale, pin_initial_scale_with_saved,
+        pin_window_size, pin_window_size_for_scale, pin_zoom_from_scroll, push_recent_color,
+        remove_favorite_color, render_document_png_bytes, resize_handle_at, rgb_to_hsl, rgb_to_hsv,
+        rgba_color_at, save_editor_document_to_dir_with_filename, scaled_canvas_point,
+        selected_annotation_bounds, set_active_text_edit, suggested_save_filename_at,
+        take_active_text_edit, tesseract_command_args, tesseract_command_invocation,
+        text_for_annotation, tool_can_select_existing, tool_icon_label, tool_icon_stroke_width,
+        tool_picks_canvas_color, update_ocr_language_selection,
     };
 
     use chrono::{Local, TimeZone};
@@ -7308,6 +7461,37 @@ mod tests {
     #[test]
     fn ocr_symbol_filter_removes_emoji_noise_but_keeps_text() {
         assert_eq!(filter_ocr_symbols("hello ✅ world 😀"), "hello  world ");
+    }
+
+    #[test]
+    fn ocr_result_dialog_labels_success_and_failure_states() {
+        let success = Ok("hello".to_string());
+        let failure = Err("missing language pack".to_string());
+
+        assert_eq!(ocr_result_title(&success), "Recognized Text");
+        assert_eq!(ocr_result_title(&failure), "OCR Failed");
+        assert_eq!(ocr_result_primary_action(&success), "Copy & Close");
+        assert_eq!(ocr_result_primary_action(&failure), "Copy Error");
+    }
+
+    #[test]
+    fn ocr_result_dialog_uses_placeholders_for_empty_messages() {
+        assert_eq!(ocr_result_body_text(&Ok(String::new())), "No text recognized.");
+        assert_eq!(
+            ocr_result_body_text(&Err(String::new())),
+            "OCR failed without an error message."
+        );
+    }
+
+    #[test]
+    fn ocr_result_dialog_extracts_install_commands_from_errors() {
+        let error = "tesseract failed\nsudo apt install tesseract-ocr tesseract-ocr-eng";
+
+        assert_eq!(
+            extract_ocr_install_command(error),
+            Some("sudo apt install tesseract-ocr tesseract-ocr-eng".to_string())
+        );
+        assert_eq!(extract_ocr_install_command("Install tesseract traineddata"), None);
     }
 
     #[test]
