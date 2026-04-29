@@ -81,6 +81,10 @@ pub struct AppConfig {
     pub last_pin_opacity: f64,
     #[serde(default = "default_appearance_mode")]
     pub appearance_mode: AppearanceMode,
+    #[serde(default = "default_eyedropper_magnifier_enabled")]
+    pub eyedropper_magnifier_enabled: bool,
+    #[serde(default = "default_eyedropper_magnifier_zoom")]
+    pub eyedropper_magnifier_zoom: f64,
     #[serde(default = "default_ocr_backend")]
     pub ocr_backend: OcrBackend,
     #[serde(default = "default_ocr_languages")]
@@ -109,6 +113,8 @@ impl Default for AppConfig {
             last_pin_scale: default_pin_scale(),
             last_pin_opacity: default_pin_opacity(),
             appearance_mode: default_appearance_mode(),
+            eyedropper_magnifier_enabled: default_eyedropper_magnifier_enabled(),
+            eyedropper_magnifier_zoom: default_eyedropper_magnifier_zoom(),
             ocr_backend: OcrBackend::Tesseract,
             ocr_languages: default_ocr_languages(),
             ocr_space_api_key: String::new(),
@@ -191,6 +197,14 @@ fn default_pin_opacity() -> f64 {
     1.0
 }
 
+fn default_eyedropper_magnifier_enabled() -> bool {
+    true
+}
+
+fn default_eyedropper_magnifier_zoom() -> f64 {
+    8.0
+}
+
 #[cfg(test)]
 mod tests {
     use tempfile::tempdir;
@@ -257,6 +271,8 @@ default_stroke_width = 4
     fn appearance_mode_defaults_to_follow_system_for_new_and_legacy_config() {
         let config = AppConfig::default();
         assert_eq!(config.appearance_mode, AppearanceMode::System);
+        assert!(config.eyedropper_magnifier_enabled);
+        assert_eq!(config.eyedropper_magnifier_zoom, 8.0);
 
         let dir = tempdir().expect("tempdir");
         let save_dir = dir.path().join("shots");
@@ -283,6 +299,8 @@ default_stroke_width = 4
         let loaded = AppConfig::load_from(&path).expect("load legacy config");
 
         assert_eq!(loaded.appearance_mode, AppearanceMode::System);
+        assert!(loaded.eyedropper_magnifier_enabled);
+        assert_eq!(loaded.eyedropper_magnifier_zoom, 8.0);
     }
 
     #[test]
@@ -320,6 +338,8 @@ default_stroke_width = 4
             favorite_colors: vec![crate::document::Color::rgba(7, 8, 9, 255)],
             last_pin_scale: 1.75,
             last_pin_opacity: 0.65,
+            eyedropper_magnifier_enabled: false,
+            eyedropper_magnifier_zoom: 12.0,
             ..AppConfig::default()
         };
 
@@ -330,6 +350,8 @@ default_stroke_width = 4
         assert_eq!(loaded.favorite_colors, config.favorite_colors);
         assert_eq!(loaded.last_pin_scale, 1.75);
         assert_eq!(loaded.last_pin_opacity, 0.65);
+        assert!(!loaded.eyedropper_magnifier_enabled);
+        assert_eq!(loaded.eyedropper_magnifier_zoom, 12.0);
     }
 
     #[test]
@@ -362,5 +384,7 @@ default_stroke_width = 4
         assert!(loaded.favorite_colors.is_empty());
         assert_eq!(loaded.last_pin_scale, 1.0);
         assert_eq!(loaded.last_pin_opacity, 1.0);
+        assert!(loaded.eyedropper_magnifier_enabled);
+        assert_eq!(loaded.eyedropper_magnifier_zoom, 8.0);
     }
 }

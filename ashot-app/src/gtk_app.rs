@@ -31,8 +31,9 @@ use gtk::prelude::{
     NativeDialogExt, NativeDialogExtManual, NativeExt, StyleContextExt, WidgetExt,
 };
 use gtk::{
-    Align, Box as GtkBox, Button, DrawingArea, Entry, Grid, HeaderBar, Label, MenuButton,
-    Orientation, Overlay, Picture, PolicyType, Popover, ScrolledWindow,
+    Adjustment, Align, Box as GtkBox, Button, DrawingArea, Entry, Grid, HeaderBar, Label,
+    MenuButton, Orientation, Overlay, Picture, PolicyType, Popover, Scale, ScrolledWindow,
+    SpinButton,
 };
 use gtk4 as gtk;
 use libadwaita as adw;
@@ -69,6 +70,10 @@ const STROKE_PREVIEW_WIDTH: i32 = 104;
 const STROKE_PREVIEW_HEIGHT: i32 = 20;
 const STROKE_MENU_BUTTON_WIDTH: i32 = 58;
 const STROKE_MENU_BUTTON_HEIGHT: i32 = 32;
+const EYEDROPPER_MAGNIFIER_MIN_ZOOM: f64 = 4.0;
+const EYEDROPPER_MAGNIFIER_MAX_ZOOM: f64 = 16.0;
+const EYEDROPPER_MAGNIFIER_DEFAULT_ZOOM: f64 = 8.0;
+const EYEDROPPER_MAGNIFIER_SAMPLE_RADIUS: i32 = 5;
 
 type ApplicationWindow = adw::ApplicationWindow;
 type ColorCallback = Rc<dyn Fn(Color)>;
@@ -1227,9 +1232,12 @@ fn present_editor(
     let active_stroke = Rc::new(Cell::new(config.default_stroke_width));
     let active_ocr_languages = Rc::new(RefCell::new(config.ocr_languages.clone()));
     let active_ocr_filter_symbols = Rc::new(Cell::new(config.ocr_filter_symbols));
+    let active_magnifier_enabled = Rc::new(Cell::new(config.eyedropper_magnifier_enabled));
+    let active_magnifier_zoom =
+        Rc::new(Cell::new(clamp_magnifier_zoom(config.eyedropper_magnifier_zoom)));
     let base_rgba = Arc::new(image.to_rgba8());
     let base_image = Rc::new(image);
-    let render_cache = Rc::new(RefCell::new(RenderCache::new(runtime.clone(), base_rgba)));
+    let render_cache = Rc::new(RefCell::new(RenderCache::new(runtime.clone(), base_rgba.clone())));
     let queue_render_cache: Rc<dyn Fn()> = {
         let render_cache = render_cache.clone();
         let document = document.clone();
@@ -1521,6 +1529,8 @@ fn present_editor(
         refresh_status.clone(),
         show_toast.clone(),
         queue_render_cache.clone(),
+        active_magnifier_enabled.clone(),
+        active_magnifier_zoom.clone(),
     );
     left_panel.append(&color_picker);
     info!("present_editor color section added");
@@ -1541,14 +1551,6 @@ fn present_editor(
     );
     left_panel.append(&stroke_menu);
     info!("present_editor stroke section added");
-
-    let info = Label::new(Some(
-        "The full screenshot is fit to the canvas. Drag tools preview live before release.",
-    ));
-    info.set_wrap(true);
-    info.set_xalign(0.0);
-    info.add_css_class("dim-label");
-    left_panel.append(&info);
 
     let left_scrolled = ScrolledWindow::builder()
         .hscrollbar_policy(PolicyType::Never)
@@ -1571,9 +1573,13 @@ fn present_editor(
     let brush_cursor_for_draw = brush_cursor_preview.clone();
     let active_color_for_draw = active_color.clone();
     let active_stroke_for_draw = active_stroke.clone();
-    canvas.set_draw_func(move |_, cr, _, _| {
+    let active_magnifier_enabled_for_draw = active_magnifier_enabled.clone();
+    let active_magnifier_zoom_for_draw = active_magnifier_zoom.clone();
+    let base_rgba_for_magnifier = base_rgba.clone();
+    canvas.set_draw_func(move |_, cr, draw_width, draw_height| {
         let _ = cr.save();
-        cr.scale(scale_for_draw.get(), scale_for_draw.get());
+        let scale = scale_for_draw.get();
+        cr.scale(scale, scale);
         cr.set_line_join(gtk::cairo::LineJoin::Round);
         cr.set_line_cap(gtk::cairo::LineCap::Round);
         if let Some(annotations) = annotation_snapshot_for_draw(&doc_for_draw) {
@@ -1602,6 +1608,25 @@ fn present_editor(
             );
         }
         let _ = cr.restore();
+        if let Ok(document) = doc_for_draw.try_borrow()
+            && let Some(point) = eyedropper_magnifier_point(
+                document.active_tool,
+                active_magnifier_enabled_for_draw.get(),
+                brush_cursor_for_draw.get(),
+                base_rgba_for_magnifier.width(),
+                base_rgba_for_magnifier.height(),
+            )
+        {
+            draw_eyedropper_magnifier(
+                cr,
+                &base_rgba_for_magnifier,
+                point,
+                Point::new(point.x * scale as f32, point.y * scale as f32),
+                draw_width,
+                draw_height,
+                active_magnifier_zoom_for_draw.get(),
+            );
+        }
     });
 
     let click = gtk::GestureClick::new();
@@ -3214,6 +3239,26 @@ fn install_editor_css() {
             min-width: 30px;
             min-height: 30px;
         }
+        .ashot-magnifier-row {
+            margin-top: 2px;
+            padding: 4px 5px;
+            border-radius: 9px;
+            background: alpha(@view_bg_color, 0.28);
+            border: 1px solid alpha(currentColor, 0.06);
+        }
+        .ashot-magnifier-settings {
+            min-width: 30px;
+            min-height: 28px;
+            padding: 0;
+            border-radius: 8px;
+        }
+        .ashot-magnifier-zoom-value {
+            font-weight: 700;
+            color: @accent_bg_color;
+        }
+        .ashot-magnifier-spin {
+            min-width: 52px;
+        }
         .ashot-color-memory-row {
             margin-top: 2px;
             min-height: 31px;
@@ -3888,6 +3933,108 @@ fn eyedropper_icon_button() -> Button {
     button
 }
 
+fn eyedropper_magnifier_control_row(
+    active_enabled: Rc<Cell<bool>>,
+    active_zoom: Rc<Cell<f64>>,
+    canvas: DrawingArea,
+    state: Arc<ServiceState>,
+) -> GtkBox {
+    let row = GtkBox::new(Orientation::Horizontal, 6);
+    row.add_css_class("ashot-magnifier-row");
+
+    let toggle = gtk::CheckButton::with_label("Magnifier");
+    toggle.set_active(active_enabled.get());
+    toggle.set_hexpand(true);
+    toggle.add_css_class("ashot-compact-check");
+    row.append(&toggle);
+
+    let settings = MenuButton::new();
+    settings.set_icon_name("preferences-system-symbolic");
+    settings.set_tooltip_text(Some("Magnifier settings"));
+    settings.set_size_request(30, 28);
+    settings.add_css_class("flat");
+    settings.add_css_class("ashot-magnifier-settings");
+    row.append(&settings);
+
+    let popover = Popover::new();
+    let root = GtkBox::new(Orientation::Vertical, 8);
+    root.add_css_class("ashot-popover-panel");
+    root.set_margin_top(8);
+    root.set_margin_bottom(8);
+    root.set_margin_start(8);
+    root.set_margin_end(8);
+    root.set_size_request(260, -1);
+
+    let title_row = GtkBox::new(Orientation::Horizontal, 8);
+    let title = Label::new(Some("Magnifier"));
+    title.set_xalign(0.0);
+    title.set_hexpand(true);
+    let zoom_value = Label::new(Some(&format_magnifier_zoom(active_zoom.get())));
+    zoom_value.add_css_class("ashot-magnifier-zoom-value");
+    title_row.append(&title);
+    title_row.append(&zoom_value);
+    root.append(&title_row);
+
+    let control_row = GtkBox::new(Orientation::Horizontal, 8);
+    let zoom_label = Label::new(Some("Zoom"));
+    zoom_label.set_xalign(0.0);
+    zoom_label.set_width_chars(5);
+    let adjustment = Adjustment::new(
+        clamp_magnifier_zoom(active_zoom.get()),
+        EYEDROPPER_MAGNIFIER_MIN_ZOOM,
+        EYEDROPPER_MAGNIFIER_MAX_ZOOM,
+        1.0,
+        2.0,
+        0.0,
+    );
+    let zoom_scale = Scale::new(Orientation::Horizontal, Some(&adjustment));
+    zoom_scale.set_draw_value(false);
+    zoom_scale.set_hexpand(true);
+    zoom_scale.set_size_request(150, -1);
+    let zoom_spin = SpinButton::new(Some(&adjustment), 1.0, 0);
+    zoom_spin.set_numeric(true);
+    zoom_spin.set_snap_to_ticks(true);
+    zoom_spin.set_width_chars(3);
+    zoom_spin.add_css_class("ashot-magnifier-spin");
+    control_row.append(&zoom_label);
+    control_row.append(&zoom_scale);
+    control_row.append(&zoom_spin);
+    root.append(&control_row);
+
+    let active_enabled_for_toggle = active_enabled.clone();
+    let canvas_for_toggle = canvas.clone();
+    let state_for_toggle = state.clone();
+    toggle.connect_toggled(move |button| {
+        let enabled = button.is_active();
+        active_enabled_for_toggle.set(enabled);
+        persist_config_change(&state_for_toggle, |config| {
+            config.eyedropper_magnifier_enabled = enabled;
+        });
+        canvas_for_toggle.queue_draw();
+    });
+
+    let active_zoom_for_adjustment = active_zoom.clone();
+    let canvas_for_adjustment = canvas.clone();
+    let state_for_adjustment = state.clone();
+    adjustment.connect_value_changed(move |adjustment| {
+        let zoom = clamp_magnifier_zoom(adjustment.value());
+        if (adjustment.value() - zoom).abs() > f64::EPSILON {
+            adjustment.set_value(zoom);
+            return;
+        }
+        active_zoom_for_adjustment.set(zoom);
+        zoom_value.set_text(&format_magnifier_zoom(zoom));
+        persist_config_change(&state_for_adjustment, |config| {
+            config.eyedropper_magnifier_zoom = zoom;
+        });
+        canvas_for_adjustment.queue_draw();
+    });
+
+    popover.set_child(Some(&root));
+    settings.set_popover(Some(&popover));
+    row
+}
+
 fn color_memory_row(title: &str, buttons: &ColorMemoryButtons) -> GtkBox {
     let row = GtkBox::new(Orientation::Horizontal, 6);
     row.add_css_class("ashot-color-memory-row");
@@ -3998,6 +4145,17 @@ fn slider_value_from_x(area: &DrawingArea, x: f64) -> f64 {
     (x / width).clamp(0.0, 1.0)
 }
 
+fn clamp_magnifier_zoom(zoom: f64) -> f64 {
+    if !zoom.is_finite() {
+        return EYEDROPPER_MAGNIFIER_DEFAULT_ZOOM;
+    }
+    zoom.round().clamp(EYEDROPPER_MAGNIFIER_MIN_ZOOM, EYEDROPPER_MAGNIFIER_MAX_ZOOM)
+}
+
+fn format_magnifier_zoom(zoom: f64) -> String {
+    format!("{}x", clamp_magnifier_zoom(zoom) as i32)
+}
+
 fn draw_hue_slider_bar(cr: &gtk::cairo::Context, width: i32, height: i32, hue: f64) {
     let width_f = width.max(1) as f64;
     let height_f = height.max(1) as f64;
@@ -4071,11 +4229,175 @@ fn set_entry_text_if_needed(entry: &Entry, value: &str) {
 }
 
 fn image_color_at(base: &image::DynamicImage, point: Point) -> Color {
+    let rgba_image = base.to_rgba8();
+    rgba_color_at(&rgba_image, point)
+}
+
+fn rgba_color_at(base: &image::RgbaImage, point: Point) -> Color {
     let image_x = point.x.floor().clamp(0.0, base.width().saturating_sub(1) as f32) as u32;
     let image_y = point.y.floor().clamp(0.0, base.height().saturating_sub(1) as f32) as u32;
-    let rgba_image = base.to_rgba8();
-    let pixel = rgba_image.get_pixel(image_x, image_y).0;
+    let pixel = base.get_pixel(image_x, image_y).0;
     Color::rgba(pixel[0], pixel[1], pixel[2], pixel[3])
+}
+
+fn image_point_inside(point: Point, image_width: u32, image_height: u32) -> bool {
+    point.x >= 0.0
+        && point.y >= 0.0
+        && point.x < image_width as f32
+        && point.y < image_height as f32
+}
+
+fn eyedropper_magnifier_point(
+    tool: DefaultTool,
+    enabled: bool,
+    point: Option<Point>,
+    image_width: u32,
+    image_height: u32,
+) -> Option<Point> {
+    let point = point?;
+    if tool_picks_canvas_color(tool)
+        && enabled
+        && image_point_inside(point, image_width, image_height)
+    {
+        Some(point)
+    } else {
+        None
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct MagnifierGeometry {
+    x: f64,
+    y: f64,
+    size: f64,
+}
+
+fn magnifier_size_for_zoom(zoom: f64) -> f64 {
+    let sample_width = (EYEDROPPER_MAGNIFIER_SAMPLE_RADIUS * 2 + 1) as f64;
+    (sample_width * clamp_magnifier_zoom(zoom) + 32.0).clamp(88.0, 210.0)
+}
+
+fn magnifier_geometry(
+    canvas_point: Point,
+    canvas_width: i32,
+    canvas_height: i32,
+    zoom: f64,
+) -> MagnifierGeometry {
+    let size = magnifier_size_for_zoom(zoom);
+    let edge = 6.0;
+    let offset = 18.0;
+    let point_x = canvas_point.x as f64;
+    let point_y = canvas_point.y as f64;
+    let mut x = point_x + offset;
+    let mut y = point_y - size - offset;
+
+    if y < edge {
+        y = point_y + offset;
+    }
+    if x + size > canvas_width as f64 - edge {
+        x = point_x - size - offset;
+    }
+
+    let max_x = (canvas_width as f64 - size - edge).max(edge);
+    let max_y = (canvas_height as f64 - size - edge).max(edge);
+    MagnifierGeometry { x: x.clamp(edge, max_x), y: y.clamp(edge, max_y), size }
+}
+
+fn draw_eyedropper_magnifier(
+    cr: &gtk::cairo::Context,
+    base: &image::RgbaImage,
+    image_point: Point,
+    canvas_point: Point,
+    canvas_width: i32,
+    canvas_height: i32,
+    zoom: f64,
+) {
+    let zoom = clamp_magnifier_zoom(zoom);
+    let geometry = magnifier_geometry(canvas_point, canvas_width, canvas_height, zoom);
+    let size = geometry.size;
+    let radius = size * 0.5;
+    let center_x = geometry.x + radius;
+    let center_y = geometry.y + radius;
+    let sample_width = EYEDROPPER_MAGNIFIER_SAMPLE_RADIUS * 2 + 1;
+    let cell_size = zoom;
+    let grid_size = sample_width as f64 * cell_size;
+    let grid_x = center_x - grid_size * 0.5;
+    let grid_y = center_y - grid_size * 0.5;
+    let center_color = rgba_color_at(base, image_point);
+
+    let _ = cr.save();
+    cr.set_source_rgba(0.0, 0.0, 0.0, 0.24);
+    cr.arc(center_x + 1.5, center_y + 2.0, radius, 0.0, std::f64::consts::TAU);
+    let _ = cr.fill();
+
+    cr.arc(center_x, center_y, radius, 0.0, std::f64::consts::TAU);
+    cr.clip();
+    cr.set_source_rgba(1.0, 1.0, 1.0, 0.96);
+    cr.paint().ok();
+
+    let origin_x = image_point.x.floor() as i32;
+    let origin_y = image_point.y.floor() as i32;
+    for sample_y in -EYEDROPPER_MAGNIFIER_SAMPLE_RADIUS..=EYEDROPPER_MAGNIFIER_SAMPLE_RADIUS {
+        for sample_x in -EYEDROPPER_MAGNIFIER_SAMPLE_RADIUS..=EYEDROPPER_MAGNIFIER_SAMPLE_RADIUS {
+            let x = (origin_x + sample_x).clamp(0, base.width().saturating_sub(1) as i32) as u32;
+            let y = (origin_y + sample_y).clamp(0, base.height().saturating_sub(1) as i32) as u32;
+            let pixel = base.get_pixel(x, y).0;
+            cr.set_source_rgba(
+                pixel[0] as f64 / 255.0,
+                pixel[1] as f64 / 255.0,
+                pixel[2] as f64 / 255.0,
+                1.0,
+            );
+            cr.rectangle(
+                grid_x + (sample_x + EYEDROPPER_MAGNIFIER_SAMPLE_RADIUS) as f64 * cell_size,
+                grid_y + (sample_y + EYEDROPPER_MAGNIFIER_SAMPLE_RADIUS) as f64 * cell_size,
+                cell_size.ceil(),
+                cell_size.ceil(),
+            );
+            let _ = cr.fill();
+        }
+    }
+
+    cr.set_source_rgba(1.0, 1.0, 1.0, 0.72);
+    cr.set_line_width(1.0);
+    cr.move_to(center_x - cell_size * 0.5, center_y);
+    cr.line_to(center_x + cell_size * 0.5, center_y);
+    cr.move_to(center_x, center_y - cell_size * 0.5);
+    cr.line_to(center_x, center_y + cell_size * 0.5);
+    let _ = cr.stroke();
+    cr.set_source_rgba(0.0, 0.0, 0.0, 0.62);
+    cr.rectangle(center_x - cell_size * 0.5, center_y - cell_size * 0.5, cell_size, cell_size);
+    cr.set_line_width(1.2);
+    let _ = cr.stroke();
+
+    cr.set_source_rgba(0.0, 0.0, 0.0, 0.58);
+    cr.rectangle(geometry.x, geometry.y + size - 28.0, size, 28.0);
+    let _ = cr.fill();
+    cr.set_source_rgba(
+        center_color.r as f64 / 255.0,
+        center_color.g as f64 / 255.0,
+        center_color.b as f64 / 255.0,
+        1.0,
+    );
+    cr.arc(geometry.x + 22.0, geometry.y + size - 14.0, 6.0, 0.0, std::f64::consts::TAU);
+    let _ = cr.fill();
+    cr.set_source_rgba(1.0, 1.0, 1.0, 0.95);
+    cr.select_font_face("Sans", gtk::cairo::FontSlant::Normal, gtk::cairo::FontWeight::Bold);
+    cr.set_font_size(11.0);
+    cr.move_to(geometry.x + 34.0, geometry.y + size - 10.0);
+    let _ = cr.show_text(&color_to_hex(center_color));
+    let _ = cr.restore();
+
+    let _ = cr.save();
+    cr.arc(center_x, center_y, radius - 0.5, 0.0, std::f64::consts::TAU);
+    cr.set_source_rgba(1.0, 1.0, 1.0, 0.92);
+    cr.set_line_width(2.0);
+    let _ = cr.stroke();
+    cr.arc(center_x, center_y, radius - 1.5, 0.0, std::f64::consts::TAU);
+    cr.set_source_rgba(0.0, 0.0, 0.0, 0.28);
+    cr.set_line_width(1.0);
+    let _ = cr.stroke();
+    let _ = cr.restore();
 }
 
 fn color_picker_section(
@@ -4093,6 +4415,8 @@ fn color_picker_section(
     refresh_status: StatusCallback,
     show_toast: ToastCallback,
     queue_render_cache: Rc<dyn Fn()>,
+    active_magnifier_enabled: Rc<Cell<bool>>,
+    active_magnifier_zoom: Rc<Cell<f64>>,
 ) -> GtkBox {
     let container = GtkBox::new(Orientation::Vertical, 5);
     container.add_css_class("ashot-color-section");
@@ -4168,6 +4492,12 @@ fn color_picker_section(
     let favorite_row = color_memory_row("Favorite", &favorite_buttons);
     container.append(&recent_row);
     container.append(&favorite_row);
+    container.append(&eyedropper_magnifier_control_row(
+        active_magnifier_enabled.clone(),
+        active_magnifier_zoom.clone(),
+        canvas.clone(),
+        state.clone(),
+    ));
 
     let top_row = GtkBox::new(Orientation::Horizontal, 8);
     top_row.set_halign(Align::Start);
@@ -6303,17 +6633,19 @@ mod tests {
         appearance_color_scheme, appearance_mode_from_index, appearance_mode_index,
         appearance_mode_labels, arrow_head_geometry, arrow_head_points, arrow_shape_geometry,
         arrow_visual_stroke_width, blur_radius_for_stroke, capture_should_use_fresh_anchor,
-        crop_image_region, cursor_name_for_resize_handle, cursor_name_for_surface_edge,
-        draft_preview_for_draw, draft_tool_can_draw, editor_color_palette, editor_cursor_for_tool,
-        editor_cursor_kind_for_tool, editor_favorite_palette, editor_initial_size,
-        editor_status_text, editor_stroke_widths, editor_tool_layout, filter_ocr_symbols,
-        fit_scale, hsl_to_color, hsv_to_color, image_color_at, mosaic_pixel_size_for_stroke,
-        moving_delta_and_update, normalized_save_filename, ocr_language_label, ocr_space_curl_args,
-        ocr_space_language_arg, output_action_menu_items, output_action_primary_label,
-        parse_hex_color, parse_ocr_space_response, pin_click_action, pin_context_popover_rect,
-        pin_dimension_label, pin_display_size, pin_initial_scale, pin_initial_scale_with_saved,
-        pin_window_size, pin_window_size_for_scale, pin_zoom_from_scroll, push_recent_color,
-        remove_favorite_color, render_document_png_bytes, resize_handle_at, rgb_to_hsl, rgb_to_hsv,
+        clamp_magnifier_zoom, crop_image_region, cursor_name_for_resize_handle,
+        cursor_name_for_surface_edge, draft_preview_for_draw, draft_tool_can_draw,
+        editor_color_palette, editor_cursor_for_tool, editor_cursor_kind_for_tool,
+        editor_favorite_palette, editor_initial_size, editor_status_text, editor_stroke_widths,
+        editor_tool_layout, eyedropper_magnifier_point, filter_ocr_symbols, fit_scale,
+        format_magnifier_zoom, hsl_to_color, hsv_to_color, image_color_at, magnifier_geometry,
+        magnifier_size_for_zoom, mosaic_pixel_size_for_stroke, moving_delta_and_update,
+        normalized_save_filename, ocr_language_label, ocr_space_curl_args, ocr_space_language_arg,
+        output_action_menu_items, output_action_primary_label, parse_hex_color,
+        parse_ocr_space_response, pin_click_action, pin_context_popover_rect, pin_dimension_label,
+        pin_display_size, pin_initial_scale, pin_initial_scale_with_saved, pin_window_size,
+        pin_window_size_for_scale, pin_zoom_from_scroll, push_recent_color, remove_favorite_color,
+        render_document_png_bytes, resize_handle_at, rgb_to_hsl, rgb_to_hsv, rgba_color_at,
         save_editor_document_to_dir_with_filename, scaled_canvas_point, selected_annotation_bounds,
         set_active_text_edit, suggested_save_filename_at, take_active_text_edit,
         tesseract_command_args, tesseract_command_invocation, text_for_annotation,
@@ -6502,6 +6834,53 @@ mod tests {
         assert_eq!((COLOR_VALUE_BUTTON_WIDTH, COLOR_VALUE_BUTTON_HEIGHT), (82, 30));
         assert_eq!((STROKE_PREVIEW_WIDTH, STROKE_PREVIEW_HEIGHT), (104, 20));
         assert_eq!((STROKE_MENU_BUTTON_WIDTH, STROKE_MENU_BUTTON_HEIGHT), (58, 32));
+    }
+
+    #[test]
+    fn magnifier_zoom_clamps_and_formats_as_integer_multiplier() {
+        assert_eq!(clamp_magnifier_zoom(1.0), 4.0);
+        assert_eq!(clamp_magnifier_zoom(8.4), 8.0);
+        assert_eq!(clamp_magnifier_zoom(18.0), 16.0);
+        assert_eq!(clamp_magnifier_zoom(f64::NAN), 8.0);
+        assert_eq!(format_magnifier_zoom(12.0), "12x");
+    }
+
+    #[test]
+    fn magnifier_only_draws_for_enabled_color_picker_inside_image() {
+        let point = Some(Point::new(12.0, 8.0));
+
+        assert_eq!(
+            eyedropper_magnifier_point(DefaultTool::ColorPicker, true, point, 24, 16),
+            point
+        );
+        assert_eq!(
+            eyedropper_magnifier_point(DefaultTool::ColorPicker, false, point, 24, 16),
+            None
+        );
+        assert_eq!(eyedropper_magnifier_point(DefaultTool::Arrow, true, point, 24, 16), None);
+        assert_eq!(
+            eyedropper_magnifier_point(
+                DefaultTool::ColorPicker,
+                true,
+                Some(Point::new(30.0, 8.0)),
+                24,
+                16
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn magnifier_geometry_stays_inside_canvas_and_scales_with_zoom() {
+        let small = magnifier_size_for_zoom(4.0);
+        let large = magnifier_size_for_zoom(16.0);
+        assert!(large > small);
+
+        let geometry = magnifier_geometry(Point::new(395.0, 6.0), 400, 260, 16.0);
+        assert!(geometry.x >= 6.0);
+        assert!(geometry.y >= 6.0);
+        assert!(geometry.x + geometry.size <= 400.0);
+        assert!(geometry.y + geometry.size <= 260.0);
     }
 
     #[test]
@@ -6846,6 +7225,16 @@ mod tests {
 
         assert_eq!(image_color_at(&image, Point::new(1.0, 1.0)), Color::rgba(3, 5, 8, 255));
         assert_eq!(image_color_at(&image, Point::new(100.0, 100.0)), Color::rgba(3, 5, 8, 255));
+    }
+
+    #[test]
+    fn magnifier_center_sample_matches_color_picker_sample() {
+        let mut rgba = image::DynamicImage::new_rgba8(3, 3).to_rgba8();
+        rgba.put_pixel(2, 1, image::Rgba([11, 22, 33, 255]));
+        let image = image::DynamicImage::ImageRgba8(rgba.clone());
+        let point = Point::new(2.0, 1.0);
+
+        assert_eq!(rgba_color_at(&rgba, point), image_color_at(&image, point));
     }
 
     #[test]
