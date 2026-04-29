@@ -7,10 +7,12 @@ authors.workspace = true
 repository.workspace = true
 
 [dependencies]
+cairo.workspace = true
 chrono.workspace = true
 directories.workspace = true
 font8x8.workspace = true
 image.workspace = true
+pango.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 toml.workspace = true

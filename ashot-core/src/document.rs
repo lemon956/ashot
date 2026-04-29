@@ -42,6 +42,12 @@ impl Color {
     }
 }
 
+pub const MARKER_HIGHLIGHT_ALPHA: u8 = 72;
+
+pub fn marker_highlight_color(color: Color) -> Color {
+    Color::rgba(color.r, color.g, color.b, color.a.min(MARKER_HIGHLIGHT_ALPHA))
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 pub struct Point {
     pub x: f32,
@@ -125,6 +131,8 @@ pub struct TextStyle {
     pub size: u32,
     pub weight: TextWeight,
     pub color: Color,
+    #[serde(default)]
+    pub family: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -284,6 +292,26 @@ impl Annotation {
         true
     }
 
+    pub fn apply_font_family(&mut self, family: Option<String>) -> bool {
+        match &mut self.data {
+            AnnotationData::Text { style, .. } => {
+                style.family = family;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    pub fn apply_text_size(&mut self, size: u32) -> bool {
+        match &mut self.data {
+            AnnotationData::Text { style, .. } => {
+                style.size = size.max(1);
+                true
+            }
+            _ => false,
+        }
+    }
+
     pub fn hit_test(&self, point: Point) -> bool {
         self.bounds().contains(point)
     }
@@ -375,6 +403,26 @@ impl Document {
             .iter_mut()
             .find(|annotation| annotation.id == id)
             .is_some_and(|annotation| annotation.apply_stroke_width(width))
+    }
+
+    pub fn apply_font_family_to_selected(&mut self, family: Option<String>) -> bool {
+        let Some(id) = self.selected else {
+            return false;
+        };
+        self.annotations
+            .iter_mut()
+            .find(|annotation| annotation.id == id)
+            .is_some_and(|annotation| annotation.apply_font_family(family))
+    }
+
+    pub fn apply_text_size_to_selected(&mut self, size: u32) -> bool {
+        let Some(id) = self.selected else {
+            return false;
+        };
+        self.annotations
+            .iter_mut()
+            .find(|annotation| annotation.id == id)
+            .is_some_and(|annotation| annotation.apply_text_size(size))
     }
 
     pub fn text_annotation_at(&self, point: Point) -> Option<AnnotationId> {
@@ -515,6 +563,7 @@ mod tests {
                 size: 16,
                 weight: TextWeight::Regular,
                 color: Color::rgba(255, 255, 255, 255),
+                family: None,
             },
         }));
 
@@ -536,6 +585,7 @@ mod tests {
                 size: 16,
                 weight: TextWeight::Regular,
                 color: Color::rgba(255, 255, 255, 255),
+                family: None,
             },
         });
         let id = annotation.id;
@@ -597,6 +647,75 @@ mod tests {
                 stroke_width: 8,
                 ..
             }
+        ));
+    }
+
+    #[test]
+    fn legacy_text_style_defaults_to_system_font() {
+        let style: TextStyle = toml::from_str(
+            r#"
+size = 18
+weight = "Regular"
+color = { r = 255, g = 255, b = 255, a = 255 }
+"#,
+        )
+        .expect("legacy text style");
+
+        assert_eq!(style.family, None);
+    }
+
+    #[test]
+    fn selected_text_annotation_accepts_font_family_changes() {
+        let mut document = Document::new(120, 80, DefaultTool::Select);
+        let annotation = Annotation::new(AnnotationData::Text {
+            origin: Point::new(12.0, 14.0),
+            text: "hello".into(),
+            style: TextStyle {
+                size: 18,
+                weight: TextWeight::Regular,
+                color: Color::rgba(255, 255, 255, 255),
+                family: None,
+            },
+        });
+        let id = annotation.id;
+        document.add_annotation(annotation);
+        document.selected = Some(id);
+
+        assert!(document.apply_font_family_to_selected(Some("Noto Sans CJK SC".to_string())));
+        assert!(matches!(
+            &document.annotations[0].data,
+            AnnotationData::Text { style, .. }
+                if style.family.as_deref() == Some("Noto Sans CJK SC")
+        ));
+
+        assert!(document.apply_font_family_to_selected(None));
+        assert!(matches!(
+            &document.annotations[0].data,
+            AnnotationData::Text { style, .. } if style.family.is_none()
+        ));
+    }
+
+    #[test]
+    fn selected_text_annotation_accepts_text_size_changes() {
+        let mut document = Document::new(120, 80, DefaultTool::Select);
+        let annotation = Annotation::new(AnnotationData::Text {
+            origin: Point::new(12.0, 14.0),
+            text: "hello".into(),
+            style: TextStyle {
+                size: 18,
+                weight: TextWeight::Regular,
+                color: Color::rgba(255, 255, 255, 255),
+                family: None,
+            },
+        });
+        let id = annotation.id;
+        document.add_annotation(annotation);
+        document.selected = Some(id);
+
+        assert!(document.apply_text_size_to_selected(32));
+        assert!(matches!(
+            &document.annotations[0].data,
+            AnnotationData::Text { style, .. } if style.size == 32
         ));
     }
 }

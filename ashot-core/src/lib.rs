@@ -8,10 +8,10 @@ pub mod workflow;
 
 pub use config::{AppConfig, AppearanceMode, ConfigError};
 pub use document::{
-    Annotation, AnnotationData, AnnotationId, Color, DefaultTool, Document, Point, Rect,
-    ResizeHandle, TextStyle, TextWeight,
+    Annotation, AnnotationData, AnnotationId, Color, DefaultTool, Document, MARKER_HIGHLIGHT_ALPHA,
+    Point, Rect, ResizeHandle, TextStyle, TextWeight, marker_highlight_color,
 };
-pub use export::{render_document, save_document_png};
+pub use export::{draw_text_cairo, render_document, save_document_png};
 pub use filename::render_filename;
 pub use history::EditorHistory;
 pub use ocr::{

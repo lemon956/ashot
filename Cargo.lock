@@ -139,10 +139,12 @@ dependencies = [
 name = "ashot-core"
 version = "0.1.0"
 dependencies = [
+ "cairo-rs",
  "chrono",
  "directories",
  "font8x8",
  "image",
+ "pango",
  "serde",
  "tempfile",
  "thiserror",

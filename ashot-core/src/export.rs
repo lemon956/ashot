@@ -2,8 +2,17 @@ use std::{io::Cursor, path::Path};
 
 use font8x8::{BASIC_FONTS, UnicodeFonts};
 use image::{DynamicImage, ImageBuffer, Rgba, RgbaImage};
+use pango::glib::translate::{ToGlibPtr, from_glib_full};
 
-use crate::document::{Annotation, AnnotationData, Color, Point, Rect, TextWeight};
+use crate::document::{
+    Annotation, AnnotationData, Color, Point, Rect, TextStyle, TextWeight, marker_highlight_color,
+};
+
+#[link(name = "pangocairo-1.0")]
+unsafe extern "C" {
+    fn pango_cairo_create_layout(cr: *mut cairo::ffi::cairo_t) -> *mut pango::ffi::PangoLayout;
+    fn pango_cairo_show_layout(cr: *mut cairo::ffi::cairo_t, layout: *mut pango::ffi::PangoLayout);
+}
 
 pub fn render_document(base: &DynamicImage, annotations: &[Annotation]) -> RgbaImage {
     render_document_from_rgba(&base.to_rgba8(), annotations)
@@ -19,9 +28,7 @@ pub fn render_document_from_rgba(base: &RgbaImage, annotations: &[Annotation]) -
 
 pub fn render_annotation_into(canvas: &mut RgbaImage, annotation: &Annotation) {
     match &annotation.data {
-        AnnotationData::Text { origin, text, style } => {
-            draw_text(canvas, *origin, text, style.size, style.weight, style.color)
-        }
+        AnnotationData::Text { origin, text, style } => draw_text(canvas, *origin, text, style),
         AnnotationData::Line { start, end, color, stroke_width } => {
             draw_thick_line(canvas, *start, *end, *color, *stroke_width)
         }
@@ -38,7 +45,7 @@ pub fn render_annotation_into(canvas: &mut RgbaImage, annotation: &Annotation) {
             draw_ellipse(canvas, *rect, *color, *stroke_width)
         }
         AnnotationData::Marker { points, color, stroke_width } => {
-            draw_brush(canvas, points, *color, *stroke_width)
+            draw_marker(canvas, points, *color, *stroke_width)
         }
         AnnotationData::Mosaic { rect, pixel_size } => {
             pixelate_region(canvas, *rect, *pixel_size);
@@ -530,6 +537,129 @@ fn draw_brush(image: &mut RgbaImage, points: &[Point], color: Color, stroke_widt
     }
 }
 
+fn draw_marker(image: &mut RgbaImage, points: &[Point], color: Color, stroke_width: u32) {
+    if points.len() < 2 || image.width() == 0 || image.height() == 0 {
+        return;
+    }
+
+    let radius = (stroke_width.max(1) as i32) / 2;
+    let padding = radius as f32 + 1.0;
+    let min_x = points.iter().map(|point| point.x).fold(f32::INFINITY, f32::min);
+    let min_y = points.iter().map(|point| point.y).fold(f32::INFINITY, f32::min);
+    let max_x = points.iter().map(|point| point.x).fold(f32::NEG_INFINITY, f32::max);
+    let max_y = points.iter().map(|point| point.y).fold(f32::NEG_INFINITY, f32::max);
+    let Some(bounds) = PixelRect::from_edges(
+        image.width(),
+        image.height(),
+        min_x - padding,
+        min_y - padding,
+        max_x + padding,
+        max_y + padding,
+    ) else {
+        return;
+    };
+
+    let mut mask = vec![false; bounds.width as usize * bounds.height as usize];
+    for window in points.windows(2) {
+        mark_thick_line(
+            &mut mask,
+            bounds.width,
+            bounds.height,
+            bounds.x as i32,
+            bounds.y as i32,
+            window[0],
+            window[1],
+            stroke_width,
+        );
+    }
+
+    let rgba = color_to_rgba(marker_highlight_color(color));
+    for y in 0..bounds.height {
+        for x in 0..bounds.width {
+            let idx = y as usize * bounds.width as usize + x as usize;
+            if !mask[idx] {
+                continue;
+            }
+            if let Some(pixel) = image.get_pixel_mut_checked(bounds.x + x, bounds.y + y) {
+                blend_pixel(pixel, rgba);
+            }
+        }
+    }
+}
+
+fn mark_thick_line(
+    mask: &mut [bool],
+    mask_width: u32,
+    mask_height: u32,
+    offset_x: i32,
+    offset_y: i32,
+    start: Point,
+    end: Point,
+    stroke_width: u32,
+) {
+    let radius = (stroke_width.max(1) as i32) / 2;
+    let dx = end.x - start.x;
+    let dy = end.y - start.y;
+    let steps = dx.abs().max(dy.abs()).ceil() as i32;
+    if steps == 0 {
+        mark_circle(
+            mask,
+            mask_width,
+            mask_height,
+            offset_x,
+            offset_y,
+            start.x.round() as i32,
+            start.y.round() as i32,
+            radius,
+        );
+        return;
+    }
+
+    for step in 0..=steps {
+        let t = step as f32 / steps as f32;
+        let x = start.x + dx * t;
+        let y = start.y + dy * t;
+        mark_circle(
+            mask,
+            mask_width,
+            mask_height,
+            offset_x,
+            offset_y,
+            x.round() as i32,
+            y.round() as i32,
+            radius,
+        );
+    }
+}
+
+fn mark_circle(
+    mask: &mut [bool],
+    mask_width: u32,
+    mask_height: u32,
+    offset_x: i32,
+    offset_y: i32,
+    center_x: i32,
+    center_y: i32,
+    radius: i32,
+) {
+    for dy in -radius..=radius {
+        for dx in -radius..=radius {
+            if dx * dx + dy * dy > radius * radius {
+                continue;
+            }
+            let x = center_x + dx - offset_x;
+            let y = center_y + dy - offset_y;
+            if x < 0 || y < 0 || x as u32 >= mask_width || y as u32 >= mask_height {
+                continue;
+            }
+            let idx = y as usize * mask_width as usize + x as usize;
+            if let Some(cell) = mask.get_mut(idx) {
+                *cell = true;
+            }
+        }
+    }
+}
+
 fn draw_rectangle(image: &mut RgbaImage, rect: Rect, color: Color, stroke_width: u32) {
     let x1 = rect.x;
     let y1 = rect.y;
@@ -588,10 +718,98 @@ fn draw_counter(image: &mut RgbaImage, center: Point, number: u32, color: Color,
     let text = number.to_string();
     let text_color = Color::rgba(255, 255, 255, 255);
     let origin = Point::new(center.x - text.chars().count() as f32 * 4.0, center.y - 5.0);
-    draw_text(image, origin, &text, 8, TextWeight::Bold, text_color);
+    draw_bitmap_text(image, origin, &text, 8, TextWeight::Bold, text_color);
 }
 
-fn draw_text(
+pub fn draw_text_cairo(cr: &cairo::Context, origin: Point, text: &str, style: &TextStyle) {
+    if text.is_empty() {
+        return;
+    }
+    let _ = cr.save();
+    cr.set_source_rgba(
+        style.color.r as f64 / 255.0,
+        style.color.g as f64 / 255.0,
+        style.color.b as f64 / 255.0,
+        style.color.a as f64 / 255.0,
+    );
+    cr.move_to(origin.x as f64, origin.y as f64);
+
+    let layout = unsafe { create_pango_cairo_layout(cr) };
+    layout.set_text(text);
+    let desc = pango_font_description(style);
+    layout.set_font_description(Some(&desc));
+
+    unsafe {
+        pango_cairo_show_layout(cr.to_glib_none().0, layout.to_glib_none().0);
+    }
+    let _ = cr.restore();
+}
+
+unsafe fn create_pango_cairo_layout(cr: &cairo::Context) -> pango::Layout {
+    unsafe { from_glib_full(pango_cairo_create_layout(cr.to_glib_none().0)) }
+}
+
+fn pango_font_description(style: &TextStyle) -> pango::FontDescription {
+    let mut desc = pango::FontDescription::new();
+    if let Some(family) = style.family.as_deref().filter(|family| !family.trim().is_empty()) {
+        desc.set_family(family);
+    }
+    desc.set_size((style.size.max(1) as i32) * pango::SCALE);
+    desc.set_weight(match style.weight {
+        TextWeight::Regular => pango::Weight::Normal,
+        TextWeight::Semibold => pango::Weight::Semibold,
+        TextWeight::Bold => pango::Weight::Bold,
+    });
+    desc
+}
+
+fn draw_text(image: &mut RgbaImage, origin: Point, text: &str, style: &TextStyle) {
+    let width = image.width() as i32;
+    let height = image.height() as i32;
+    if width <= 0 || height <= 0 || text.is_empty() {
+        return;
+    }
+
+    let Ok(mut surface) = cairo::ImageSurface::create(cairo::Format::ARgb32, width, height) else {
+        return;
+    };
+    {
+        let Ok(cr) = cairo::Context::new(&surface) else {
+            return;
+        };
+        draw_text_cairo(&cr, origin, text, style);
+    }
+    surface.flush();
+    let stride = surface.stride() as usize;
+    let Ok(data) = surface.data() else {
+        return;
+    };
+
+    for y in 0..image.height() {
+        for x in 0..image.width() {
+            let idx = y as usize * stride + x as usize * 4;
+            let alpha = data[idx + 3];
+            if alpha == 0 {
+                continue;
+            }
+            let unpremultiply = |value: u8| -> u8 {
+                ((value as u32 * 255 + alpha as u32 / 2) / alpha as u32).min(255) as u8
+            };
+            let source = Rgba([
+                unpremultiply(data[idx + 2]),
+                unpremultiply(data[idx + 1]),
+                unpremultiply(data[idx]),
+                alpha,
+            ]);
+            let Some(pixel) = image.get_pixel_mut_checked(x, y) else {
+                continue;
+            };
+            blend_pixel(pixel, source);
+        }
+    }
+}
+
+fn draw_bitmap_text(
     image: &mut RgbaImage,
     origin: Point,
     text: &str,
@@ -744,7 +962,7 @@ fn blur_region(image: &mut RgbaImage, rect: Rect, radius: u32) {
 
 #[cfg(test)]
 mod tests {
-    use image::{DynamicImage, Rgba};
+    use image::{DynamicImage, Rgba, RgbaImage};
 
     use crate::document::{Annotation, AnnotationData, Color, Point, Rect, TextStyle, TextWeight};
 
@@ -776,12 +994,36 @@ mod tests {
                     size: 16,
                     weight: TextWeight::Bold,
                     color: Color::rgba(0, 0, 255, 255),
+                    family: None,
                 },
             }),
         ];
 
         let rendered = render_document(&base, &annotations);
         assert!(rendered.pixels().any(|pixel| *pixel != Rgba([0, 0, 0, 0])));
+    }
+
+    #[test]
+    fn export_renders_cjk_text_with_system_font_fallback() {
+        let base = DynamicImage::new_rgba8(160, 64);
+        let annotations = vec![Annotation::new(AnnotationData::Text {
+            origin: Point::new(8.0, 8.0),
+            text: "中文".into(),
+            style: TextStyle {
+                size: 24,
+                weight: TextWeight::Bold,
+                color: Color::rgba(255, 0, 0, 255),
+                family: None,
+            },
+        })];
+
+        let rendered = render_document(&base, &annotations);
+
+        assert!(
+            rendered
+                .pixels()
+                .any(|pixel| pixel[0] > 0 && pixel[1] == 0 && pixel[2] == 0 && pixel[3] > 0)
+        );
     }
 
     #[test]
@@ -881,6 +1123,24 @@ mod tests {
         let rendered = render_document(&base, &annotations);
 
         assert!(rendered.pixels().filter(|pixel| **pixel != Rgba([0, 0, 0, 0])).count() > 40);
+    }
+
+    #[test]
+    fn marker_highlight_does_not_compound_alpha_over_dense_paths() {
+        let base = RgbaImage::from_pixel(40, 16, Rgba([180, 180, 180, 255]));
+        let points = (2..38).map(|x| Point::new(x as f32, 8.0)).collect::<Vec<_>>();
+        let annotations = vec![Annotation::new(AnnotationData::Marker {
+            points,
+            color: Color::rgba(255, 0, 0, 96),
+            stroke_width: 9,
+        })];
+
+        let rendered = render_document_from_rgba(&base, &annotations);
+        let pixel = rendered.get_pixel(20, 8);
+
+        assert!(pixel[0] < 230, "marker red channel compounded to {}", pixel[0]);
+        assert!(pixel[1] > 95, "marker green channel was crushed to {}", pixel[1]);
+        assert!(pixel[2] > 95, "marker blue channel was crushed to {}", pixel[2]);
     }
 
     #[test]

@@ -17,7 +17,8 @@ use ashot_core::{
     Annotation, AnnotationData, AppConfig, AppearanceMode, Color, DefaultTool, Document,
     EditorHistory, LinuxDistroFamily, OcrBackend, Point, Rect, ResizeHandle, TextStyle, TextWeight,
     default_ocr_languages, detect_linux_distro_family, finalize_capture_with_config,
-    language_install_command, language_package_for_distro, render_filename, search_ocr_languages,
+    language_install_command, language_package_for_distro, marker_highlight_color, render_filename,
+    search_ocr_languages,
 };
 use ashot_ipc::{
     APP_ID, CaptureMode, CaptureOutcome, CommandOutcome, DBUS_NAME, DBUS_PATH, OutcomeKind,
@@ -26,6 +27,7 @@ use glib::prelude::IsA;
 use glib::translate::ToGlibPtr;
 use glib::types::StaticType;
 use gtk::gdk::prelude::ToplevelExt;
+use gtk::pango::prelude::FontFamilyExt;
 use gtk::prelude::{
     Cast, EventControllerExt, FileChooserExt, FileChooserExtManual, GestureSingleExt,
     NativeDialogExt, NativeDialogExtManual, NativeExt, StyleContextExt, WidgetExt,
@@ -74,6 +76,15 @@ const EYEDROPPER_MAGNIFIER_MIN_ZOOM: f64 = 4.0;
 const EYEDROPPER_MAGNIFIER_MAX_ZOOM: f64 = 16.0;
 const EYEDROPPER_MAGNIFIER_DEFAULT_ZOOM: f64 = 8.0;
 const EYEDROPPER_MAGNIFIER_SAMPLE_RADIUS: i32 = 5;
+const PIN_MIN_SCALE: f64 = 0.1;
+const PIN_MAX_SCALE: f64 = 8.0;
+const TEXT_SIZE_MIN: u32 = 8;
+const TEXT_SIZE_MAX: u32 = 72;
+#[cfg(test)]
+const TEXT_SIZE_OPTIONS: [u32; 7] = [12, 14, 16, 20, 24, 32, 48];
+const TEXT_FONT_BUTTON_WIDTH: i32 = 132;
+const TEXT_SIZE_BUTTON_WIDTH: i32 = 70;
+const TEXT_CONTROL_GAP: i32 = 6;
 
 type ApplicationWindow = adw::ApplicationWindow;
 type ColorCallback = Rc<dyn Fn(Color)>;
@@ -1230,6 +1241,8 @@ fn present_editor(
     let active_text_edit = Rc::new(RefCell::new(None::<ActiveTextEdit>));
     let active_color = Rc::new(Cell::new(config.default_color));
     let active_stroke = Rc::new(Cell::new(config.default_stroke_width));
+    let active_text_family = Rc::new(RefCell::new(config.default_text_family.clone()));
+    let active_text_size = Rc::new(Cell::new(clamp_text_size(config.default_text_size)));
     let active_ocr_languages = Rc::new(RefCell::new(config.ocr_languages.clone()));
     let active_ocr_filter_symbols = Rc::new(Cell::new(config.ocr_filter_symbols));
     let active_magnifier_enabled = Rc::new(Cell::new(config.eyedropper_magnifier_enabled));
@@ -1339,15 +1352,13 @@ fn present_editor(
     let redo = action_icon_button("edit-redo-symbolic", "Redo");
     let copy = action_icon_button("edit-copy-symbolic", "Copy to Clipboard");
     let pin = action_icon_button("view-pin-symbolic", "Pin Screenshot");
-    let [save_label, save_to_label, copy_close_label] = output_action_menu_items();
+    let [save_label, save_to_label, save_exit_label] = output_action_menu_items();
     let save = action_text_button("document-save-symbolic", save_label, "Save");
-    let save_close = action_text_button(
-        "document-save-as-symbolic",
-        output_action_primary_label(),
-        "Save and Close",
-    );
+    let copy_exit =
+        action_text_button("edit-copy-symbolic", output_action_primary_label(), "Copy and Exit");
     let save_to = action_text_button("folder-save-symbolic", save_to_label, "Save to a folder");
-    let copy_close = action_text_button("edit-copy-symbolic", copy_close_label, "Copy and Close");
+    let save_close =
+        action_text_button("document-save-as-symbolic", save_exit_label, "Save and Exit");
 
     let overlay = Overlay::new();
     overlay.set_hexpand(true);
@@ -1418,10 +1429,10 @@ fn present_editor(
     left_panel.append(&quick_actions);
 
     let output_actions = GtkBox::new(Orientation::Horizontal, 6);
-    save_close.set_hexpand(true);
-    output_actions.append(&save_close);
-    save_close.add_css_class("ashot-action-primary");
-    let output_more = output_actions_menu(&save, &save_to, &copy_close);
+    copy_exit.set_hexpand(true);
+    output_actions.append(&copy_exit);
+    copy_exit.add_css_class("ashot-action-primary");
+    let output_more = output_actions_menu(&save, &save_to, &save_close);
     output_actions.append(&output_more);
     left_panel.append(&output_actions);
     update_history_action_buttons(&history, &undo, &redo);
@@ -1552,6 +1563,37 @@ fn present_editor(
     left_panel.append(&stroke_menu);
     info!("present_editor stroke section added");
 
+    left_panel.append(&section_title("Text"));
+    let text_controls = GtkBox::new(Orientation::Horizontal, TEXT_CONTROL_GAP);
+    text_controls.add_css_class("ashot-text-controls");
+    text_controls.set_size_request(text_controls_width(), -1);
+    let text_font_menu = text_font_selector(
+        active_text_family.clone(),
+        document.clone(),
+        history.clone(),
+        canvas.clone(),
+        undo.clone(),
+        redo.clone(),
+        state.clone(),
+        refresh_status.clone(),
+        queue_render_cache.clone(),
+    );
+    text_controls.append(&text_font_menu);
+    let text_size_menu = text_size_selector(
+        active_text_size.clone(),
+        document.clone(),
+        history.clone(),
+        canvas.clone(),
+        undo.clone(),
+        redo.clone(),
+        state.clone(),
+        refresh_status.clone(),
+        queue_render_cache.clone(),
+    );
+    text_controls.append(&text_size_menu);
+    left_panel.append(&text_controls);
+    info!("present_editor text font section added");
+
     let left_scrolled = ScrolledWindow::builder()
         .hscrollbar_policy(PolicyType::Never)
         .vscrollbar_policy(PolicyType::Automatic)
@@ -1590,7 +1632,7 @@ fn present_editor(
         if let Ok(document) = doc_for_draw.try_borrow()
             && let Some(bounds) = selected_annotation_bounds(&document)
         {
-            draw_selection_overlay(cr, bounds);
+            draw_selection_overlay(cr, bounds, selected_annotation_has_resize_handles(&document));
         }
         if let Some(annotation) = draft_preview_for_draw(&draft_for_draw) {
             draw_annotation(cr, &annotation);
@@ -1639,6 +1681,8 @@ fn present_editor(
     let color_for_click = active_color.clone();
     let color_ui_refresh_for_click = color_ui_refresh.clone();
     let recent_for_click = recent_color_recorder.clone();
+    let text_family_for_click = active_text_family.clone();
+    let text_size_for_click = active_text_size.clone();
     let undo_for_click = undo.clone();
     let redo_for_click = redo.clone();
     let scale_for_click = image_scale.clone();
@@ -1674,7 +1718,13 @@ fn present_editor(
 
             if !set_active_text_edit(
                 &active_text_edit_for_click,
-                ActiveTextEdit { id: existing, origin: point, color: color_for_click.get() },
+                ActiveTextEdit {
+                    id: existing,
+                    origin: point,
+                    color: color_for_click.get(),
+                    family: text_family_for_click.borrow().clone(),
+                    size: text_size_for_click.get(),
+                },
             ) {
                 return;
             }
@@ -1722,6 +1772,7 @@ fn present_editor(
                 .ok()
                 .and_then(|mut document| document.select_at(point))
                 .is_some();
+            canvas_for_click.queue_draw();
             if selected {
                 if let Ok(mut draft) = draft_for_click.try_borrow_mut() {
                     *draft = None;
@@ -2462,22 +2513,22 @@ fn present_editor(
         }
     });
 
-    let doc_for_copy_close = document.clone();
-    let render_cache_for_copy_close = render_cache.clone();
-    let window_for_copy_close = window.clone();
-    let refresh_status_for_copy_close = refresh_status.clone();
-    let show_toast_for_copy_close = show_toast.clone();
-    copy_close.connect_clicked(move |button| {
+    let doc_for_copy_exit = document.clone();
+    let render_cache_for_copy_exit = render_cache.clone();
+    let window_for_copy_exit = window.clone();
+    let refresh_status_for_copy_exit = refresh_status.clone();
+    let show_toast_for_copy_exit = show_toast.clone();
+    copy_exit.connect_clicked(move |button| {
         set_button_loading(button, true);
-        let Some(annotations) = annotation_snapshot_for_draw(&doc_for_copy_close) else {
+        let Some(annotations) = annotation_snapshot_for_draw(&doc_for_copy_exit) else {
             set_button_loading(button, false);
             return;
         };
-        refresh_status_for_copy_close(Some("Copying...".to_string()));
+        refresh_status_for_copy_exit(Some("Copying...".to_string()));
         let button_for_result = button.clone();
-        let window_for_result = window_for_copy_close.clone();
-        let refresh_status_for_result = refresh_status_for_copy_close.clone();
-        let show_toast_for_result = show_toast_for_copy_close.clone();
+        let window_for_result = window_for_copy_exit.clone();
+        let refresh_status_for_result = refresh_status_for_copy_exit.clone();
+        let show_toast_for_result = show_toast_for_copy_exit.clone();
         let callback: RenderCacheCallback =
             Box::new(move |result| match result.and_then(copy_png_bytes_to_clipboard) {
                 Ok(()) => window_for_result.close(),
@@ -2488,11 +2539,11 @@ fn present_editor(
                     set_button_loading(&button_for_result, false);
                 }
             });
-        if let Ok(mut render_cache) = render_cache_for_copy_close.try_borrow_mut() {
+        if let Ok(mut render_cache) = render_cache_for_copy_exit.try_borrow_mut() {
             render_cache.request_latest(annotations, callback);
         } else {
-            show_toast_for_copy_close("Copy failed: renderer is busy");
-            refresh_status_for_copy_close(None);
+            show_toast_for_copy_exit("Copy failed: renderer is busy");
+            refresh_status_for_copy_exit(None);
             set_button_loading(button, false);
         }
     });
@@ -2589,11 +2640,22 @@ fn present_pin_window(app: &adw::Application, state: Arc<ServiceState>, image_pa
     let image_overlay = Overlay::new();
     image_overlay.set_halign(Align::Start);
     image_overlay.set_valign(Align::Start);
+    let pin_content = GtkBox::new(Orientation::Vertical, 0);
+    pin_content.set_halign(Align::Start);
+    pin_content.set_valign(Align::Start);
+    pin_content.set_hexpand(false);
+    pin_content.set_vexpand(false);
+    pin_content.set_overflow(gtk::Overflow::Hidden);
     let picture = Picture::for_filename(&image_path);
+    picture.set_can_target(pin_picture_can_target());
     picture.set_can_shrink(true);
     picture.set_halign(Align::Start);
     picture.set_valign(Align::Start);
-    image_overlay.set_child(Some(&picture));
+    picture.set_hexpand(false);
+    picture.set_vexpand(false);
+    picture.set_overflow(gtk::Overflow::Hidden);
+    pin_content.append(&picture);
+    image_overlay.set_child(Some(&pin_content));
 
     let dimension_label = Label::new(None);
     dimension_label.add_css_class("osd");
@@ -2606,9 +2668,11 @@ fn present_pin_window(app: &adw::Application, state: Arc<ServiceState>, image_pa
     image_overlay.add_overlay(&dimension_label);
 
     let scale = Rc::new(Cell::new(initial_scale));
+    let pin_scale_save_generation = Rc::new(Cell::new(0_u64));
     apply_pin_zoom(
         &window,
         &image_overlay,
+        &pin_content,
         &picture,
         &dimension_label,
         image_width,
@@ -2620,34 +2684,48 @@ fn present_pin_window(app: &adw::Application, state: Arc<ServiceState>, image_pa
     scroll.set_propagation_phase(gtk::PropagationPhase::Capture);
     let window_for_scroll = window.clone();
     let image_overlay_for_scroll = image_overlay.clone();
+    let pin_content_for_scroll = pin_content.clone();
     let picture_for_scroll = picture.clone();
     let dimension_label_for_scroll = dimension_label.clone();
     let scale_for_scroll = scale.clone();
     let state_for_scroll = state.clone();
+    let save_generation_for_scroll = pin_scale_save_generation.clone();
     scroll.connect_scroll(move |_, _, dy| {
         let next = pin_zoom_from_scroll(scale_for_scroll.get(), dy);
+        if (next - scale_for_scroll.get()).abs() < 0.000_001 {
+            return glib::Propagation::Stop;
+        }
         scale_for_scroll.set(next);
-        persist_config_change(&state_for_scroll, |config| {
-            config.last_pin_scale = next;
-        });
         apply_pin_zoom(
             &window_for_scroll,
             &image_overlay_for_scroll,
+            &pin_content_for_scroll,
             &picture_for_scroll,
             &dimension_label_for_scroll,
             image_width,
             image_height,
             next,
         );
+        let generation = next_pin_scale_save_generation(save_generation_for_scroll.get());
+        save_generation_for_scroll.set(generation);
+        let state_for_save = state_for_scroll.clone();
+        let save_generation_for_timeout = save_generation_for_scroll.clone();
+        glib::timeout_add_local_once(Duration::from_millis(220), move || {
+            if pin_scale_save_generation_is_current(save_generation_for_timeout.get(), generation) {
+                persist_config_change(&state_for_save, |config| {
+                    config.last_pin_scale = next;
+                });
+            }
+        });
         glib::Propagation::Stop
     });
-    image_overlay.add_controller(scroll);
+    pin_content.add_controller(scroll);
 
     let click = gtk::GestureClick::new();
     click.set_button(0);
     click.set_propagation_phase(gtk::PropagationPhase::Capture);
     let window_for_click = window.clone();
-    let image_overlay_for_click = image_overlay.clone();
+    let pin_content_for_click = pin_content.clone();
     let state_for_click = state.clone();
     let image_path_for_click = image_path.clone();
     click.connect_pressed(move |gesture, n_press, x, y| {
@@ -2660,8 +2738,8 @@ fn present_pin_window(app: &adw::Application, state: Arc<ServiceState>, image_pa
             if let Some(edge) = pin_resize_edge_at(
                 x,
                 y,
-                image_overlay_for_click.allocated_width(),
-                image_overlay_for_click.allocated_height(),
+                pin_content_for_click.allocated_width(),
+                pin_content_for_click.allocated_height(),
                 8.0,
             ) {
                 begin_pin_window_resize(&window_for_click, gesture, edge, x, y);
@@ -2672,7 +2750,7 @@ fn present_pin_window(app: &adw::Application, state: Arc<ServiceState>, image_pa
         }
         if pin_click_action(n_press, button) == Some(PinClickAction::Menu) {
             show_pin_context_popover(
-                &image_overlay_for_click,
+                &pin_content_for_click,
                 &window_for_click,
                 state_for_click.clone(),
                 image_path_for_click.clone(),
@@ -2681,28 +2759,28 @@ fn present_pin_window(app: &adw::Application, state: Arc<ServiceState>, image_pa
             );
         }
     });
-    image_overlay.add_controller(click);
+    pin_content.add_controller(click);
 
     let pin_motion = gtk::EventControllerMotion::new();
-    let image_overlay_for_motion = image_overlay.clone();
+    let pin_content_for_motion = pin_content.clone();
     pin_motion.connect_motion(move |_, x, y| {
         if let Some(edge) = pin_resize_edge_at(
             x,
             y,
-            image_overlay_for_motion.allocated_width(),
-            image_overlay_for_motion.allocated_height(),
+            pin_content_for_motion.allocated_width(),
+            pin_content_for_motion.allocated_height(),
             8.0,
         ) {
-            image_overlay_for_motion.set_cursor_from_name(Some(cursor_name_for_surface_edge(edge)));
+            pin_content_for_motion.set_cursor_from_name(Some(cursor_name_for_surface_edge(edge)));
         } else {
-            image_overlay_for_motion.set_cursor_from_name(Some("move"));
+            pin_content_for_motion.set_cursor_from_name(Some("move"));
         }
     });
-    let image_overlay_for_leave = image_overlay.clone();
+    let pin_content_for_leave = pin_content.clone();
     pin_motion.connect_leave(move |_| {
-        image_overlay_for_leave.set_cursor(None);
+        pin_content_for_leave.set_cursor(None);
     });
-    image_overlay.add_controller(pin_motion);
+    pin_content.add_controller(pin_motion);
 
     window.set_content(Some(&image_overlay));
     window.present();
@@ -2731,11 +2809,11 @@ fn action_text_button(icon_name: &str, label: &str, tooltip: &str) -> Button {
 }
 
 fn output_action_primary_label() -> &'static str {
-    "Done"
+    "Copy & Exit"
 }
 
 fn output_action_menu_items() -> [&'static str; 3] {
-    ["Save", "Save To", "Copy & Close"]
+    ["Save", "Save To", "Save & Exit"]
 }
 
 fn output_actions_menu(save: &Button, save_to: &Button, copy_close: &Button) -> MenuButton {
@@ -2766,6 +2844,70 @@ fn output_actions_menu(save: &Button, save_to: &Button, copy_close: &Button) -> 
     menu
 }
 
+fn filter_font_families(families: &[String], query: &str, limit: usize) -> Vec<String> {
+    let query = query.trim().to_lowercase();
+    let mut matches = families
+        .iter()
+        .filter(|family| query.is_empty() || family.to_lowercase().contains(&query))
+        .cloned()
+        .collect::<Vec<_>>();
+    matches.sort_by_key(|family| family.to_lowercase());
+    matches.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+    matches.truncate(limit);
+    matches
+}
+
+fn font_family_preview_markup(family: &str) -> String {
+    let family = glib::markup_escape_text(family);
+    format!("<span font_family=\"{family}\" size=\"large\">{family}</span>")
+}
+
+fn font_family_sample_markup(family: &str) -> String {
+    let family = glib::markup_escape_text(family);
+    format!("<span font_family=\"{family}\">Aa Bb 123</span>")
+}
+
+fn font_family_row_fixed_height() -> Option<i32> {
+    None
+}
+
+fn font_family_row_content_halign() -> Align {
+    Align::Center
+}
+
+fn font_family_row_text_xalign() -> f32 {
+    0.5
+}
+
+#[cfg(test)]
+fn text_size_options() -> [u32; 7] {
+    TEXT_SIZE_OPTIONS
+}
+
+fn text_size_wheel_options() -> Vec<u32> {
+    (TEXT_SIZE_MIN..=TEXT_SIZE_MAX).step_by(2).collect()
+}
+
+fn clamp_text_size(size: u32) -> u32 {
+    size.clamp(TEXT_SIZE_MIN, TEXT_SIZE_MAX)
+}
+
+fn text_size_label(size: u32) -> String {
+    format!("{}px", clamp_text_size(size))
+}
+
+fn text_font_button_width() -> i32 {
+    TEXT_FONT_BUTTON_WIDTH
+}
+
+fn text_size_button_width() -> i32 {
+    TEXT_SIZE_BUTTON_WIDTH
+}
+
+fn text_controls_width() -> i32 {
+    text_font_button_width() + text_size_button_width() + TEXT_CONTROL_GAP
+}
+
 fn set_button_loading(button: &Button, loading: bool) {
     button.set_sensitive(!loading);
     if loading {
@@ -2785,6 +2927,14 @@ fn pin_window_size_for_scale(image_width: u32, image_height: u32, scale: f64) ->
     pin_display_size(image_width, image_height, scale)
 }
 
+fn pin_picture_size(image_width: u32, image_height: u32, scale: f64) -> (i32, i32) {
+    pin_display_size(image_width, image_height, scale)
+}
+
+fn pin_picture_can_target() -> bool {
+    false
+}
+
 fn pin_initial_scale(
     image_width: u32,
     image_height: u32,
@@ -2802,25 +2952,27 @@ fn pin_initial_scale_with_saved(
     saved_scale: f64,
 ) -> f64 {
     if (saved_scale - 1.0).abs() > f64::EPSILON {
-        saved_scale.clamp(0.1, 8.0)
+        saved_scale.clamp(PIN_MIN_SCALE, PIN_MAX_SCALE)
     } else {
         pin_initial_scale(image_width, image_height, window_width, window_height)
     }
 }
 
 fn pin_zoom_from_scroll(current: f64, dy: f64) -> f64 {
-    let factor = if dy < 0.0 {
-        1.1
-    } else if dy > 0.0 {
-        1.0 / 1.1
-    } else {
-        1.0
-    };
-    (current * factor).clamp(0.1, 8.0)
+    let factor = if dy.abs() > f64::EPSILON { 1.1_f64.powf(-dy) } else { 1.0 };
+    (current * factor).clamp(PIN_MIN_SCALE, PIN_MAX_SCALE)
+}
+
+fn next_pin_scale_save_generation(current: u64) -> u64 {
+    current.wrapping_add(1)
+}
+
+fn pin_scale_save_generation_is_current(current: u64, scheduled: u64) -> bool {
+    current == scheduled
 }
 
 fn pin_display_size(image_width: u32, image_height: u32, scale: f64) -> (i32, i32) {
-    let scale = scale.clamp(0.1, 8.0);
+    let scale = scale.clamp(PIN_MIN_SCALE, PIN_MAX_SCALE);
     (
         (image_width.max(1) as f64 * scale).round().max(1.0) as i32,
         (image_height.max(1) as f64 * scale).round().max(1.0) as i32,
@@ -2948,7 +3100,7 @@ fn cursor_name_for_surface_edge(edge: gtk::gdk::SurfaceEdge) -> &'static str {
 }
 
 fn show_pin_context_popover(
-    anchor: &Overlay,
+    anchor: &impl IsA<gtk::Widget>,
     window: &ApplicationWindow,
     state: Arc<ServiceState>,
     image_path: PathBuf,
@@ -3073,16 +3225,18 @@ fn save_pinned_image_with_filename(
 fn apply_pin_zoom(
     window: &ApplicationWindow,
     image_overlay: &Overlay,
+    pin_content: &GtkBox,
     picture: &Picture,
     dimension_label: &Label,
     image_width: u32,
     image_height: u32,
     scale: f64,
 ) {
-    let (display_width, display_height) = pin_display_size(image_width, image_height, scale);
+    let (display_width, display_height) = pin_picture_size(image_width, image_height, scale);
     let (window_width, window_height) = pin_window_size_for_scale(image_width, image_height, scale);
     window.set_default_size(window_width, window_height);
     image_overlay.set_size_request(display_width, display_height);
+    pin_content.set_size_request(display_width, display_height);
     picture.set_size_request(display_width, display_height);
     dimension_label.set_text(&pin_dimension_label(
         image_width,
@@ -3309,6 +3463,107 @@ fn install_editor_css() {
             min-height: 30px;
             border-radius: 7px;
         }
+        .ashot-font-menu-button {
+            padding: 0 8px;
+        }
+        .ashot-font-menu-content {
+            min-width: 0;
+        }
+        .ashot-font-menu-label {
+            font-weight: 600;
+            min-width: 80px;
+        }
+        .ashot-font-popover {
+            padding: 2px;
+        }
+        .ashot-font-search {
+            min-height: 34px;
+            margin-bottom: 2px;
+        }
+        .ashot-font-list {
+            border-radius: 10px;
+            border: 1px solid alpha(currentColor, 0.08);
+            background: alpha(@view_bg_color, 0.42);
+            padding: 2px;
+        }
+        .ashot-font-row {
+            padding: 7px 9px;
+            border-radius: 7px;
+            border-width: 0 0 1px 0;
+            border-style: solid;
+            border-color: alpha(currentColor, 0.08);
+            box-shadow: none;
+            background: transparent;
+        }
+        .ashot-font-row:hover {
+            background: alpha(@accent_bg_color, 0.08);
+        }
+        .ashot-font-row-selected {
+            background: alpha(@accent_bg_color, 0.12);
+            border-color: alpha(@accent_bg_color, 0.22);
+        }
+        .ashot-font-check {
+            color: @accent_bg_color;
+        }
+        .ashot-font-preview-name {
+            font-weight: 650;
+        }
+        .ashot-font-preview-sample {
+            font-size: 0.82em;
+        }
+        .ashot-text-size-menu-button {
+            min-height: 32px;
+            padding: 0 5px;
+        }
+        .ashot-text-size-glyph {
+            font-weight: 800;
+            font-size: 0.86em;
+            color: alpha(currentColor, 0.64);
+        }
+        .ashot-text-size-value {
+            font-weight: 700;
+            font-size: 0.92em;
+            min-width: 18px;
+        }
+        .ashot-text-size-popover {
+            min-width: 112px;
+            padding: 2px;
+        }
+        .ashot-text-size-title {
+            font-weight: 700;
+            font-size: 0.82em;
+            color: alpha(currentColor, 0.66);
+        }
+        .ashot-text-size-wheel-scroll {
+            border-radius: 10px;
+            border: 1px solid alpha(currentColor, 0.08);
+            background: alpha(@view_bg_color, 0.42);
+            padding: 3px;
+        }
+        .ashot-text-size-wheel {
+            padding: 2px;
+        }
+        .ashot-text-size-option {
+            min-width: 70px;
+            min-height: 30px;
+            border-radius: 8px;
+            font-weight: 700;
+            background: transparent;
+        }
+        .ashot-text-size-option:hover {
+            background: alpha(@accent_bg_color, 0.10);
+        }
+        .ashot-text-size-option-selected {
+            color: @accent_fg_color;
+            background: @accent_bg_color;
+        }
+        .ashot-text-size-custom-row {
+            border-top: 1px solid alpha(currentColor, 0.08);
+            padding-top: 8px;
+        }
+        .ashot-text-size-spin {
+            min-width: 76px;
+        }
         .ashot-compact-check {
             margin-top: -2px;
             font-size: 0.86em;
@@ -3416,16 +3671,16 @@ fn editor_tool_layout() -> [(&'static str, DefaultTool); 12] {
 fn tool_icon_label(tool: DefaultTool) -> &'static str {
     match tool {
         DefaultTool::Select => "↖",
-        DefaultTool::Brush => "✎",
+        DefaultTool::Brush => "✐",
         DefaultTool::Line => "╱",
         DefaultTool::Arrow => "➜",
         DefaultTool::Rectangle => "□",
         DefaultTool::Ellipse => "○",
-        DefaultTool::Marker => "▰",
+        DefaultTool::Marker => "◎",
         DefaultTool::Text => "T",
-        DefaultTool::Counter => "#",
+        DefaultTool::Counter => "①",
         DefaultTool::Mosaic => "▦",
-        DefaultTool::Blur => "◌",
+        DefaultTool::Blur => "▒",
         DefaultTool::FilledBox => "■",
         DefaultTool::Ocr => "OCR",
         DefaultTool::ColorPicker => "◉",
@@ -3481,13 +3736,19 @@ fn draw_tool_icon(
             let _ = cr.stroke();
         }
         DefaultTool::Brush => {
-            cr.move_to(6.0, 18.0);
-            cr.curve_to(9.0, 17.0, 10.0, 15.0, 11.2, 12.2);
-            cr.line_to(17.2, 6.2);
-            cr.move_to(13.8, 8.2);
-            cr.line_to(16.2, 10.6);
-            cr.move_to(5.4, 19.0);
-            cr.curve_to(7.6, 21.0, 11.0, 20.7, 12.7, 18.6);
+            cr.move_to(5.2, 18.7);
+            cr.line_to(6.9, 14.0);
+            cr.line_to(16.6, 4.2);
+            cr.line_to(20.0, 7.6);
+            cr.line_to(10.2, 17.2);
+            cr.close_path();
+            let _ = cr.stroke();
+            cr.move_to(7.0, 14.0);
+            cr.line_to(10.1, 17.1);
+            cr.move_to(16.0, 4.9);
+            cr.line_to(19.3, 8.2);
+            cr.move_to(4.5, 19.4);
+            cr.curve_to(6.4, 20.6, 8.8, 20.1, 10.5, 18.4);
             let _ = cr.stroke();
         }
         DefaultTool::Line => {
@@ -3517,12 +3778,43 @@ fn draw_tool_icon(
             let _ = cr.stroke();
         }
         DefaultTool::Marker => {
-            draw_round_rect(cr, 6.0, 7.0, 12.0, 8.0, 2.0);
+            let icon_r = color.red() as f64;
+            let icon_g = color.green() as f64;
+            let icon_b = color.blue() as f64;
+            let icon_a = color.alpha() as f64;
+
+            cr.set_source_rgba(icon_r, icon_g, icon_b, icon_a * 0.18);
+            cr.move_to(8.0, 8.6);
+            cr.line_to(4.6, 18.2);
+            cr.line_to(19.8, 18.2);
+            cr.close_path();
+            let _ = cr.fill();
+
+            cr.set_source_rgba(icon_r, icon_g, icon_b, icon_a);
+            cr.move_to(8.0, 8.6);
+            cr.line_to(4.6, 18.2);
+            cr.move_to(8.0, 8.6);
+            cr.line_to(19.8, 18.2);
             let _ = cr.stroke();
-            cr.move_to(8.0, 18.0);
-            cr.line_to(16.0, 18.0);
-            cr.move_to(9.2, 10.8);
-            cr.line_to(14.8, 10.8);
+
+            cr.set_source_rgba(icon_r, icon_g, icon_b, icon_a * 0.36);
+            draw_round_rect(cr, 4.4, 16.5, 15.8, 4.0, 1.8);
+            let _ = cr.fill();
+
+            cr.set_source_rgba(icon_r, icon_g, icon_b, icon_a);
+            let _ = cr.save();
+            cr.translate(7.6, 6.7);
+            cr.rotate(-0.48);
+            draw_round_rect(cr, -3.5, -2.4, 7.0, 4.8, 2.1);
+            let _ = cr.stroke();
+            cr.arc(1.4, 0.0, 1.3, 0.0, std::f64::consts::TAU);
+            let _ = cr.stroke();
+            let _ = cr.restore();
+
+            cr.arc(12.1, 15.0, 1.5, 0.0, std::f64::consts::TAU);
+            let _ = cr.stroke();
+            cr.move_to(5.0, 21.0);
+            cr.line_to(19.4, 21.0);
             let _ = cr.stroke();
         }
         DefaultTool::Text => {
@@ -3535,35 +3827,44 @@ fn draw_tool_icon(
             let _ = cr.stroke();
         }
         DefaultTool::Counter => {
-            cr.arc(12.0, 12.0, 7.2, 0.0, std::f64::consts::TAU);
+            cr.arc(12.0, 12.0, 8.0, 0.0, std::f64::consts::TAU);
             let _ = cr.stroke();
-            cr.move_to(9.0, 12.0);
-            cr.line_to(15.0, 12.0);
-            cr.move_to(10.0, 9.5);
-            cr.line_to(10.0, 14.5);
-            cr.move_to(14.0, 9.5);
-            cr.line_to(14.0, 14.5);
+            cr.move_to(10.4, 10.4);
+            cr.line_to(12.4, 9.0);
+            cr.line_to(12.4, 15.4);
+            cr.move_to(10.7, 15.4);
+            cr.line_to(14.3, 15.4);
             let _ = cr.stroke();
         }
         DefaultTool::Mosaic => {
-            for y in 0..3 {
-                for x in 0..3 {
-                    draw_round_rect(
-                        cr,
-                        6.0 + x as f64 * 4.25,
-                        6.0 + y as f64 * 4.25,
-                        2.8,
-                        2.8,
-                        0.8,
-                    );
-                }
+            let cells = [
+                (5.4, 5.4, 4.0),
+                (10.1, 5.4, 3.2),
+                (14.1, 5.4, 4.5),
+                (5.4, 10.1, 3.4),
+                (9.4, 9.5, 5.1),
+                (15.0, 10.2, 3.6),
+                (5.4, 14.2, 4.7),
+                (10.6, 15.0, 3.5),
+                (14.8, 14.4, 4.2),
+            ];
+            draw_round_rect(cr, 4.6, 4.6, 15.0, 15.0, 2.0);
+            let _ = cr.stroke();
+            for (x, y, side) in cells {
+                draw_round_rect(cr, x, y, side, side, 0.8);
             }
             let _ = cr.fill();
         }
         DefaultTool::Blur => {
-            cr.arc(9.0, 12.0, 3.2, 0.0, std::f64::consts::TAU);
-            cr.arc(14.0, 10.0, 3.0, 0.0, std::f64::consts::TAU);
-            cr.arc(14.5, 15.0, 2.5, 0.0, std::f64::consts::TAU);
+            draw_round_rect(cr, 5.5, 6.0, 13.0, 12.0, 2.4);
+            let _ = cr.stroke();
+            for y in [8.0, 11.0, 14.0, 17.0] {
+                cr.move_to(4.6, y);
+                cr.curve_to(8.0, y - 1.5, 11.2, y + 1.5, 14.6, y);
+                cr.curve_to(16.8, y - 0.8, 18.2, y - 0.4, 20.0, y + 0.8);
+            }
+            cr.move_to(7.0, 5.0);
+            cr.line_to(17.0, 19.0);
             let _ = cr.stroke();
         }
         DefaultTool::FilledBox => {
@@ -4470,7 +4771,7 @@ fn color_picker_section(
     let header_preview = selected_color_preview(active_color.clone());
     header.append(&header_preview);
 
-    let menu_button = MenuButton::new();
+    let menu_button = Button::new();
     menu_button.set_label(&color_to_hex(active_color.get()));
     menu_button.set_tooltip_text(Some("Open color picker"));
     menu_button.set_size_request(COLOR_VALUE_BUTTON_WIDTH, COLOR_VALUE_BUTTON_HEIGHT);
@@ -5039,7 +5340,442 @@ fn color_picker_section(
 
     refresh_ui(active_color.get());
     popover.set_child(Some(&root));
-    menu_button.set_popover(Some(&popover));
+    popover.set_parent(&menu_button);
+    let popover_for_click = popover.clone();
+    menu_button.connect_clicked(move |_| {
+        popover_for_click.popup();
+    });
+    container
+}
+
+fn text_font_label(family: Option<&str>) -> String {
+    family.filter(|family| !family.trim().is_empty()).unwrap_or("System Font").to_string()
+}
+
+fn update_text_font_menu_label(label: &Label, family: Option<&str>) {
+    label.set_text(&text_font_label(family));
+}
+
+fn installed_font_families_from_widget(widget: &impl IsA<gtk::Widget>) -> Vec<String> {
+    let context = widget.pango_context();
+    let mut families = context
+        .list_families()
+        .into_iter()
+        .map(|family| family.name().to_string())
+        .collect::<Vec<_>>();
+    families.sort_by_key(|family| family.to_lowercase());
+    families.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+    families
+}
+
+fn text_font_row_button(selected: bool) -> (Button, GtkBox) {
+    let button = Button::new();
+    button.add_css_class("flat");
+    button.add_css_class("ashot-font-row");
+    if selected {
+        button.add_css_class("ashot-font-row-selected");
+    }
+    button.set_hexpand(true);
+    if let Some(height) = font_family_row_fixed_height() {
+        button.set_size_request(-1, height);
+    }
+
+    let row = GtkBox::new(Orientation::Horizontal, 9);
+    row.set_hexpand(false);
+    row.set_halign(font_family_row_content_halign());
+    row.set_valign(Align::Center);
+
+    let check = gtk::Image::from_icon_name("object-select-symbolic");
+    check.set_visible(true);
+    check.set_opacity(if selected { 1.0 } else { 0.0 });
+    check.set_size_request(16, 16);
+    check.set_valign(Align::Center);
+    check.add_css_class("ashot-font-check");
+    row.append(&check);
+
+    (button, row)
+}
+
+fn append_font_row_balance_spacer(row: &GtkBox) {
+    let spacer = GtkBox::new(Orientation::Horizontal, 0);
+    spacer.set_size_request(16, 16);
+    spacer.set_can_target(false);
+    row.append(&spacer);
+}
+
+fn configure_font_row_label(label: &Label) {
+    label.set_xalign(font_family_row_text_xalign());
+    label.set_halign(font_family_row_content_halign());
+    label.set_justify(gtk::Justification::Center);
+}
+
+fn text_font_system_row_button(selected: bool) -> Button {
+    let (button, row) = text_font_row_button(selected);
+    let text = GtkBox::new(Orientation::Vertical, 1);
+    text.set_hexpand(false);
+    text.set_halign(font_family_row_content_halign());
+    text.set_valign(Align::Center);
+
+    let title = Label::new(Some("System Font"));
+    configure_font_row_label(&title);
+    title.add_css_class("ashot-font-preview-name");
+    let subtitle = Label::new(Some("Follow desktop font fallback"));
+    configure_font_row_label(&subtitle);
+    subtitle.add_css_class("dim-label");
+    subtitle.add_css_class("ashot-font-preview-sample");
+    text.append(&title);
+    text.append(&subtitle);
+    row.append(&text);
+    append_font_row_balance_spacer(&row);
+    button.set_child(Some(&row));
+    button
+}
+
+fn text_font_family_row_button(family: &str, selected: bool) -> Button {
+    let (button, row) = text_font_row_button(selected);
+    button.set_tooltip_text(Some(family));
+
+    let text = GtkBox::new(Orientation::Vertical, 1);
+    text.set_hexpand(false);
+    text.set_halign(font_family_row_content_halign());
+    text.set_valign(Align::Center);
+    let name = Label::new(None);
+    configure_font_row_label(&name);
+    name.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    name.add_css_class("ashot-font-preview-name");
+    name.set_markup(&font_family_preview_markup(family));
+    let sample = Label::new(None);
+    configure_font_row_label(&sample);
+    sample.add_css_class("dim-label");
+    sample.add_css_class("ashot-font-preview-sample");
+    sample.set_markup(&font_family_sample_markup(family));
+    text.append(&name);
+    text.append(&sample);
+    row.append(&text);
+    append_font_row_balance_spacer(&row);
+    button.set_child(Some(&row));
+    button
+}
+
+#[allow(clippy::too_many_arguments)]
+fn text_font_selector(
+    active_text_family: Rc<RefCell<Option<String>>>,
+    document: Rc<RefCell<Document>>,
+    history: Rc<RefCell<EditorHistory>>,
+    canvas: DrawingArea,
+    undo: Button,
+    redo: Button,
+    state: Arc<ServiceState>,
+    refresh_status: StatusCallback,
+    queue_render_cache: Rc<dyn Fn()>,
+) -> GtkBox {
+    let container = GtkBox::new(Orientation::Horizontal, 8);
+    container.add_css_class("ashot-stroke-control");
+    container.add_css_class("ashot-text-font-control");
+    container.set_size_request(text_font_button_width(), -1);
+
+    let menu_button = Button::new();
+    let menu_content = GtkBox::new(Orientation::Horizontal, 6);
+    menu_content.set_halign(Align::Center);
+    menu_content.add_css_class("ashot-font-menu-content");
+    let menu_label = Label::new(None);
+    update_text_font_menu_label(&menu_label, active_text_family.borrow().as_deref());
+    menu_label.set_xalign(0.5);
+    menu_label.set_width_chars(8);
+    menu_label.set_max_width_chars(8);
+    menu_label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    menu_label.add_css_class("ashot-font-menu-label");
+    menu_content.append(&menu_label);
+    menu_content.append(&gtk::Image::from_icon_name("pan-down-symbolic"));
+    menu_button.set_child(Some(&menu_content));
+    menu_button.set_tooltip_text(Some("Text font"));
+    menu_button.set_hexpand(false);
+    menu_button.set_size_request(text_font_button_width() - 10, 32);
+    menu_button.add_css_class("ashot-compact-menu");
+    menu_button.add_css_class("ashot-font-menu-button");
+    container.append(&menu_button);
+
+    let popover = Popover::new();
+    let root = GtkBox::new(Orientation::Vertical, 6);
+    root.add_css_class("ashot-popover-panel");
+    root.add_css_class("ashot-font-popover");
+    root.set_margin_top(8);
+    root.set_margin_bottom(8);
+    root.set_margin_start(8);
+    root.set_margin_end(8);
+    root.set_size_request(286, -1);
+
+    let search = Entry::new();
+    search.set_placeholder_text(Some("Search fonts"));
+    search.add_css_class("ashot-font-search");
+    root.append(&search);
+
+    let list = GtkBox::new(Orientation::Vertical, 3);
+    list.add_css_class("ashot-font-list");
+    let scrolled = ScrolledWindow::builder()
+        .hscrollbar_policy(PolicyType::Never)
+        .vscrollbar_policy(PolicyType::Automatic)
+        .min_content_height(180)
+        .max_content_height(240)
+        .child(&list)
+        .build();
+    root.append(&scrolled);
+
+    let families = Rc::new(installed_font_families_from_widget(&canvas));
+    let select_family: Rc<dyn Fn(Option<String>)> = {
+        let active_text_family = active_text_family.clone();
+        let document = document.clone();
+        let history = history.clone();
+        let canvas = canvas.clone();
+        let undo = undo.clone();
+        let redo = redo.clone();
+        let state = state.clone();
+        let refresh_status = refresh_status.clone();
+        let queue_render_cache = queue_render_cache.clone();
+        let menu_label = menu_label.clone();
+        let popover_for_select = popover.clone();
+        Rc::new(move |family: Option<String>| {
+            if let Ok(mut active_text_family) = active_text_family.try_borrow_mut() {
+                *active_text_family = family.clone();
+            }
+            persist_config_change(&state, |config| {
+                config.default_text_family = family.clone();
+            });
+
+            let style_changed = if let Ok(mut document) = document.try_borrow_mut() {
+                if document.active_tool == DefaultTool::Select && document.selected.is_some() {
+                    let before = document.annotations.clone();
+                    if document.apply_font_family_to_selected(family.clone()) {
+                        if let Ok(mut history) = history.try_borrow_mut() {
+                            history.snapshot(&before);
+                        }
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+
+            update_text_font_menu_label(&menu_label, family.as_deref());
+            if style_changed {
+                update_history_action_buttons(&history, &undo, &redo);
+                queue_render_cache();
+                canvas.queue_draw();
+            }
+            refresh_status(None);
+            popover_for_select.popdown();
+        })
+    };
+
+    let refresh_list: Rc<dyn Fn(&str)> = {
+        let families = families.clone();
+        let list = list.clone();
+        let select_family = select_family.clone();
+        let active_text_family = active_text_family.clone();
+        Rc::new(move |query: &str| {
+            while let Some(child) = list.first_child() {
+                list.remove(&child);
+            }
+
+            let current_family =
+                active_text_family.try_borrow().ok().and_then(|family| family.clone());
+            let system = text_font_system_row_button(current_family.is_none());
+            let select_system = select_family.clone();
+            system.connect_clicked(move |_| {
+                select_system(None);
+            });
+            list.append(&system);
+
+            let filtered = filter_font_families(&families, query, 32);
+            if filtered.is_empty() && !query.trim().is_empty() {
+                let empty = Label::new(Some("No fonts found"));
+                empty.add_css_class("dim-label");
+                empty.set_xalign(0.0);
+                list.append(&empty);
+                return;
+            }
+
+            for family in filtered {
+                let selected = current_family.as_deref() == Some(family.as_str());
+                let button = text_font_family_row_button(&family, selected);
+                let select_family_for_button = select_family.clone();
+                button.connect_clicked(move |_| {
+                    select_family_for_button(Some(family.clone()));
+                });
+                list.append(&button);
+            }
+        })
+    };
+
+    let refresh_for_search = refresh_list.clone();
+    search.connect_changed(move |entry| {
+        refresh_for_search(entry.text().as_str());
+    });
+    refresh_list("");
+
+    popover.set_child(Some(&root));
+    popover.set_parent(&menu_button);
+    let popover_for_click = popover.clone();
+    menu_button.connect_clicked(move |_| {
+        popover_for_click.popup();
+    });
+    container
+}
+
+#[allow(clippy::too_many_arguments)]
+fn text_size_selector(
+    active_text_size: Rc<Cell<u32>>,
+    document: Rc<RefCell<Document>>,
+    history: Rc<RefCell<EditorHistory>>,
+    canvas: DrawingArea,
+    undo: Button,
+    redo: Button,
+    state: Arc<ServiceState>,
+    refresh_status: StatusCallback,
+    queue_render_cache: Rc<dyn Fn()>,
+) -> GtkBox {
+    let container = GtkBox::new(Orientation::Horizontal, 0);
+    container.add_css_class("ashot-stroke-control");
+    container.add_css_class("ashot-text-size-control");
+    container.set_size_request(text_size_button_width(), -1);
+
+    let menu_button = Button::new();
+    menu_button.set_tooltip_text(Some("Text size"));
+    menu_button.add_css_class("ashot-compact-menu");
+    menu_button.add_css_class("ashot-text-size-menu-button");
+    menu_button.set_size_request(text_size_button_width() - 10, 32);
+
+    let menu_content = GtkBox::new(Orientation::Horizontal, 4);
+    menu_content.set_halign(Align::Center);
+    let preview = Label::new(Some("T"));
+    preview.add_css_class("ashot-text-size-glyph");
+    let value_label = Label::new(Some(&clamp_text_size(active_text_size.get()).to_string()));
+    value_label.add_css_class("ashot-text-size-value");
+    menu_content.append(&preview);
+    menu_content.append(&value_label);
+    menu_content.append(&gtk::Image::from_icon_name("pan-down-symbolic"));
+    menu_button.set_child(Some(&menu_content));
+    menu_button.set_hexpand(false);
+
+    let popover = Popover::new();
+    let root = GtkBox::new(Orientation::Vertical, 6);
+    root.add_css_class("ashot-popover-panel");
+    root.add_css_class("ashot-text-size-popover");
+    root.set_margin_top(7);
+    root.set_margin_bottom(7);
+    root.set_margin_start(7);
+    root.set_margin_end(7);
+
+    let wheel_title = Label::new(Some("Size"));
+    wheel_title.set_xalign(0.5);
+    wheel_title.add_css_class("ashot-text-size-title");
+    root.append(&wheel_title);
+
+    let wheel_list = GtkBox::new(Orientation::Vertical, 2);
+    wheel_list.add_css_class("ashot-text-size-wheel");
+    let size_buttons: Rc<RefCell<Vec<(u32, Button)>>> = Rc::new(RefCell::new(Vec::new()));
+    let update_size_buttons: Rc<dyn Fn(u32)> = {
+        let size_buttons = size_buttons.clone();
+        Rc::new(move |size| {
+            if let Ok(size_buttons) = size_buttons.try_borrow() {
+                for (button_size, button) in size_buttons.iter() {
+                    if *button_size == size {
+                        button.add_css_class("ashot-text-size-option-selected");
+                    } else {
+                        button.remove_css_class("ashot-text-size-option-selected");
+                    }
+                }
+            }
+        })
+    };
+
+    let apply_size: Rc<dyn Fn(u32)> = {
+        let active_text_size = active_text_size.clone();
+        let document = document.clone();
+        let history = history.clone();
+        let canvas = canvas.clone();
+        let undo = undo.clone();
+        let redo = redo.clone();
+        let state = state.clone();
+        let refresh_status = refresh_status.clone();
+        let queue_render_cache = queue_render_cache.clone();
+        let value_label = value_label.clone();
+        let update_size_buttons = update_size_buttons.clone();
+        Rc::new(move |size| {
+            let size = clamp_text_size(size);
+            active_text_size.set(size);
+            persist_config_change(&state, |config| {
+                config.default_text_size = size;
+            });
+
+            let style_changed = if let Ok(mut document) = document.try_borrow_mut() {
+                if document.active_tool == DefaultTool::Select && document.selected.is_some() {
+                    let before = document.annotations.clone();
+                    if document.apply_text_size_to_selected(size) {
+                        if let Ok(mut history) = history.try_borrow_mut() {
+                            history.snapshot(&before);
+                        }
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+
+            value_label.set_text(&size.to_string());
+            update_size_buttons(size);
+            if style_changed {
+                update_history_action_buttons(&history, &undo, &redo);
+                queue_render_cache();
+                canvas.queue_draw();
+            }
+            refresh_status(None);
+        })
+    };
+
+    for size in text_size_wheel_options() {
+        let button = Button::with_label(&size.to_string());
+        button.add_css_class("flat");
+        button.add_css_class("ashot-text-size-option");
+        button.set_tooltip_text(Some(&format!("Use {} text", text_size_label(size))));
+        if size == active_text_size.get() {
+            button.add_css_class("ashot-text-size-option-selected");
+        }
+        let apply_size_for_button = apply_size.clone();
+        button.connect_clicked(move |_| {
+            apply_size_for_button(size);
+        });
+        wheel_list.append(&button);
+        size_buttons.borrow_mut().push((size, button));
+    }
+
+    let scrolled = ScrolledWindow::builder()
+        .hscrollbar_policy(PolicyType::Never)
+        .vscrollbar_policy(PolicyType::Automatic)
+        .min_content_width(90)
+        .max_content_width(90)
+        .min_content_height(176)
+        .max_content_height(176)
+        .child(&wheel_list)
+        .build();
+    scrolled.add_css_class("ashot-text-size-wheel-scroll");
+    root.append(&scrolled);
+
+    popover.set_child(Some(&root));
+    popover.set_parent(&menu_button);
+    let popover_for_click = popover.clone();
+    menu_button.connect_clicked(move |_| {
+        popover_for_click.popup();
+    });
+    container.append(&menu_button);
     container
 }
 
@@ -5398,6 +6134,21 @@ fn tool_picks_canvas_color(tool: DefaultTool) -> bool {
 fn annotation_shows_selection_overlay(annotation: &Annotation) -> bool {
     matches!(
         annotation.data,
+        AnnotationData::Text { .. }
+            | AnnotationData::Line { .. }
+            | AnnotationData::Arrow { .. }
+            | AnnotationData::Rectangle { .. }
+            | AnnotationData::Ellipse { .. }
+            | AnnotationData::Mosaic { .. }
+            | AnnotationData::Blur { .. }
+            | AnnotationData::Counter { .. }
+            | AnnotationData::FilledBox { .. }
+    )
+}
+
+fn annotation_has_resize_handles(annotation: &Annotation) -> bool {
+    matches!(
+        annotation.data,
         AnnotationData::Line { .. }
             | AnnotationData::Arrow { .. }
             | AnnotationData::Rectangle { .. }
@@ -5410,7 +6161,7 @@ fn annotation_shows_selection_overlay(annotation: &Annotation) -> bool {
 }
 
 fn annotation_keeps_selection_after_creation(annotation: &Annotation) -> bool {
-    annotation_shows_selection_overlay(annotation)
+    annotation_has_resize_handles(annotation)
 }
 
 fn selected_annotation_bounds(document: &Document) -> Option<Rect> {
@@ -5419,6 +6170,26 @@ fn selected_annotation_bounds(document: &Document) -> Option<Rect> {
         .annotations
         .iter()
         .find(|annotation| annotation.id == id && annotation_shows_selection_overlay(annotation))
+        .map(Annotation::bounds)
+}
+
+fn selected_annotation_has_resize_handles(document: &Document) -> bool {
+    let Some(id) = document.selected else {
+        return false;
+    };
+    document
+        .annotations
+        .iter()
+        .find(|annotation| annotation.id == id)
+        .is_some_and(annotation_has_resize_handles)
+}
+
+fn selected_resizable_annotation_bounds(document: &Document) -> Option<Rect> {
+    let id = document.selected?;
+    document
+        .annotations
+        .iter()
+        .find(|annotation| annotation.id == id && annotation_has_resize_handles(annotation))
         .map(Annotation::bounds)
 }
 
@@ -5442,7 +6213,7 @@ fn resize_handle_points(rect: Rect) -> [(ResizeHandle, Point); 8] {
 }
 
 fn resize_handle_at(document: &Document, point: Point, tolerance: f32) -> Option<ResizeHandle> {
-    let bounds = selected_annotation_bounds(document)?;
+    let bounds = selected_resizable_annotation_bounds(document)?;
     resize_handle_points(bounds).iter().find_map(|(handle, center)| {
         let dx = point.x - center.x;
         let dy = point.y - center.y;
@@ -5450,12 +6221,17 @@ fn resize_handle_at(document: &Document, point: Point, tolerance: f32) -> Option
     })
 }
 
-fn draw_selection_overlay(cr: &gtk::cairo::Context, rect: Rect) {
+fn draw_selection_overlay(cr: &gtk::cairo::Context, rect: Rect, show_handles: bool) {
     let _ = cr.save();
     cr.set_source_rgba(0.13, 0.48, 0.95, 0.88);
     cr.set_line_width(1.4);
     cr.rectangle(rect.x as f64, rect.y as f64, rect.width as f64, rect.height as f64);
     let _ = cr.stroke();
+
+    if !show_handles {
+        let _ = cr.restore();
+        return;
+    }
 
     for (_, center) in resize_handle_points(rect) {
         cr.set_source_rgba(1.0, 1.0, 1.0, 0.96);
@@ -5488,6 +6264,8 @@ struct ActiveTextEdit {
     id: Option<ashot_core::AnnotationId>,
     origin: Point,
     color: Color,
+    family: Option<String>,
+    size: u32,
 }
 
 fn position_text_entry(entry: &Entry, x: f64, y: f64) {
@@ -5571,7 +6349,12 @@ fn commit_text_entry(
             document.add_annotation(Annotation::new(AnnotationData::Text {
                 origin: edit.origin,
                 text,
-                style: TextStyle { size: 20, weight: TextWeight::Bold, color: edit.color },
+                style: TextStyle {
+                    size: edit.size,
+                    weight: TextWeight::Bold,
+                    color: edit.color,
+                    family: edit.family,
+                },
             }));
         }
         true
@@ -5648,7 +6431,7 @@ impl DraftAnnotation {
             })),
             DefaultTool::Marker => Some(Annotation::new(AnnotationData::Marker {
                 points: self.points.clone(),
-                color: Color::rgba(self.color.r, self.color.g, self.color.b, 96),
+                color: marker_highlight_color(self.color),
                 stroke_width: self.stroke_width.max(8),
             })),
             DefaultTool::Mosaic => Some(Annotation::new(AnnotationData::Mosaic {
@@ -5929,18 +6712,7 @@ fn draw_blur_preview(cr: &gtk::cairo::Context, rect: Rect, radius: u32) {
 fn draw_annotation(cr: &gtk::cairo::Context, annotation: &Annotation) {
     match &annotation.data {
         AnnotationData::Text { origin, text, style } => {
-            set_cairo_color(cr, style.color);
-            cr.select_font_face(
-                "Sans",
-                gtk::cairo::FontSlant::Normal,
-                match style.weight {
-                    TextWeight::Regular => gtk::cairo::FontWeight::Normal,
-                    TextWeight::Semibold | TextWeight::Bold => gtk::cairo::FontWeight::Bold,
-                },
-            );
-            cr.set_font_size(style.size as f64);
-            cr.move_to(origin.x as f64, origin.y as f64 + style.size as f64);
-            let _ = cr.show_text(text);
+            ashot_core::draw_text_cairo(cr, *origin, text, style);
         }
         AnnotationData::Line { start, end, color, stroke_width } => {
             draw_cairo_segment(cr, *start, *end, *color, *stroke_width);
@@ -5948,12 +6720,23 @@ fn draw_annotation(cr: &gtk::cairo::Context, annotation: &Annotation) {
         AnnotationData::Arrow { start, end, color, stroke_width } => {
             draw_cairo_arrow(cr, *start, *end, *color, *stroke_width);
         }
-        AnnotationData::Brush { points, color, stroke_width }
-        | AnnotationData::Marker { points, color, stroke_width } => {
+        AnnotationData::Brush { points, color, stroke_width } => {
             if points.is_empty() {
                 return;
             }
             set_cairo_color(cr, *color);
+            cr.set_line_width(*stroke_width as f64);
+            cr.move_to(points[0].x as f64, points[0].y as f64);
+            for point in points.iter().skip(1) {
+                cr.line_to(point.x as f64, point.y as f64);
+            }
+            let _ = cr.stroke();
+        }
+        AnnotationData::Marker { points, color, stroke_width } => {
+            if points.is_empty() {
+                return;
+            }
+            set_cairo_color(cr, marker_highlight_color(*color));
             cr.set_line_width(*stroke_width as f64);
             cr.move_to(points[0].x as f64, points[0].y as f64);
             for point in points.iter().skip(1) {
@@ -6770,12 +7553,12 @@ mod tests {
     use std::{cell::RefCell, rc::Rc};
 
     use ashot_core::{
-        Annotation, AnnotationData, AppConfig, AppearanceMode, Color, DefaultTool, Document, Point,
-        Rect, ResizeHandle,
+        Annotation, AnnotationData, AppConfig, AppearanceMode, Color, DefaultTool, Document,
+        MARKER_HIGHLIGHT_ALPHA, Point, Rect, ResizeHandle,
     };
 
     use super::{
-        ActiveTextEdit, COLOR_MEMORY_BUTTON_SIZE, COLOR_MEMORY_SWATCH_SIZE, COLOR_ROW_LIMIT,
+        ActiveTextEdit, Align, COLOR_MEMORY_BUTTON_SIZE, COLOR_MEMORY_SWATCH_SIZE, COLOR_ROW_LIMIT,
         COLOR_VALUE_BUTTON_HEIGHT, COLOR_VALUE_BUTTON_WIDTH, DraftAnnotation, EditorCursorKind,
         HslColor, PinClickAction, SELECTION_HANDLE_HIT_TOLERANCE, SIDEBAR_ACTION_BUTTON_HEIGHT,
         SIDEBAR_ACTION_BUTTON_WIDTH, SIDEBAR_TOOL_BUTTON_HEIGHT, SIDEBAR_TOOL_BUTTON_WIDTH,
@@ -6785,25 +7568,29 @@ mod tests {
         appearance_color_scheme, appearance_mode_from_index, appearance_mode_index,
         appearance_mode_labels, arrow_head_geometry, arrow_head_points, arrow_shape_geometry,
         arrow_visual_stroke_width, blur_radius_for_stroke, capture_should_use_fresh_anchor,
-        clamp_magnifier_zoom, crop_image_region, cursor_name_for_resize_handle,
+        clamp_magnifier_zoom, clamp_text_size, crop_image_region, cursor_name_for_resize_handle,
         cursor_name_for_surface_edge, draft_preview_for_draw, draft_tool_can_draw,
         editor_color_palette, editor_cursor_for_tool, editor_cursor_kind_for_tool,
         editor_favorite_palette, editor_initial_size, editor_status_text, editor_stroke_widths,
         editor_tool_layout, extract_ocr_install_command, eyedropper_magnifier_point,
-        filter_ocr_symbols, fit_scale, format_magnifier_zoom, hsl_to_color, hsv_to_color,
-        image_color_at, magnifier_geometry, magnifier_size_for_zoom, mosaic_pixel_size_for_stroke,
-        moving_delta_and_update, normalized_save_filename, ocr_language_label,
+        filter_font_families, filter_ocr_symbols, fit_scale, font_family_preview_markup,
+        font_family_row_content_halign, font_family_row_fixed_height, font_family_row_text_xalign,
+        format_magnifier_zoom, hsl_to_color, hsv_to_color, image_color_at, magnifier_geometry,
+        magnifier_size_for_zoom, mosaic_pixel_size_for_stroke, moving_delta_and_update,
+        next_pin_scale_save_generation, normalized_save_filename, ocr_language_label,
         ocr_result_body_text, ocr_result_primary_action, ocr_result_title, ocr_space_curl_args,
         ocr_space_language_arg, output_action_menu_items, output_action_primary_label,
         parse_hex_color, parse_ocr_space_response, pin_click_action, pin_context_popover_rect,
         pin_dimension_label, pin_display_size, pin_initial_scale, pin_initial_scale_with_saved,
+        pin_picture_can_target, pin_picture_size, pin_scale_save_generation_is_current,
         pin_window_size, pin_window_size_for_scale, pin_zoom_from_scroll, push_recent_color,
         remove_favorite_color, render_document_png_bytes, resize_handle_at, rgb_to_hsl, rgb_to_hsv,
         rgba_color_at, save_editor_document_to_dir_with_filename, scaled_canvas_point,
         selected_annotation_bounds, set_active_text_edit, suggested_save_filename_at,
         take_active_text_edit, tesseract_command_args, tesseract_command_invocation,
-        text_for_annotation, tool_can_select_existing, tool_icon_label, tool_icon_stroke_width,
-        tool_picks_canvas_color, update_ocr_language_selection,
+        text_controls_width, text_font_button_width, text_for_annotation, text_size_button_width,
+        text_size_options, text_size_wheel_options, tool_can_select_existing, tool_icon_label,
+        tool_icon_stroke_width, tool_picks_canvas_color, update_ocr_language_selection,
     };
 
     use chrono::{Local, TimeZone};
@@ -6900,6 +7687,27 @@ mod tests {
     }
 
     #[test]
+    fn marker_draft_uses_highlighter_alpha_and_minimum_width() {
+        let mut draft = DraftAnnotation::new(
+            DefaultTool::Marker,
+            Point::new(10.0, 20.0),
+            Color::rgba(232, 62, 38, 255),
+            4,
+        );
+        draft.extend(Point::new(60.0, 20.0));
+
+        let preview = draft.preview_annotation().expect("marker preview");
+
+        match preview.data {
+            AnnotationData::Marker { color, stroke_width, .. } => {
+                assert_eq!(color.a, MARKER_HIGHLIGHT_ALPHA);
+                assert_eq!(stroke_width, 8);
+            }
+            other => panic!("expected marker, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn color_picker_converts_between_hex_hsv_and_hsl() {
         let red = Color::rgba(244, 67, 54, 255);
 
@@ -6972,6 +7780,15 @@ mod tests {
     }
 
     #[test]
+    fn tool_icons_use_semantic_symbols_for_ambiguous_tools() {
+        assert_eq!(tool_icon_label(DefaultTool::Brush), "✐");
+        assert_eq!(tool_icon_label(DefaultTool::Marker), "◎");
+        assert_eq!(tool_icon_label(DefaultTool::Counter), "①");
+        assert_eq!(tool_icon_label(DefaultTool::Mosaic), "▦");
+        assert_eq!(tool_icon_label(DefaultTool::Blur), "▒");
+    }
+
+    #[test]
     fn sidebar_visual_metrics_stay_compact() {
         assert_eq!((SIDEBAR_TOOL_BUTTON_WIDTH, SIDEBAR_TOOL_BUTTON_HEIGHT), (42, 34));
         assert_eq!((SIDEBAR_ACTION_BUTTON_WIDTH, SIDEBAR_ACTION_BUTTON_HEIGHT), (40, 34));
@@ -7038,8 +7855,48 @@ mod tests {
 
     #[test]
     fn output_actions_keep_done_primary_and_group_secondary_items() {
-        assert_eq!(output_action_primary_label(), "Done");
-        assert_eq!(output_action_menu_items(), ["Save", "Save To", "Copy & Close"]);
+        assert_eq!(output_action_primary_label(), "Copy & Exit");
+        assert_eq!(output_action_menu_items(), ["Save", "Save To", "Save & Exit"]);
+    }
+
+    #[test]
+    fn font_family_filter_matches_case_insensitively_and_limits_results() {
+        let families = vec![
+            "Noto Sans".to_string(),
+            "Noto Sans CJK SC".to_string(),
+            "Inter".to_string(),
+            "Source Han Sans".to_string(),
+        ];
+
+        assert_eq!(
+            filter_font_families(&families, "sans", 2),
+            vec!["Noto Sans".to_string(), "Noto Sans CJK SC".to_string()]
+        );
+        assert_eq!(
+            filter_font_families(&families, "", 2),
+            vec!["Inter".to_string(), "Noto Sans".to_string()]
+        );
+    }
+
+    #[test]
+    fn font_family_preview_markup_renders_name_with_its_own_family() {
+        let markup = font_family_preview_markup("ACME & \"Mono\"");
+
+        assert!(markup.starts_with("<span font_family=\"ACME"));
+        assert!(markup.contains("&amp;"));
+        assert!(markup.contains("&quot;Mono&quot;"));
+        assert!(markup.ends_with("</span>"));
+    }
+
+    #[test]
+    fn font_family_rows_use_natural_content_height() {
+        assert_eq!(font_family_row_fixed_height(), None);
+    }
+
+    #[test]
+    fn font_family_rows_center_option_content() {
+        assert_eq!(font_family_row_content_halign(), Align::Center);
+        assert_eq!(font_family_row_text_xalign(), 0.5);
     }
 
     #[test]
@@ -7155,6 +8012,7 @@ mod tests {
                 size: 20,
                 weight: ashot_core::TextWeight::Bold,
                 color: Color::rgba(255, 255, 255, 255),
+                family: None,
             },
         });
         let id = annotation.id;
@@ -7222,12 +8080,17 @@ mod tests {
                 size: 20,
                 weight: ashot_core::TextWeight::Bold,
                 color: Color::rgba(255, 255, 255, 255),
+                family: None,
             },
         });
         let text_id = text.id;
         document.add_annotation(text);
         document.selected = Some(text_id);
-        assert_eq!(selected_annotation_bounds(&document), None);
+        assert!(selected_annotation_bounds(&document).is_some());
+        assert_eq!(
+            resize_handle_at(&document, Point::new(12.0, 18.0), SELECTION_HANDLE_HIT_TOLERANCE),
+            None
+        );
 
         let rect = Annotation::new(AnnotationData::Rectangle {
             rect: Rect { x: 10.0, y: 20.0, width: 40.0, height: 30.0 },
@@ -7287,6 +8150,8 @@ mod tests {
             id: None,
             origin: Point::new(4.0, 8.0),
             color: Color::rgba(255, 255, 255, 255),
+            family: None,
+            size: 20,
         })));
         let _borrow = active_text_edit.borrow_mut();
 
@@ -7297,6 +8162,8 @@ mod tests {
                 id: None,
                 origin: Point::new(12.0, 16.0),
                 color: Color::rgba(232, 62, 38, 255),
+                family: Some("Noto Sans CJK SC".to_string()),
+                size: 24,
             },
         ));
     }
@@ -7567,6 +8434,70 @@ mod tests {
 
         assert!(pin_zoom_from_scroll(current, -1.0) > current);
         assert!(pin_zoom_from_scroll(current, 1.0) < current);
+    }
+
+    #[test]
+    fn pin_wheel_zoom_stops_at_ten_percent() {
+        let next = pin_zoom_from_scroll(0.1, 1.0);
+
+        assert_eq!(next, 0.1);
+        assert_eq!(pin_display_size(1000, 800, next).0, 100);
+    }
+
+    #[test]
+    fn pin_picture_size_tracks_clamped_scale_even_when_window_is_larger() {
+        let size = pin_picture_size(1000, 800, 0.05);
+
+        assert_eq!(size, (100, 80));
+    }
+
+    #[test]
+    fn pin_picture_does_not_capture_pointer_events() {
+        assert!(!pin_picture_can_target());
+    }
+
+    #[test]
+    fn text_size_selector_uses_compact_readable_choices() {
+        assert_eq!(text_size_options(), [12, 14, 16, 20, 24, 32, 48]);
+        assert_eq!(clamp_text_size(6), 8);
+        assert_eq!(clamp_text_size(96), 72);
+    }
+
+    #[test]
+    fn text_controls_fit_font_and_size_on_one_row() {
+        assert!(text_controls_width() <= 214);
+        assert!(text_font_button_width() < 140);
+        assert!(text_size_button_width() <= 76);
+    }
+
+    #[test]
+    fn text_size_picker_uses_scroll_wheel_values() {
+        let values = text_size_wheel_options();
+
+        assert_eq!(values.first(), Some(&8));
+        assert_eq!(values.last(), Some(&72));
+        assert!(values.contains(&20));
+        assert!(values.len() > text_size_options().len());
+    }
+
+    #[test]
+    fn pin_zoom_uses_fractional_scroll_delta_for_smooth_steps() {
+        let current = 1.0;
+        let small_step = pin_zoom_from_scroll(current, -0.25);
+        let full_step = pin_zoom_from_scroll(current, -1.0);
+
+        assert!(small_step > current);
+        assert!(small_step < full_step);
+        assert!((full_step - 1.1).abs() < 0.000_001);
+    }
+
+    #[test]
+    fn pin_scale_save_debounce_ignores_superseded_generations() {
+        let first = next_pin_scale_save_generation(0);
+        let second = next_pin_scale_save_generation(first);
+
+        assert!(!pin_scale_save_generation_is_current(second, first));
+        assert!(pin_scale_save_generation_is_current(second, second));
     }
 
     #[test]

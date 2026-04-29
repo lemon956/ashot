@@ -72,6 +72,10 @@ pub struct AppConfig {
     pub default_color: Color,
     pub default_stroke_width: u32,
     #[serde(default)]
+    pub default_text_family: Option<String>,
+    #[serde(default = "default_text_size")]
+    pub default_text_size: u32,
+    #[serde(default)]
     pub recent_colors: Vec<Color>,
     #[serde(default)]
     pub favorite_colors: Vec<Color>,
@@ -108,6 +112,8 @@ impl Default for AppConfig {
             default_tool: DefaultTool::Arrow,
             default_color: Color::rgba(232, 62, 38, 255),
             default_stroke_width: 4,
+            default_text_family: None,
+            default_text_size: default_text_size(),
             recent_colors: Vec::new(),
             favorite_colors: Vec::new(),
             last_pin_scale: default_pin_scale(),
@@ -195,6 +201,10 @@ fn default_pin_scale() -> f64 {
 
 fn default_pin_opacity() -> f64 {
     1.0
+}
+
+fn default_text_size() -> u32 {
+    20
 }
 
 fn default_eyedropper_magnifier_enabled() -> bool {
@@ -338,6 +348,8 @@ default_stroke_width = 4
             favorite_colors: vec![crate::document::Color::rgba(7, 8, 9, 255)],
             last_pin_scale: 1.75,
             last_pin_opacity: 0.65,
+            default_text_family: Some("Noto Sans CJK SC".to_string()),
+            default_text_size: 32,
             eyedropper_magnifier_enabled: false,
             eyedropper_magnifier_zoom: 12.0,
             ..AppConfig::default()
@@ -350,6 +362,8 @@ default_stroke_width = 4
         assert_eq!(loaded.favorite_colors, config.favorite_colors);
         assert_eq!(loaded.last_pin_scale, 1.75);
         assert_eq!(loaded.last_pin_opacity, 0.65);
+        assert_eq!(loaded.default_text_family.as_deref(), Some("Noto Sans CJK SC"));
+        assert_eq!(loaded.default_text_size, 32);
         assert!(!loaded.eyedropper_magnifier_enabled);
         assert_eq!(loaded.eyedropper_magnifier_zoom, 12.0);
     }
@@ -384,6 +398,8 @@ default_stroke_width = 4
         assert!(loaded.favorite_colors.is_empty());
         assert_eq!(loaded.last_pin_scale, 1.0);
         assert_eq!(loaded.last_pin_opacity, 1.0);
+        assert_eq!(loaded.default_text_family, None);
+        assert_eq!(loaded.default_text_size, 20);
         assert!(loaded.eyedropper_magnifier_enabled);
         assert_eq!(loaded.eyedropper_magnifier_zoom, 8.0);
     }
