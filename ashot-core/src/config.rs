@@ -18,6 +18,17 @@ use crate::{
 const CONFIG_DIR_NAME: &str = "ashot";
 const CONFIG_FILE_NAME: &str = "config.toml";
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum AppearanceMode {
+    System,
+    Light,
+    Dark,
+}
+
+pub fn default_appearance_mode() -> AppearanceMode {
+    AppearanceMode::System
+}
+
 #[derive(Debug, Error)]
 pub enum ConfigError {
     #[error("the current environment does not expose XDG base directories")]
@@ -68,6 +79,8 @@ pub struct AppConfig {
     pub last_pin_scale: f64,
     #[serde(default = "default_pin_opacity")]
     pub last_pin_opacity: f64,
+    #[serde(default = "default_appearance_mode")]
+    pub appearance_mode: AppearanceMode,
     #[serde(default = "default_ocr_backend")]
     pub ocr_backend: OcrBackend,
     #[serde(default = "default_ocr_languages")]
@@ -95,6 +108,7 @@ impl Default for AppConfig {
             favorite_colors: Vec::new(),
             last_pin_scale: default_pin_scale(),
             last_pin_opacity: default_pin_opacity(),
+            appearance_mode: default_appearance_mode(),
             ocr_backend: OcrBackend::Tesseract,
             ocr_languages: default_ocr_languages(),
             ocr_space_api_key: String::new(),
@@ -183,7 +197,7 @@ mod tests {
 
     use crate::ocr::OcrBackend;
 
-    use super::AppConfig;
+    use super::{AppConfig, AppearanceMode};
 
     #[test]
     fn load_or_create_round_trip() {
@@ -237,6 +251,58 @@ default_stroke_width = 4
         assert_eq!(loaded.ocr_backend, OcrBackend::Tesseract);
         assert_eq!(loaded.ocr_languages, vec!["chi_sim".to_string(), "eng".to_string()]);
         assert!(loaded.ocr_filter_symbols);
+    }
+
+    #[test]
+    fn appearance_mode_defaults_to_follow_system_for_new_and_legacy_config() {
+        let config = AppConfig::default();
+        assert_eq!(config.appearance_mode, AppearanceMode::System);
+
+        let dir = tempdir().expect("tempdir");
+        let save_dir = dir.path().join("shots");
+        std::fs::create_dir_all(&save_dir).expect("save dir");
+        let path = dir.path().join("legacy-appearance.toml");
+        std::fs::write(
+            &path,
+            format!(
+                r#"
+default_save_dir = "{}"
+filename_template = "Screenshot.png"
+auto_copy = true
+post_capture_open_editor = true
+pin_after_save = false
+default_tool = "Arrow"
+default_color = {{ r = 232, g = 62, b = 38, a = 255 }}
+default_stroke_width = 4
+"#,
+                save_dir.display()
+            ),
+        )
+        .expect("legacy config");
+
+        let loaded = AppConfig::load_from(&path).expect("load legacy config");
+
+        assert_eq!(loaded.appearance_mode, AppearanceMode::System);
+    }
+
+    #[test]
+    fn appearance_mode_round_trips_and_restore_defaults_returns_to_system() {
+        let dir = tempdir().expect("tempdir");
+        let save_dir = dir.path().join("shots");
+        std::fs::create_dir_all(&save_dir).expect("save dir");
+        let path = dir.path().join("appearance.toml");
+        let mut config = AppConfig {
+            default_save_dir: save_dir,
+            appearance_mode: AppearanceMode::Dark,
+            ..AppConfig::default()
+        };
+
+        config.save_to(&path).expect("save config");
+        let loaded = AppConfig::load_from(&path).expect("load config");
+        assert_eq!(loaded.appearance_mode, AppearanceMode::Dark);
+
+        config.restore_defaults();
+        assert_eq!(config.appearance_mode, AppearanceMode::System);
     }
 
     #[test]

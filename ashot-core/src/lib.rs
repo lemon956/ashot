@@ -6,7 +6,7 @@ pub mod history;
 pub mod ocr;
 pub mod workflow;
 
-pub use config::{AppConfig, ConfigError};
+pub use config::{AppConfig, AppearanceMode, ConfigError};
 pub use document::{
     Annotation, AnnotationData, AnnotationId, Color, DefaultTool, Document, Point, Rect,
     ResizeHandle, TextStyle, TextWeight,

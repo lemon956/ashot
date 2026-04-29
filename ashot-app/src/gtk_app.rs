@@ -14,8 +14,8 @@ use crate::render_cache::{RenderCache, RenderCacheCallback, save_png_bytes_to_di
 use anyhow::{Context, Result};
 use ashot_capture::{CaptureClient, CaptureError};
 use ashot_core::{
-    Annotation, AnnotationData, AppConfig, Color, DefaultTool, Document, EditorHistory,
-    LinuxDistroFamily, OcrBackend, Point, Rect, ResizeHandle, TextStyle, TextWeight,
+    Annotation, AnnotationData, AppConfig, AppearanceMode, Color, DefaultTool, Document,
+    EditorHistory, LinuxDistroFamily, OcrBackend, Point, Rect, ResizeHandle, TextStyle, TextWeight,
     default_ocr_languages, detect_linux_distro_family, finalize_capture_with_config,
     language_install_command, language_package_for_distro, render_filename, search_ocr_languages,
 };
@@ -24,6 +24,7 @@ use ashot_ipc::{
 };
 use glib::prelude::IsA;
 use glib::translate::ToGlibPtr;
+use glib::types::StaticType;
 use gtk::gdk::prelude::ToplevelExt;
 use gtk::prelude::{
     Cast, EventControllerExt, FileChooserExt, FileChooserExtManual, GestureSingleExt,
@@ -95,6 +96,7 @@ pub fn run() -> Result<()> {
         .context("failed to create tokio runtime")?;
     let (ui_tx, ui_rx) = mpsc::unbounded_channel();
     let config = AppConfig::load_or_create().unwrap_or_default();
+    apply_appearance_mode(config.appearance_mode);
     let state = Arc::new(ServiceState::new(config, ui_tx));
 
     let service_state = state.clone();
@@ -783,6 +785,10 @@ fn present_settings(app: &adw::Application, state: Arc<ServiceState>) {
     let config = state.config_snapshot();
     let page = adw::PreferencesPage::new();
     let capture_group = adw::PreferencesGroup::builder().title("Capture and Save").build();
+    let appearance_group = adw::PreferencesGroup::builder()
+        .title("Appearance")
+        .description("Choose whether aShot follows the desktop theme or uses a fixed theme.")
+        .build();
     let ocr_group = adw::PreferencesGroup::builder()
         .title("OCR")
         .description("Configure text recognition and local Tesseract language package hints.")
@@ -811,6 +817,21 @@ fn present_settings(app: &adw::Application, state: Arc<ServiceState>) {
     let pin_after_save = gtk::CheckButton::with_label("Pin screenshots after save");
     pin_after_save.set_active(config.pin_after_save);
     capture_group.add(&pin_after_save);
+
+    let appearance_model = gtk::StringList::new(&appearance_mode_labels());
+    let appearance_expression = gtk::PropertyExpression::new(
+        gtk::StringObject::static_type(),
+        None::<&gtk::Expression>,
+        "string",
+    );
+    let appearance_row = adw::ComboRow::builder()
+        .title("Theme")
+        .subtitle("Follow the desktop appearance or force a light/dark editor.")
+        .model(&appearance_model)
+        .expression(&appearance_expression)
+        .selected(appearance_mode_index(config.appearance_mode))
+        .build();
+    appearance_group.add(&appearance_row);
 
     let ocr_space_backend = gtk::CheckButton::with_label("Use OCR.space online backend");
     ocr_space_backend
@@ -880,6 +901,7 @@ fn present_settings(app: &adw::Application, state: Arc<ServiceState>) {
     let auto_copy_for_save = auto_copy.clone();
     let open_editor_for_save = open_editor.clone();
     let pin_after_save_for_save = pin_after_save.clone();
+    let appearance_row_for_save = appearance_row.clone();
     let ocr_space_backend_for_save = ocr_space_backend.clone();
     let ocr_api_key_entry_for_save = ocr_api_key_entry.clone();
     let ocr_filter_symbols_for_save = ocr_filter_symbols.clone();
@@ -891,6 +913,7 @@ fn present_settings(app: &adw::Application, state: Arc<ServiceState>) {
         updated.auto_copy = auto_copy_for_save.is_active();
         updated.post_capture_open_editor = open_editor_for_save.is_active();
         updated.pin_after_save = pin_after_save_for_save.is_active();
+        updated.appearance_mode = appearance_mode_from_index(appearance_row_for_save.selected());
         updated.ocr_backend = if ocr_space_backend_for_save.is_active() {
             OcrBackend::OcrSpace
         } else {
@@ -902,6 +925,7 @@ fn present_settings(app: &adw::Application, state: Arc<ServiceState>) {
             updated.ocr_languages = languages.clone();
         }
         let _ = updated.save();
+        apply_appearance_mode(updated.appearance_mode);
         state_for_save.update_config(updated);
     });
 
@@ -917,6 +941,7 @@ fn present_settings(app: &adw::Application, state: Arc<ServiceState>) {
         auto_copy.set_active(updated.auto_copy);
         open_editor.set_active(updated.post_capture_open_editor);
         pin_after_save.set_active(updated.pin_after_save);
+        appearance_row.set_selected(appearance_mode_index(updated.appearance_mode));
         ocr_space_backend.set_active(updated.ocr_backend == OcrBackend::OcrSpace);
         ocr_api_key_entry.set_text(&updated.ocr_space_api_key);
         ocr_filter_symbols.set_active(updated.ocr_filter_symbols);
@@ -930,6 +955,7 @@ fn present_settings(app: &adw::Application, state: Arc<ServiceState>) {
             selected_ocr_languages.clone(),
             distro,
         );
+        apply_appearance_mode(updated.appearance_mode);
     });
 
     let window_for_close = window.clone();
@@ -938,10 +964,43 @@ fn present_settings(app: &adw::Application, state: Arc<ServiceState>) {
     });
 
     page.add(&capture_group);
+    page.add(&appearance_group);
     page.add(&ocr_group);
     page.add(&actions_group);
     window.add(&page);
     window.present();
+}
+
+fn appearance_mode_labels() -> [&'static str; 3] {
+    ["Follow System", "Light", "Dark"]
+}
+
+fn appearance_mode_index(mode: AppearanceMode) -> u32 {
+    match mode {
+        AppearanceMode::System => 0,
+        AppearanceMode::Light => 1,
+        AppearanceMode::Dark => 2,
+    }
+}
+
+fn appearance_mode_from_index(index: u32) -> AppearanceMode {
+    match index {
+        1 => AppearanceMode::Light,
+        2 => AppearanceMode::Dark,
+        _ => AppearanceMode::System,
+    }
+}
+
+fn appearance_color_scheme(mode: AppearanceMode) -> adw::ColorScheme {
+    match mode {
+        AppearanceMode::System => adw::ColorScheme::Default,
+        AppearanceMode::Light => adw::ColorScheme::ForceLight,
+        AppearanceMode::Dark => adw::ColorScheme::ForceDark,
+    }
+}
+
+fn apply_appearance_mode(mode: AppearanceMode) {
+    adw::StyleManager::default().set_color_scheme(appearance_color_scheme(mode));
 }
 
 fn settings_labeled_control(label: &str, control: &impl IsA<gtk::Widget>) -> GtkBox {
@@ -6229,8 +6288,8 @@ mod tests {
     use std::{cell::RefCell, rc::Rc};
 
     use ashot_core::{
-        Annotation, AnnotationData, AppConfig, Color, DefaultTool, Document, Point, Rect,
-        ResizeHandle,
+        Annotation, AnnotationData, AppConfig, AppearanceMode, Color, DefaultTool, Document, Point,
+        Rect, ResizeHandle,
     };
 
     use super::{
@@ -6241,10 +6300,11 @@ mod tests {
         STROKE_MENU_BUTTON_HEIGHT, STROKE_MENU_BUTTON_WIDTH, STROKE_PREVIEW_HEIGHT,
         STROKE_PREVIEW_WIDTH, TOOL_ICON_CANVAS_SIZE, add_favorite_color,
         annotation_keeps_selection_after_creation, annotation_snapshot_for_draw,
-        arrow_head_geometry, arrow_head_points, arrow_shape_geometry, arrow_visual_stroke_width,
-        blur_radius_for_stroke, capture_should_use_fresh_anchor, crop_image_region,
-        cursor_name_for_resize_handle, cursor_name_for_surface_edge, draft_preview_for_draw,
-        draft_tool_can_draw, editor_color_palette, editor_cursor_for_tool,
+        appearance_color_scheme, appearance_mode_from_index, appearance_mode_index,
+        appearance_mode_labels, arrow_head_geometry, arrow_head_points, arrow_shape_geometry,
+        arrow_visual_stroke_width, blur_radius_for_stroke, capture_should_use_fresh_anchor,
+        crop_image_region, cursor_name_for_resize_handle, cursor_name_for_surface_edge,
+        draft_preview_for_draw, draft_tool_can_draw, editor_color_palette, editor_cursor_for_tool,
         editor_cursor_kind_for_tool, editor_favorite_palette, editor_initial_size,
         editor_status_text, editor_stroke_widths, editor_tool_layout, filter_ocr_symbols,
         fit_scale, hsl_to_color, hsv_to_color, image_color_at, mosaic_pixel_size_for_stroke,
@@ -6262,6 +6322,7 @@ mod tests {
     };
 
     use chrono::{Local, TimeZone};
+    use libadwaita::ColorScheme;
 
     #[test]
     fn capture_never_reuses_existing_editor_window_as_portal_parent() {
@@ -6298,6 +6359,25 @@ mod tests {
         assert!(text.contains("Image: 1920 x 1080"));
         assert!(text.contains("Path: /tmp/screens"));
         assert!(text.contains("Saved"));
+    }
+
+    #[test]
+    fn appearance_mode_maps_to_libadwaita_color_scheme() {
+        assert_eq!(appearance_color_scheme(AppearanceMode::System), ColorScheme::Default);
+        assert_eq!(appearance_color_scheme(AppearanceMode::Light), ColorScheme::ForceLight);
+        assert_eq!(appearance_color_scheme(AppearanceMode::Dark), ColorScheme::ForceDark);
+    }
+
+    #[test]
+    fn appearance_mode_settings_options_round_trip() {
+        assert_eq!(appearance_mode_labels(), ["Follow System", "Light", "Dark"]);
+        assert_eq!(appearance_mode_index(AppearanceMode::System), 0);
+        assert_eq!(appearance_mode_index(AppearanceMode::Light), 1);
+        assert_eq!(appearance_mode_index(AppearanceMode::Dark), 2);
+        assert_eq!(appearance_mode_from_index(0), AppearanceMode::System);
+        assert_eq!(appearance_mode_from_index(1), AppearanceMode::Light);
+        assert_eq!(appearance_mode_from_index(2), AppearanceMode::Dark);
+        assert_eq!(appearance_mode_from_index(99), AppearanceMode::System);
     }
 
     #[test]
