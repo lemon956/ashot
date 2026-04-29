@@ -29,6 +29,16 @@ pub fn default_appearance_mode() -> AppearanceMode {
     AppearanceMode::System
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum HighlightMode {
+    Marker,
+    Block,
+}
+
+pub fn default_highlight_mode() -> HighlightMode {
+    HighlightMode::Marker
+}
+
 #[derive(Debug, Error)]
 pub enum ConfigError {
     #[error("the current environment does not expose XDG base directories")]
@@ -75,6 +85,8 @@ pub struct AppConfig {
     pub default_text_family: Option<String>,
     #[serde(default = "default_text_size")]
     pub default_text_size: u32,
+    #[serde(default = "default_highlight_mode")]
+    pub default_highlight_mode: HighlightMode,
     #[serde(default)]
     pub recent_colors: Vec<Color>,
     #[serde(default)]
@@ -114,6 +126,7 @@ impl Default for AppConfig {
             default_stroke_width: 4,
             default_text_family: None,
             default_text_size: default_text_size(),
+            default_highlight_mode: default_highlight_mode(),
             recent_colors: Vec::new(),
             favorite_colors: Vec::new(),
             last_pin_scale: default_pin_scale(),
@@ -221,7 +234,7 @@ mod tests {
 
     use crate::ocr::OcrBackend;
 
-    use super::{AppConfig, AppearanceMode};
+    use super::{AppConfig, AppearanceMode, HighlightMode};
 
     #[test]
     fn load_or_create_round_trip() {
@@ -350,6 +363,7 @@ default_stroke_width = 4
             last_pin_opacity: 0.65,
             default_text_family: Some("Noto Sans CJK SC".to_string()),
             default_text_size: 32,
+            default_highlight_mode: HighlightMode::Block,
             eyedropper_magnifier_enabled: false,
             eyedropper_magnifier_zoom: 12.0,
             ..AppConfig::default()
@@ -364,6 +378,7 @@ default_stroke_width = 4
         assert_eq!(loaded.last_pin_opacity, 0.65);
         assert_eq!(loaded.default_text_family.as_deref(), Some("Noto Sans CJK SC"));
         assert_eq!(loaded.default_text_size, 32);
+        assert_eq!(loaded.default_highlight_mode, HighlightMode::Block);
         assert!(!loaded.eyedropper_magnifier_enabled);
         assert_eq!(loaded.eyedropper_magnifier_zoom, 12.0);
     }
@@ -400,6 +415,7 @@ default_stroke_width = 4
         assert_eq!(loaded.last_pin_opacity, 1.0);
         assert_eq!(loaded.default_text_family, None);
         assert_eq!(loaded.default_text_size, 20);
+        assert_eq!(loaded.default_highlight_mode, HighlightMode::Marker);
         assert!(loaded.eyedropper_magnifier_enabled);
         assert_eq!(loaded.eyedropper_magnifier_zoom, 8.0);
     }

@@ -47,6 +47,9 @@ pub fn render_annotation_into(canvas: &mut RgbaImage, annotation: &Annotation) {
         AnnotationData::Marker { points, color, stroke_width } => {
             draw_marker(canvas, points, *color, *stroke_width)
         }
+        AnnotationData::HighlightBlock { rect, color } => {
+            fill_rect(canvas, *rect, marker_highlight_color(*color));
+        }
         AnnotationData::Mosaic { rect, pixel_size } => {
             pixelate_region(canvas, *rect, *pixel_size);
         }
@@ -276,6 +279,7 @@ fn annotation_render_padding(annotation: &Annotation) -> f32 {
         AnnotationData::Counter { radius, .. } => *radius as f32 * 0.2 + 3.0,
         AnnotationData::Mosaic { .. }
         | AnnotationData::Blur { .. }
+        | AnnotationData::HighlightBlock { .. }
         | AnnotationData::FilledBox { .. } => 1.0,
     }
 }
@@ -1108,6 +1112,10 @@ mod tests {
                 color: Color::rgba(255, 255, 0, 96),
                 stroke_width: 9,
             }),
+            Annotation::new(AnnotationData::HighlightBlock {
+                rect: Rect { x: 5.0, y: 62.0, width: 38.0, height: 10.0 },
+                color: Color::rgba(255, 230, 0, 255),
+            }),
             Annotation::new(AnnotationData::Counter {
                 center: Point::new(60.0, 20.0),
                 number: 3,
@@ -1141,6 +1149,22 @@ mod tests {
         assert!(pixel[0] < 230, "marker red channel compounded to {}", pixel[0]);
         assert!(pixel[1] > 95, "marker green channel was crushed to {}", pixel[1]);
         assert!(pixel[2] > 95, "marker blue channel was crushed to {}", pixel[2]);
+    }
+
+    #[test]
+    fn highlight_block_uses_marker_alpha_without_hiding_content() {
+        let base = RgbaImage::from_pixel(12, 12, Rgba([120, 120, 120, 255]));
+        let annotations = vec![Annotation::new(AnnotationData::HighlightBlock {
+            rect: Rect { x: 2.0, y: 2.0, width: 8.0, height: 8.0 },
+            color: Color::rgba(255, 0, 0, 255),
+        })];
+
+        let rendered = render_document_from_rgba(&base, &annotations);
+        let pixel = rendered.get_pixel(6, 6);
+
+        assert!(pixel[0] > 120);
+        assert!(pixel[1] > 80, "highlight block should not obscure content: {}", pixel[1]);
+        assert!(pixel[2] > 80, "highlight block should not obscure content: {}", pixel[2]);
     }
 
     #[test]

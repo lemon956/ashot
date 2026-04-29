@@ -144,6 +144,7 @@ pub enum AnnotationData {
     Rectangle { rect: Rect, color: Color, stroke_width: u32 },
     Ellipse { rect: Rect, color: Color, stroke_width: u32 },
     Marker { points: Vec<Point>, color: Color, stroke_width: u32 },
+    HighlightBlock { rect: Rect, color: Color },
     Mosaic { rect: Rect, pixel_size: u32 },
     Blur { rect: Rect, radius: u32 },
     Counter { center: Point, number: u32, color: Color, radius: u32 },
@@ -189,6 +190,7 @@ impl Annotation {
             }
             AnnotationData::Rectangle { rect, .. }
             | AnnotationData::Ellipse { rect, .. }
+            | AnnotationData::HighlightBlock { rect, .. }
             | AnnotationData::Mosaic { rect, .. }
             | AnnotationData::Blur { rect, .. }
             | AnnotationData::FilledBox { rect, .. } => *rect,
@@ -218,6 +220,7 @@ impl Annotation {
             }
             AnnotationData::Rectangle { rect, .. }
             | AnnotationData::Ellipse { rect, .. }
+            | AnnotationData::HighlightBlock { rect, .. }
             | AnnotationData::Mosaic { rect, .. }
             | AnnotationData::Blur { rect, .. }
             | AnnotationData::FilledBox { rect, .. } => {
@@ -240,6 +243,7 @@ impl Annotation {
             }
             AnnotationData::Rectangle { rect, .. }
             | AnnotationData::Ellipse { rect, .. }
+            | AnnotationData::HighlightBlock { rect, .. }
             | AnnotationData::Mosaic { rect, .. }
             | AnnotationData::Blur { rect, .. }
             | AnnotationData::FilledBox { rect, .. } => {
@@ -267,6 +271,7 @@ impl Annotation {
             | AnnotationData::Rectangle { color: current, .. }
             | AnnotationData::Ellipse { color: current, .. }
             | AnnotationData::Marker { color: current, .. }
+            | AnnotationData::HighlightBlock { color: current, .. }
             | AnnotationData::Counter { color: current, .. }
             | AnnotationData::FilledBox { color: current, .. } => *current = color,
             AnnotationData::Mosaic { .. } | AnnotationData::Blur { .. } => return false,
@@ -287,7 +292,9 @@ impl Annotation {
             AnnotationData::Blur { radius, .. } => *radius = width,
             AnnotationData::Counter { radius, .. } => *radius = width,
             AnnotationData::Text { style, .. } => style.size = width,
-            AnnotationData::FilledBox { .. } => return false,
+            AnnotationData::HighlightBlock { .. } | AnnotationData::FilledBox { .. } => {
+                return false;
+            }
         }
         true
     }

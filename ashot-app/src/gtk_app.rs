@@ -15,10 +15,10 @@ use anyhow::{Context, Result};
 use ashot_capture::{CaptureClient, CaptureError};
 use ashot_core::{
     Annotation, AnnotationData, AppConfig, AppearanceMode, Color, DefaultTool, Document,
-    EditorHistory, LinuxDistroFamily, OcrBackend, Point, Rect, ResizeHandle, TextStyle, TextWeight,
-    default_ocr_languages, detect_linux_distro_family, finalize_capture_with_config,
-    language_install_command, language_package_for_distro, marker_highlight_color, render_filename,
-    search_ocr_languages,
+    EditorHistory, HighlightMode, LinuxDistroFamily, OcrBackend, Point, Rect, ResizeHandle,
+    TextStyle, TextWeight, default_ocr_languages, detect_linux_distro_family,
+    finalize_capture_with_config, language_install_command, language_package_for_distro,
+    marker_highlight_color, render_filename, search_ocr_languages,
 };
 use ashot_ipc::{
     APP_ID, CaptureMode, CaptureOutcome, CommandOutcome, DBUS_NAME, DBUS_PATH, OutcomeKind,
@@ -1243,6 +1243,7 @@ fn present_editor(
     let active_stroke = Rc::new(Cell::new(config.default_stroke_width));
     let active_text_family = Rc::new(RefCell::new(config.default_text_family.clone()));
     let active_text_size = Rc::new(Cell::new(clamp_text_size(config.default_text_size)));
+    let active_highlight_mode = Rc::new(Cell::new(config.default_highlight_mode));
     let active_ocr_languages = Rc::new(RefCell::new(config.ocr_languages.clone()));
     let active_ocr_filter_symbols = Rc::new(Cell::new(config.ocr_filter_symbols));
     let active_magnifier_enabled = Rc::new(Cell::new(config.eyedropper_magnifier_enabled));
@@ -1443,6 +1444,62 @@ fn present_editor(
     tool_grid.set_column_spacing(5);
     let tool_buttons = Rc::new(RefCell::new(Vec::<(DefaultTool, Button)>::new()));
     for (index, (label, tool)) in editor_tool_layout().iter().enumerate() {
+        if *tool == DefaultTool::Marker {
+            let split = GtkBox::new(Orientation::Horizontal, 0);
+            split.add_css_class("ashot-tool-split");
+
+            let button = Button::new();
+            let icon = highlight_tool_icon_area(active_highlight_mode.clone());
+            button.set_child(Some(&icon));
+            button.set_tooltip_text(Some(&highlight_tooltip(active_highlight_mode.get())));
+            button.set_hexpand(true);
+            button.set_size_request(30, SIDEBAR_TOOL_BUTTON_HEIGHT);
+            button.add_css_class("ashot-tool-button");
+            button.add_css_class("ashot-tool-split-main");
+
+            let mode_menu = MenuButton::new();
+            mode_menu.set_icon_name("pan-down-symbolic");
+            mode_menu.set_tooltip_text(Some("Highlight mode"));
+            mode_menu.set_size_request(14, SIDEBAR_TOOL_BUTTON_HEIGHT);
+            mode_menu.add_css_class("ashot-tool-split-menu");
+            mode_menu.add_css_class("ashot-tool-button");
+
+            let document_for_marker_button = document.clone();
+            let tool_buttons_for_click = tool_buttons.clone();
+            let canvas_for_tool = canvas.clone();
+            let state_for_tool = state.clone();
+            let refresh_status_for_tool = refresh_status.clone();
+            button.connect_clicked(move |_| {
+                if let Ok(mut document) = document_for_marker_button.try_borrow_mut() {
+                    document.active_tool = DefaultTool::Marker;
+                }
+                update_tool_button_selection(&tool_buttons_for_click, DefaultTool::Marker);
+                apply_editor_cursor(&canvas_for_tool, DefaultTool::Marker);
+                persist_config_change(&state_for_tool, |config| {
+                    config.default_tool = DefaultTool::Marker;
+                });
+                refresh_status_for_tool(None);
+            });
+
+            let popover = highlight_mode_popover(
+                active_highlight_mode.clone(),
+                icon.clone(),
+                button.clone(),
+                state.clone(),
+                canvas.clone(),
+                document.clone(),
+                tool_buttons.clone(),
+                refresh_status.clone(),
+            );
+            mode_menu.set_popover(Some(&popover));
+
+            split.append(&button);
+            split.append(&mode_menu);
+            tool_grid.attach(&split, (index % 3) as i32, (index / 3) as i32, 1, 1);
+            tool_buttons.borrow_mut().push((DefaultTool::Marker, button));
+            continue;
+        }
+
         let button = Button::new();
         let icon = tool_icon_area(*tool);
         button.set_child(Some(&icon));
@@ -1615,6 +1672,7 @@ fn present_editor(
     let brush_cursor_for_draw = brush_cursor_preview.clone();
     let active_color_for_draw = active_color.clone();
     let active_stroke_for_draw = active_stroke.clone();
+    let active_highlight_mode_for_draw = active_highlight_mode.clone();
     let active_magnifier_enabled_for_draw = active_magnifier_enabled.clone();
     let active_magnifier_zoom_for_draw = active_magnifier_zoom.clone();
     let base_rgba_for_magnifier = base_rgba.clone();
@@ -1638,7 +1696,9 @@ fn present_editor(
             draw_annotation(cr, &annotation);
         }
         if let Ok(document) = doc_for_draw.try_borrow()
-            && matches!(document.active_tool, DefaultTool::Brush | DefaultTool::Marker)
+            && (document.active_tool == DefaultTool::Brush
+                || (document.active_tool == DefaultTool::Marker
+                    && active_highlight_mode_for_draw.get() == HighlightMode::Marker))
             && draft_for_draw.try_borrow().is_ok_and(|draft| draft.is_none())
             && let Some(point) = brush_cursor_for_draw.get()
         {
@@ -1874,6 +1934,7 @@ fn present_editor(
     let color_for_drag = active_color.clone();
     let color_ui_refresh_for_drag = color_ui_refresh.clone();
     let stroke_for_drag = active_stroke.clone();
+    let highlight_mode_for_drag = active_highlight_mode.clone();
     let image_for_drag = base_image.clone();
     let canvas_for_drag = canvas.clone();
     let scale_for_drag = image_scale.clone();
@@ -1952,6 +2013,7 @@ fn present_editor(
                 point,
                 color_for_drag.get(),
                 stroke_for_drag.get(),
+                highlight_mode_for_drag.get(),
             ));
         }
     });
@@ -3336,6 +3398,19 @@ fn install_editor_css() {
             min-height: 34px;
             padding: 0;
         }
+        .ashot-tool-split {
+            min-height: 34px;
+        }
+        .ashot-tool-split-main {
+            min-width: 30px;
+            border-radius: 8px 0 0 8px;
+        }
+        .ashot-tool-split-menu {
+            min-width: 16px;
+            padding: 0;
+            border-left-width: 0;
+            border-radius: 0 8px 8px 0;
+        }
         .ashot-action-button:hover,
         .ashot-tool-button:hover {
             background: alpha(@accent_bg_color, 0.08);
@@ -3564,6 +3639,38 @@ fn install_editor_css() {
         .ashot-text-size-spin {
             min-width: 76px;
         }
+        .ashot-highlight-popover {
+            padding: 7px;
+        }
+        .ashot-highlight-mode-option {
+            min-width: 192px;
+            min-height: 46px;
+            padding: 7px 9px;
+            border-radius: 9px;
+            background: transparent;
+            border: 1px solid transparent;
+        }
+        .ashot-highlight-mode-option:hover {
+            background: alpha(@accent_bg_color, 0.08);
+            border-color: alpha(@accent_bg_color, 0.18);
+        }
+        .ashot-highlight-mode-selected {
+            background: alpha(@accent_bg_color, 0.14);
+            border-color: alpha(@accent_bg_color, 0.36);
+        }
+        .ashot-highlight-mode-title {
+            font-weight: 700;
+        }
+        .ashot-highlight-mode-subtitle {
+            font-size: 0.82em;
+        }
+        .ashot-highlight-mode-check {
+            color: alpha(currentColor, 0.18);
+            font-weight: 800;
+        }
+        .ashot-highlight-mode-selected .ashot-highlight-mode-check {
+            color: @accent_bg_color;
+        }
         .ashot-compact-check {
             margin-top: -2px;
             font-size: 0.86em;
@@ -3696,6 +3803,200 @@ fn tool_icon_area(tool: DefaultTool) -> DrawingArea {
         draw_tool_icon(area, cr, tool, width, height);
     });
     icon
+}
+
+fn highlight_mode_options() -> [(HighlightMode, &'static str, &'static str); 2] {
+    [
+        (HighlightMode::Marker, "Marker pen", "Freehand translucent highlighter"),
+        (HighlightMode::Block, "Block highlight", "Drag a rectangular highlight region"),
+    ]
+}
+
+fn highlight_mode_name(mode: HighlightMode) -> &'static str {
+    match mode {
+        HighlightMode::Marker => "Marker pen",
+        HighlightMode::Block => "Block highlight",
+    }
+}
+
+fn highlight_tooltip(mode: HighlightMode) -> String {
+    format!("Highlight: {}", highlight_mode_name(mode))
+}
+
+fn update_highlight_mode_buttons(
+    buttons: &Rc<RefCell<Vec<(HighlightMode, Button)>>>,
+    selected: HighlightMode,
+) {
+    if let Ok(buttons) = buttons.try_borrow() {
+        for (mode, button) in buttons.iter() {
+            if *mode == selected {
+                button.add_css_class("ashot-highlight-mode-selected");
+            } else {
+                button.remove_css_class("ashot-highlight-mode-selected");
+            }
+        }
+    }
+}
+
+fn highlight_tool_icon_area(active_highlight_mode: Rc<Cell<HighlightMode>>) -> DrawingArea {
+    let icon = DrawingArea::new();
+    icon.set_content_width(TOOL_ICON_CANVAS_SIZE);
+    icon.set_content_height(TOOL_ICON_CANVAS_SIZE);
+    icon.add_css_class("ashot-tool-icon");
+    icon.set_draw_func(move |area, cr, width, height| {
+        draw_highlight_mode_icon(area, cr, active_highlight_mode.get(), width, height);
+    });
+    icon
+}
+
+fn fixed_highlight_mode_icon_area(mode: HighlightMode) -> DrawingArea {
+    highlight_tool_icon_area(Rc::new(Cell::new(mode)))
+}
+
+fn highlight_mode_popover(
+    active_highlight_mode: Rc<Cell<HighlightMode>>,
+    icon: DrawingArea,
+    marker_button: Button,
+    state: Arc<ServiceState>,
+    canvas: DrawingArea,
+    document: Rc<RefCell<Document>>,
+    tool_buttons: Rc<RefCell<Vec<(DefaultTool, Button)>>>,
+    refresh_status: StatusCallback,
+) -> Popover {
+    let popover = Popover::new();
+    popover.add_css_class("ashot-highlight-popover");
+    let list = GtkBox::new(Orientation::Vertical, 4);
+    let option_buttons = Rc::new(RefCell::new(Vec::<(HighlightMode, Button)>::new()));
+
+    for (mode, title, subtitle) in highlight_mode_options() {
+        let button = Button::new();
+        button.add_css_class("ashot-highlight-mode-option");
+        let row = GtkBox::new(Orientation::Horizontal, 8);
+        row.set_halign(Align::Fill);
+        row.append(&fixed_highlight_mode_icon_area(mode));
+
+        let text = GtkBox::new(Orientation::Vertical, 1);
+        text.set_hexpand(true);
+        let title_label = Label::new(Some(title));
+        title_label.set_xalign(0.0);
+        title_label.add_css_class("ashot-highlight-mode-title");
+        let subtitle_label = Label::new(Some(subtitle));
+        subtitle_label.set_xalign(0.0);
+        subtitle_label.add_css_class("dim-label");
+        subtitle_label.add_css_class("ashot-highlight-mode-subtitle");
+        text.append(&title_label);
+        text.append(&subtitle_label);
+        row.append(&text);
+
+        let check = Label::new(Some("✓"));
+        check.add_css_class("ashot-highlight-mode-check");
+        row.append(&check);
+        button.set_child(Some(&row));
+
+        let active_highlight_mode_for_click = active_highlight_mode.clone();
+        let icon_for_click = icon.clone();
+        let marker_button_for_click = marker_button.clone();
+        let state_for_click = state.clone();
+        let canvas_for_click = canvas.clone();
+        let document_for_click = document.clone();
+        let tool_buttons_for_click = tool_buttons.clone();
+        let refresh_status_for_click = refresh_status.clone();
+        let option_buttons_for_click = option_buttons.clone();
+        let popover_for_click = popover.clone();
+        button.connect_clicked(move |_| {
+            active_highlight_mode_for_click.set(mode);
+            icon_for_click.queue_draw();
+            marker_button_for_click.set_tooltip_text(Some(&highlight_tooltip(mode)));
+            if let Ok(mut document) = document_for_click.try_borrow_mut() {
+                document.active_tool = DefaultTool::Marker;
+            }
+            update_tool_button_selection(&tool_buttons_for_click, DefaultTool::Marker);
+            apply_editor_cursor(&canvas_for_click, DefaultTool::Marker);
+            update_highlight_mode_buttons(&option_buttons_for_click, mode);
+            persist_config_change(&state_for_click, |config| {
+                config.default_tool = DefaultTool::Marker;
+                config.default_highlight_mode = mode;
+            });
+            refresh_status_for_click(None);
+            popover_for_click.popdown();
+        });
+
+        option_buttons.borrow_mut().push((mode, button.clone()));
+        list.append(&button);
+    }
+
+    update_highlight_mode_buttons(&option_buttons, active_highlight_mode.get());
+    popover.set_child(Some(&list));
+    popover
+}
+
+fn draw_highlight_mode_icon(
+    area: &DrawingArea,
+    cr: &gtk::cairo::Context,
+    mode: HighlightMode,
+    width: i32,
+    height: i32,
+) {
+    let size = width.min(height).max(1) as f64;
+    let scale = size / 24.0;
+    let offset_x = (width as f64 - size) * 0.5;
+    let offset_y = (height as f64 - size) * 0.5;
+    let color = area.style_context().color();
+    let r = color.red() as f64;
+    let g = color.green() as f64;
+    let b = color.blue() as f64;
+    let a = color.alpha() as f64;
+    let _ = cr.save();
+    cr.translate(offset_x, offset_y);
+    cr.scale(scale, scale);
+    cr.set_line_width(tool_icon_stroke_width());
+    cr.set_line_cap(gtk::cairo::LineCap::Round);
+    cr.set_line_join(gtk::cairo::LineJoin::Round);
+
+    match mode {
+        HighlightMode::Marker => {
+            cr.set_source_rgba(r, g, b, a * 0.22);
+            cr.move_to(4.6, 16.5);
+            cr.curve_to(8.4, 14.5, 13.2, 14.2, 19.4, 16.2);
+            cr.line_to(18.2, 20.2);
+            cr.curve_to(12.0, 18.6, 7.7, 18.8, 4.0, 20.5);
+            cr.close_path();
+            let _ = cr.fill();
+
+            cr.set_source_rgba(r, g, b, a);
+            let _ = cr.save();
+            cr.translate(11.7, 10.6);
+            cr.rotate(-0.72);
+            draw_round_rect(cr, -2.9, -7.2, 5.8, 12.6, 1.9);
+            let _ = cr.stroke();
+            cr.move_to(-2.9, 1.8);
+            cr.line_to(2.9, 1.8);
+            cr.move_to(-1.6, 5.5);
+            cr.line_to(0.0, 8.0);
+            cr.line_to(1.6, 5.5);
+            let _ = cr.stroke();
+            let _ = cr.restore();
+
+            cr.move_to(4.8, 18.2);
+            cr.curve_to(9.6, 16.8, 14.2, 16.8, 19.2, 18.0);
+            let _ = cr.stroke();
+        }
+        HighlightMode::Block => {
+            cr.set_source_rgba(r, g, b, a * 0.18);
+            draw_round_rect(cr, 4.0, 7.0, 16.0, 10.0, 2.0);
+            let _ = cr.fill();
+
+            cr.set_source_rgba(r, g, b, a);
+            cr.set_line_width(1.6);
+            draw_round_rect(cr, 4.0, 7.0, 16.0, 10.0, 2.0);
+            let _ = cr.stroke();
+            for (x, y) in [(4.2, 7.2), (19.8, 7.2), (19.8, 16.8), (4.2, 16.8)] {
+                cr.arc(x, y, 1.2, 0.0, std::f64::consts::TAU);
+                let _ = cr.fill();
+            }
+        }
+    }
+    let _ = cr.restore();
 }
 
 fn draw_tool_icon(
@@ -6139,6 +6440,7 @@ fn annotation_shows_selection_overlay(annotation: &Annotation) -> bool {
             | AnnotationData::Arrow { .. }
             | AnnotationData::Rectangle { .. }
             | AnnotationData::Ellipse { .. }
+            | AnnotationData::HighlightBlock { .. }
             | AnnotationData::Mosaic { .. }
             | AnnotationData::Blur { .. }
             | AnnotationData::Counter { .. }
@@ -6153,6 +6455,7 @@ fn annotation_has_resize_handles(annotation: &Annotation) -> bool {
             | AnnotationData::Arrow { .. }
             | AnnotationData::Rectangle { .. }
             | AnnotationData::Ellipse { .. }
+            | AnnotationData::HighlightBlock { .. }
             | AnnotationData::Mosaic { .. }
             | AnnotationData::Blur { .. }
             | AnnotationData::Counter { .. }
@@ -6253,6 +6556,7 @@ fn draw_selection_overlay(cr: &gtk::cairo::Context, rect: Rect, show_handles: bo
 #[derive(Debug, Clone)]
 struct DraftAnnotation {
     tool: DefaultTool,
+    highlight_mode: HighlightMode,
     start: Point,
     points: Vec<Point>,
     color: Color,
@@ -6375,12 +6679,18 @@ fn commit_text_entry(
 }
 
 impl DraftAnnotation {
-    fn new(tool: DefaultTool, start: Point, color: Color, stroke_width: u32) -> Self {
-        Self { tool, start, points: vec![start], color, stroke_width }
+    fn new(
+        tool: DefaultTool,
+        start: Point,
+        color: Color,
+        stroke_width: u32,
+        highlight_mode: HighlightMode,
+    ) -> Self {
+        Self { tool, highlight_mode, start, points: vec![start], color, stroke_width }
     }
 
     fn extend(&mut self, point: Point) {
-        if matches!(self.tool, DefaultTool::Brush | DefaultTool::Marker) {
+        if self.uses_freehand_points() {
             self.points.push(point);
         } else {
             self.points.truncate(1);
@@ -6397,6 +6707,11 @@ impl DraftAnnotation {
 
     fn bounds(&self) -> Rect {
         Rect::from_points(self.start, *self.points.last().unwrap_or(&self.start))
+    }
+
+    fn uses_freehand_points(&self) -> bool {
+        matches!(self.tool, DefaultTool::Brush)
+            || (self.tool == DefaultTool::Marker && self.highlight_mode == HighlightMode::Marker)
     }
 
     fn preview_annotation(&self) -> Option<Annotation> {
@@ -6429,11 +6744,17 @@ impl DraftAnnotation {
                 color: self.color,
                 stroke_width: self.stroke_width,
             })),
-            DefaultTool::Marker => Some(Annotation::new(AnnotationData::Marker {
-                points: self.points.clone(),
-                color: marker_highlight_color(self.color),
-                stroke_width: self.stroke_width.max(8),
-            })),
+            DefaultTool::Marker => match self.highlight_mode {
+                HighlightMode::Marker => Some(Annotation::new(AnnotationData::Marker {
+                    points: self.points.clone(),
+                    color: marker_highlight_color(self.color),
+                    stroke_width: self.stroke_width.max(8),
+                })),
+                HighlightMode::Block => Some(Annotation::new(AnnotationData::HighlightBlock {
+                    rect: Rect::from_points(self.start, end),
+                    color: marker_highlight_color(self.color),
+                })),
+            },
             DefaultTool::Mosaic => Some(Annotation::new(AnnotationData::Mosaic {
                 rect: Rect::from_points(self.start, end),
                 pixel_size: mosaic_pixel_size_for_stroke(self.stroke_width),
@@ -6743,6 +7064,11 @@ fn draw_annotation(cr: &gtk::cairo::Context, annotation: &Annotation) {
                 cr.line_to(point.x as f64, point.y as f64);
             }
             let _ = cr.stroke();
+        }
+        AnnotationData::HighlightBlock { rect, color } => {
+            set_cairo_color(cr, marker_highlight_color(*color));
+            cr.rectangle(rect.x as f64, rect.y as f64, rect.width as f64, rect.height as f64);
+            let _ = cr.fill();
         }
         AnnotationData::Rectangle { rect, color, stroke_width } => {
             set_cairo_color(cr, *color);
@@ -7554,7 +7880,7 @@ mod tests {
 
     use ashot_core::{
         Annotation, AnnotationData, AppConfig, AppearanceMode, Color, DefaultTool, Document,
-        MARKER_HIGHLIGHT_ALPHA, Point, Rect, ResizeHandle,
+        HighlightMode, MARKER_HIGHLIGHT_ALPHA, Point, Rect, ResizeHandle,
     };
 
     use super::{
@@ -7575,22 +7901,23 @@ mod tests {
         editor_tool_layout, extract_ocr_install_command, eyedropper_magnifier_point,
         filter_font_families, filter_ocr_symbols, fit_scale, font_family_preview_markup,
         font_family_row_content_halign, font_family_row_fixed_height, font_family_row_text_xalign,
-        format_magnifier_zoom, hsl_to_color, hsv_to_color, image_color_at, magnifier_geometry,
-        magnifier_size_for_zoom, mosaic_pixel_size_for_stroke, moving_delta_and_update,
-        next_pin_scale_save_generation, normalized_save_filename, ocr_language_label,
-        ocr_result_body_text, ocr_result_primary_action, ocr_result_title, ocr_space_curl_args,
-        ocr_space_language_arg, output_action_menu_items, output_action_primary_label,
-        parse_hex_color, parse_ocr_space_response, pin_click_action, pin_context_popover_rect,
-        pin_dimension_label, pin_display_size, pin_initial_scale, pin_initial_scale_with_saved,
-        pin_picture_can_target, pin_picture_size, pin_scale_save_generation_is_current,
-        pin_window_size, pin_window_size_for_scale, pin_zoom_from_scroll, push_recent_color,
-        remove_favorite_color, render_document_png_bytes, resize_handle_at, rgb_to_hsl, rgb_to_hsv,
-        rgba_color_at, save_editor_document_to_dir_with_filename, scaled_canvas_point,
-        selected_annotation_bounds, set_active_text_edit, suggested_save_filename_at,
-        take_active_text_edit, tesseract_command_args, tesseract_command_invocation,
-        text_controls_width, text_font_button_width, text_for_annotation, text_size_button_width,
-        text_size_options, text_size_wheel_options, tool_can_select_existing, tool_icon_label,
-        tool_icon_stroke_width, tool_picks_canvas_color, update_ocr_language_selection,
+        format_magnifier_zoom, highlight_mode_options, highlight_tooltip, hsl_to_color,
+        hsv_to_color, image_color_at, magnifier_geometry, magnifier_size_for_zoom,
+        mosaic_pixel_size_for_stroke, moving_delta_and_update, next_pin_scale_save_generation,
+        normalized_save_filename, ocr_language_label, ocr_result_body_text,
+        ocr_result_primary_action, ocr_result_title, ocr_space_curl_args, ocr_space_language_arg,
+        output_action_menu_items, output_action_primary_label, parse_hex_color,
+        parse_ocr_space_response, pin_click_action, pin_context_popover_rect, pin_dimension_label,
+        pin_display_size, pin_initial_scale, pin_initial_scale_with_saved, pin_picture_can_target,
+        pin_picture_size, pin_scale_save_generation_is_current, pin_window_size,
+        pin_window_size_for_scale, pin_zoom_from_scroll, push_recent_color, remove_favorite_color,
+        render_document_png_bytes, resize_handle_at, rgb_to_hsl, rgb_to_hsv, rgba_color_at,
+        save_editor_document_to_dir_with_filename, scaled_canvas_point, selected_annotation_bounds,
+        set_active_text_edit, suggested_save_filename_at, take_active_text_edit,
+        tesseract_command_args, tesseract_command_invocation, text_controls_width,
+        text_font_button_width, text_for_annotation, text_size_button_width, text_size_options,
+        text_size_wheel_options, tool_can_select_existing, tool_icon_label, tool_icon_stroke_width,
+        tool_picks_canvas_color, update_ocr_language_selection,
     };
 
     use chrono::{Local, TimeZone};
@@ -7678,6 +8005,7 @@ mod tests {
             Point::new(10.0, 20.0),
             Color::rgba(232, 62, 38, 255),
             4,
+            HighlightMode::Marker,
         );
         draft.extend(Point::new(60.0, 80.0));
 
@@ -7693,6 +8021,7 @@ mod tests {
             Point::new(10.0, 20.0),
             Color::rgba(232, 62, 38, 255),
             4,
+            HighlightMode::Marker,
         );
         draft.extend(Point::new(60.0, 20.0));
 
@@ -7705,6 +8034,39 @@ mod tests {
             }
             other => panic!("expected marker, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn marker_block_mode_creates_resizable_highlight_region() {
+        let mut draft = DraftAnnotation::new(
+            DefaultTool::Marker,
+            Point::new(10.0, 20.0),
+            Color::rgba(232, 62, 38, 255),
+            4,
+            HighlightMode::Block,
+        );
+        draft.extend(Point::new(60.0, 80.0));
+
+        let preview = draft.preview_annotation().expect("block highlight preview");
+
+        match preview.data {
+            AnnotationData::HighlightBlock { rect, color } => {
+                assert_eq!(rect, Rect { x: 10.0, y: 20.0, width: 50.0, height: 60.0 });
+                assert_eq!(color.a, MARKER_HIGHLIGHT_ALPHA);
+            }
+            other => panic!("expected highlight block, got {other:?}"),
+        }
+        assert!(annotation_keeps_selection_after_creation(&preview));
+    }
+
+    #[test]
+    fn highlight_mode_menu_exposes_two_persistent_modes() {
+        let options = highlight_mode_options();
+
+        assert_eq!(options.len(), 2);
+        assert_eq!(options[0].0, HighlightMode::Marker);
+        assert_eq!(options[1].0, HighlightMode::Block);
+        assert!(highlight_tooltip(HighlightMode::Block).contains("Block highlight"));
     }
 
     #[test]
@@ -7967,6 +8329,7 @@ mod tests {
             Point::new(10.0, 20.0),
             Color::rgba(232, 62, 38, 255),
             12,
+            HighlightMode::Marker,
         );
         draft.extend(Point::new(60.0, 80.0));
 
@@ -7986,6 +8349,7 @@ mod tests {
             Point::new(10.0, 20.0),
             Color::rgba(232, 62, 38, 255),
             8,
+            HighlightMode::Marker,
         );
         draft.extend(Point::new(60.0, 80.0));
 
@@ -8175,6 +8539,7 @@ mod tests {
             Point::new(10.0, 20.0),
             Color::rgba(232, 62, 38, 255),
             4,
+            HighlightMode::Marker,
         ))));
         let _borrow = draft.borrow_mut();
 
@@ -8264,6 +8629,7 @@ mod tests {
             Point::new(10.0, 20.0),
             Color::rgba(232, 62, 38, 255),
             4,
+            HighlightMode::Marker,
         );
         draft.extend(Point::new(60.0, 80.0));
 

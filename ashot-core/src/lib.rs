@@ -6,7 +6,7 @@ pub mod history;
 pub mod ocr;
 pub mod workflow;
 
-pub use config::{AppConfig, AppearanceMode, ConfigError};
+pub use config::{AppConfig, AppearanceMode, ConfigError, HighlightMode};
 pub use document::{
     Annotation, AnnotationData, AnnotationId, Color, DefaultTool, Document, MARKER_HIGHLIGHT_ALPHA,
     Point, Rect, ResizeHandle, TextStyle, TextWeight, marker_highlight_color,
