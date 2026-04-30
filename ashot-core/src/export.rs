@@ -5,7 +5,8 @@ use image::{DynamicImage, ImageBuffer, Rgba, RgbaImage};
 use pango::glib::translate::{ToGlibPtr, from_glib_full};
 
 use crate::document::{
-    Annotation, AnnotationData, Color, Point, Rect, TextStyle, TextWeight, marker_highlight_color,
+    Annotation, AnnotationData, Color, MarkerFiber, Point, Rect, TextStyle, TextWeight,
+    marker_fiber_layout,
 };
 
 #[link(name = "pangocairo-1.0")]
@@ -573,15 +574,148 @@ fn draw_marker(image: &mut RgbaImage, points: &[Point], color: Color, stroke_wid
         );
     }
 
-    let rgba = color_to_rgba(marker_highlight_color(color));
+    paint_marker_trace(image, &mask, bounds, color);
+    for fiber in marker_fiber_layout(stroke_width) {
+        paint_marker_fiber(image, &mask, bounds, points, color, fiber);
+    }
+}
+
+fn paint_marker_trace(image: &mut RgbaImage, mask: &[bool], bounds: PixelRect, color: Color) {
+    let base_alpha = color.a.min(72) as f32;
+    let fill = Rgba([color.r, color.g, color.b, (base_alpha * 0.34).round() as u8]);
+    let edge = Rgba([color.r, color.g, color.b, (base_alpha * 0.68).round() as u8]);
     for y in 0..bounds.height {
         for x in 0..bounds.width {
             let idx = y as usize * bounds.width as usize + x as usize;
-            if !mask[idx] {
+            if !mask.get(idx).copied().unwrap_or(false) {
+                continue;
+            }
+            let source = if marker_mask_pixel_is_edge(mask, bounds.width, bounds.height, x, y) {
+                edge
+            } else {
+                fill
+            };
+            if let Some(pixel) = image.get_pixel_mut_checked(bounds.x + x, bounds.y + y) {
+                blend_pixel(pixel, source);
+            }
+        }
+    }
+}
+
+fn marker_mask_pixel_is_edge(mask: &[bool], width: u32, height: u32, x: u32, y: u32) -> bool {
+    for dy in -1..=1 {
+        for dx in -1..=1 {
+            if dx == 0 && dy == 0 {
+                continue;
+            }
+            let nx = x as i32 + dx;
+            let ny = y as i32 + dy;
+            if nx < 0 || ny < 0 || nx as u32 >= width || ny as u32 >= height {
+                return true;
+            }
+            let idx = ny as usize * width as usize + nx as usize;
+            if !mask.get(idx).copied().unwrap_or(false) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn paint_marker_fiber(
+    image: &mut RgbaImage,
+    mask: &[bool],
+    bounds: PixelRect,
+    points: &[Point],
+    color: Color,
+    fiber: MarkerFiber,
+) {
+    let alpha = color.a.min(72).saturating_add((fiber.opacity as f32 * 0.22).round() as u8);
+    let rgba = Rgba([color.r, color.g, color.b, alpha.min(112)]);
+    let radius = (fiber.stroke_width * 0.5).ceil().max(1.0) as i32;
+    let cycle = (fiber.dash + fiber.gap).max(1.0);
+    let dash_offset = fiber.phase * cycle;
+    let mut total_distance = 0.0;
+    let mut fiber_mask = vec![false; bounds.width as usize * bounds.height as usize];
+
+    for window in points.windows(2) {
+        let start = window[0];
+        let end = window[1];
+        let dx = end.x - start.x;
+        let dy = end.y - start.y;
+        let length = (dx * dx + dy * dy).sqrt();
+        if length <= f32::EPSILON {
+            continue;
+        }
+        let normal_x = -dy / length;
+        let normal_y = dx / length;
+        let offset_start =
+            Point::new(start.x + normal_x * fiber.offset, start.y + normal_y * fiber.offset);
+        let offset_end =
+            Point::new(end.x + normal_x * fiber.offset, end.y + normal_y * fiber.offset);
+        let steps = length.ceil().max(1.0) as i32;
+
+        for step in 0..=steps {
+            let t = step as f32 / steps as f32;
+            let distance = total_distance + length * t;
+            if (distance + dash_offset).rem_euclid(cycle) > fiber.dash {
+                continue;
+            }
+            let x = offset_start.x + (offset_end.x - offset_start.x) * t;
+            let y = offset_start.y + (offset_end.y - offset_start.y) * t;
+            mark_marker_fiber_circle(
+                &mut fiber_mask,
+                bounds,
+                x.round() as i32,
+                y.round() as i32,
+                radius,
+            );
+        }
+
+        total_distance += length;
+    }
+
+    for y in 0..bounds.height {
+        for x in 0..bounds.width {
+            let idx = y as usize * bounds.width as usize + x as usize;
+            if !fiber_mask.get(idx).copied().unwrap_or(false)
+                || !mask.get(idx).copied().unwrap_or(false)
+            {
                 continue;
             }
             if let Some(pixel) = image.get_pixel_mut_checked(bounds.x + x, bounds.y + y) {
                 blend_pixel(pixel, rgba);
+            }
+        }
+    }
+}
+
+fn mark_marker_fiber_circle(
+    fiber_mask: &mut [bool],
+    bounds: PixelRect,
+    center_x: i32,
+    center_y: i32,
+    radius: i32,
+) {
+    for dy in -radius..=radius {
+        for dx in -radius..=radius {
+            if dx * dx + dy * dy > radius * radius {
+                continue;
+            }
+            let x = center_x + dx;
+            let y = center_y + dy;
+            if x < bounds.x as i32
+                || y < bounds.y as i32
+                || x >= (bounds.x + bounds.width) as i32
+                || y >= (bounds.y + bounds.height) as i32
+            {
+                continue;
+            }
+            let local_x = x - bounds.x as i32;
+            let local_y = y - bounds.y as i32;
+            let idx = local_y as usize * bounds.width as usize + local_x as usize;
+            if let Some(cell) = fiber_mask.get_mut(idx) {
+                *cell = true;
             }
         }
     }
@@ -1138,9 +1272,44 @@ mod tests {
         let rendered = render_document_from_rgba(&base, &annotations);
         let pixel = rendered.get_pixel(20, 8);
 
-        assert!(pixel[0] < 230, "marker red channel compounded to {}", pixel[0]);
+        assert!(pixel[0] < 245, "marker red channel washed out to {}", pixel[0]);
         assert!(pixel[1] > 95, "marker green channel was crushed to {}", pixel[1]);
         assert!(pixel[2] > 95, "marker blue channel was crushed to {}", pixel[2]);
+    }
+
+    #[test]
+    fn marker_export_draws_same_color_fibers_inside_marker_trace() {
+        let base = RgbaImage::from_pixel(96, 32, Rgba([255, 255, 255, 255]));
+        let annotations = vec![Annotation::new(AnnotationData::Marker {
+            points: vec![Point::new(8.0, 16.0), Point::new(88.0, 16.0)],
+            color: Color::rgba(255, 0, 0, 255),
+            stroke_width: 18,
+        })];
+
+        let rendered = render_document_from_rgba(&base, &annotations);
+        let changed = rendered
+            .pixels()
+            .filter(|pixel| **pixel != Rgba([255, 255, 255, 255]))
+            .collect::<Vec<_>>();
+
+        assert!(!changed.is_empty(), "marker should render visible fiber strokes on white");
+        assert!(
+            changed.iter().all(|pixel| pixel[0] >= pixel[1] && pixel[0] >= pixel[2]),
+            "all marker fiber lines should use the selected marker hue"
+        );
+        let center = rendered.get_pixel(48, 16);
+        assert_ne!(
+            center,
+            &Rgba([255, 255, 255, 255]),
+            "marker center should show the original marker stroke trace"
+        );
+        let edge = rendered.get_pixel(48, 7);
+        assert_ne!(edge, &Rgba([255, 255, 255, 255]), "marker edge should show a visible boundary");
+        assert_eq!(
+            rendered.get_pixel(48, 2),
+            &Rgba([255, 255, 255, 255]),
+            "fibers should not render outside the marker stroke area"
+        );
     }
 
     #[test]

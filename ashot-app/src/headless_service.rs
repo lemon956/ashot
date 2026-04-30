@@ -6,8 +6,13 @@ use std::{
 use anyhow::{Context, Result};
 use ashot_capture::{CaptureClient, CaptureError};
 use ashot_core::{Annotation, AppConfig, finalize_capture_with_config};
-use ashot_ipc::{CaptureMode, CaptureOutcome, CommandOutcome, DBUS_NAME, DBUS_PATH, OutcomeKind};
-use tokio::{runtime::Builder, sync::Mutex as AsyncMutex};
+use ashot_ipc::{
+    APP_VERSION, CaptureMode, CaptureOutcome, CommandOutcome, DBUS_NAME, DBUS_PATH, OutcomeKind,
+};
+use tokio::{
+    runtime::Builder,
+    sync::{Mutex as AsyncMutex, oneshot},
+};
 use tracing::error;
 use tracing_subscriber::{EnvFilter, fmt};
 use url::Url;
@@ -30,8 +35,9 @@ pub fn run() -> Result<()> {
         .context("failed to create tokio runtime")?;
     runtime.block_on(async {
         let config = AppConfig::load_or_create().unwrap_or_default();
-        let state = Arc::new(HeadlessState::new(config));
-        if let Err(error) = register_service(state).await {
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let state = Arc::new(HeadlessState::new(config, shutdown_tx));
+        if let Err(error) = register_service(state, shutdown_rx).await {
             error!("failed to register headless DBus service: {error:#}");
             return Err(error);
         }
@@ -42,11 +48,16 @@ pub fn run() -> Result<()> {
 struct HeadlessState {
     config: Mutex<AppConfig>,
     capture_lock: AsyncMutex<()>,
+    shutdown_tx: Mutex<Option<oneshot::Sender<()>>>,
 }
 
 impl HeadlessState {
-    fn new(config: AppConfig) -> Self {
-        Self { config: Mutex::new(config), capture_lock: AsyncMutex::new(()) }
+    fn new(config: AppConfig, shutdown_tx: oneshot::Sender<()>) -> Self {
+        Self {
+            config: Mutex::new(config),
+            capture_lock: AsyncMutex::new(()),
+            shutdown_tx: Mutex::new(Some(shutdown_tx)),
+        }
     }
 
     fn config_snapshot(&self) -> AppConfig {
@@ -150,6 +161,15 @@ impl HeadlessState {
             ),
         }
     }
+
+    fn quit(&self) -> CommandOutcome {
+        if let Ok(mut sender) = self.shutdown_tx.lock()
+            && let Some(sender) = sender.take()
+        {
+            let _ = sender.send(());
+        }
+        CommandOutcome::ok("service stopping")
+    }
 }
 
 fn capture_message(mode: CaptureMode) -> &'static str {
@@ -160,14 +180,17 @@ fn capture_message(mode: CaptureMode) -> &'static str {
     }
 }
 
-async fn register_service(state: Arc<HeadlessState>) -> Result<()> {
+async fn register_service(
+    state: Arc<HeadlessState>,
+    shutdown_rx: oneshot::Receiver<()>,
+) -> Result<()> {
     let service = HeadlessDbusService { state };
     let _connection = ConnectionBuilder::session()?
         .name(DBUS_NAME)?
         .serve_at(DBUS_PATH, service)?
         .build()
         .await?;
-    std::future::pending::<()>().await;
+    let _ = shutdown_rx.await;
     Ok(())
 }
 
@@ -218,5 +241,15 @@ impl HeadlessDbusService {
         annotations_json: &str,
     ) -> CaptureOutcome {
         self.state.finalize_capture(source_file_uri, annotations_json)
+    }
+
+    #[zbus(name = "Version")]
+    async fn version(&self) -> String {
+        APP_VERSION.to_string()
+    }
+
+    #[zbus(name = "Quit")]
+    async fn quit(&self) -> CommandOutcome {
+        self.state.quit()
     }
 }

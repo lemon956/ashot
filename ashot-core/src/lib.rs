@@ -9,7 +9,8 @@ pub mod workflow;
 pub use config::{AppConfig, AppearanceMode, ConfigError};
 pub use document::{
     Annotation, AnnotationData, AnnotationId, Color, DefaultTool, Document, MARKER_HIGHLIGHT_ALPHA,
-    Point, Rect, ResizeHandle, TextStyle, TextWeight, marker_highlight_color,
+    MARKER_MULTI_FIBER_MIN_WIDTH, MARKER_STROKE_MULTIPLIER, MarkerFiber, Point, Rect, ResizeHandle,
+    TextStyle, TextWeight, marker_fiber_layout, marker_highlight_color, marker_visual_stroke_width,
 };
 pub use export::{draw_text_cairo, render_document, save_document_png};
 pub use filename::render_filename;

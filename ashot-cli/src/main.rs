@@ -7,7 +7,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use ashot_ipc::{AshotProxy, CaptureOutcome, CommandOutcome, DBUS_NAME, OutcomeKind};
+use ashot_ipc::{APP_VERSION, AshotProxy, CaptureOutcome, CommandOutcome, DBUS_NAME, OutcomeKind};
 use clap::{Args, Parser, Subcommand};
 use tokio::{process::Command, time::sleep};
 use tracing_subscriber::{EnvFilter, fmt};
@@ -257,7 +257,7 @@ fn outcome_to_exit_code(kind: OutcomeKind) -> ExitCode {
 
 async fn ensure_service() -> Result<Connection> {
     if let Ok(connection) = Connection::session().await {
-        if service_is_running(&connection).await? {
+        if current_service_is_running(&connection).await? {
             return Ok(connection);
         }
     }
@@ -270,13 +270,32 @@ async fn ensure_service() -> Result<Connection> {
     for _ in 0..40 {
         sleep(Duration::from_millis(250)).await;
         if let Ok(connection) = Connection::session().await {
-            if service_is_running(&connection).await? {
+            if current_service_is_running(&connection).await? {
                 return Ok(connection);
             }
         }
     }
 
     Err(anyhow::anyhow!("background service did not appear on DBus after launch"))
+}
+
+async fn current_service_is_running(connection: &Connection) -> Result<bool> {
+    if !service_is_running(connection).await? {
+        return Ok(false);
+    }
+
+    let proxy = AshotProxy::new(connection).await?;
+    let reported_version = proxy.version().await.ok();
+    if service_version_status(reported_version.as_deref()) {
+        return Ok(true);
+    }
+
+    let _ = proxy.quit().await;
+    Ok(false)
+}
+
+fn service_version_status(reported_version: Option<&str>) -> bool {
+    reported_version == Some(APP_VERSION)
 }
 
 fn resolve_app_binary() -> Result<PathBuf> {
@@ -309,7 +328,7 @@ async fn name_has_owner(connection: &Connection, name: &str) -> Result<bool> {
 mod tests {
     use clap::Parser;
 
-    use super::{Cli, CommandKind, resolved_command};
+    use super::{Cli, CommandKind, resolved_command, service_version_status};
 
     #[test]
     fn parses_gui_with_flameshot_final_actions() {
@@ -366,5 +385,12 @@ mod tests {
             }
             other => panic!("unexpected command: {other:?}"),
         }
+    }
+
+    #[test]
+    fn service_version_status_requires_current_version() {
+        assert!(service_version_status(Some(env!("CARGO_PKG_VERSION"))));
+        assert!(!service_version_status(Some("0.0.0")));
+        assert!(!service_version_status(None));
     }
 }

@@ -1,0 +1,565 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>aShot Marker Highlight Preview</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --ink: #1d2428;
+      --muted: #637179;
+      --paper: #fbfaf7;
+      --line: rgba(34, 42, 45, 0.14);
+      --marker: rgba(196, 206, 198, 0.18);
+      --edge: rgba(88, 100, 96, 0.18);
+      --shadow: 0 18px 42px rgba(24, 34, 36, 0.12);
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background:
+        radial-gradient(circle at 12% 8%, rgba(174, 202, 190, 0.22), transparent 28rem),
+        radial-gradient(circle at 86% 18%, rgba(225, 218, 190, 0.22), transparent 24rem),
+        linear-gradient(180deg, #f7f8f5, #edece8);
+      color: var(--ink);
+      font-family: ui-serif, Georgia, "Times New Roman", "Noto Serif CJK SC", serif;
+    }
+
+    main {
+      width: min(1180px, calc(100vw - 40px));
+      margin: 0 auto;
+      padding: 34px 0 44px;
+    }
+
+    header {
+      display: flex;
+      align-items: end;
+      justify-content: space-between;
+      gap: 24px;
+      padding-bottom: 22px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    h1 {
+      margin: 0;
+      font-size: clamp(28px, 3.2vw, 46px);
+      line-height: 1;
+      letter-spacing: 0;
+      font-weight: 650;
+    }
+
+    .note {
+      max-width: 520px;
+      margin: 0;
+      color: var(--muted);
+      font-family: ui-sans-serif, "Noto Sans CJK SC", system-ui, sans-serif;
+      font-size: 14px;
+      line-height: 1.7;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 18px;
+      margin-top: 22px;
+    }
+
+    .sample {
+      position: relative;
+      min-height: 292px;
+      padding: 20px 22px 22px;
+      overflow: hidden;
+      background:
+        linear-gradient(90deg, rgba(34, 42, 45, 0.035) 1px, transparent 1px) 0 0 / 28px 28px,
+        linear-gradient(rgba(34, 42, 45, 0.026) 1px, transparent 1px) 0 0 / 28px 28px,
+        var(--paper);
+      border: 1px solid rgba(45, 56, 58, 0.16);
+      border-radius: 8px;
+      box-shadow: var(--shadow);
+    }
+
+    .sample.paper-fiber {
+      background:
+        radial-gradient(circle at 14% 18%, rgba(192, 218, 178, 0.18), transparent 12rem),
+        linear-gradient(90deg, rgba(34, 42, 45, 0.035) 1px, transparent 1px) 0 0 / 28px 28px,
+        linear-gradient(rgba(34, 42, 45, 0.026) 1px, transparent 1px) 0 0 / 28px 28px,
+        #fbfaf2;
+      border-color: rgba(89, 121, 80, 0.26);
+    }
+
+    .sample.frosted {
+      background:
+        linear-gradient(135deg, rgba(210, 234, 246, 0.52), rgba(249, 252, 252, 0.72)),
+        linear-gradient(90deg, rgba(21, 72, 96, 0.038) 1px, transparent 1px) 0 0 / 28px 28px,
+        #f7fbfc;
+      border-color: rgba(58, 112, 139, 0.26);
+    }
+
+    .sample.soft-stroke {
+      background:
+        radial-gradient(circle at 84% 20%, rgba(255, 221, 138, 0.2), transparent 15rem),
+        linear-gradient(90deg, rgba(64, 47, 11, 0.032) 1px, transparent 1px) 0 0 / 28px 28px,
+        #fffaf0;
+      border-color: rgba(176, 134, 42, 0.26);
+    }
+
+    .sample.micro-glint {
+      background:
+        radial-gradient(circle at 20% 14%, rgba(219, 212, 255, 0.38), transparent 13rem),
+        radial-gradient(circle at 86% 82%, rgba(193, 232, 218, 0.28), transparent 14rem),
+        linear-gradient(90deg, rgba(58, 55, 93, 0.04) 1px, transparent 1px) 0 0 / 28px 28px,
+        #fbfaff;
+      border-color: rgba(106, 94, 171, 0.28);
+    }
+
+    .sample h2 {
+      margin: 0 0 12px;
+      font-family: ui-sans-serif, "Noto Sans CJK SC", system-ui, sans-serif;
+      font-size: 15px;
+      line-height: 1.2;
+      font-weight: 700;
+      letter-spacing: 0;
+    }
+
+    .body-copy {
+      position: relative;
+      z-index: 2;
+      max-width: 92%;
+      font-size: 23px;
+      line-height: 1.95;
+      letter-spacing: 0;
+    }
+
+    .mark {
+      position: relative;
+      display: inline;
+      padding: 0 0.04em;
+      color: #162024;
+      background: transparent;
+      -webkit-box-decoration-break: clone;
+      box-decoration-break: clone;
+    }
+
+    .mark::before,
+    .mark::after {
+      content: "";
+      position: absolute;
+      pointer-events: none;
+      left: -0.16em;
+      right: -0.14em;
+      top: 0.38em;
+      bottom: 0.18em;
+      z-index: -1;
+    }
+
+    .label {
+      position: absolute;
+      right: 16px;
+      bottom: 12px;
+      color: rgba(35, 47, 51, 0.48);
+      font-family: ui-monospace, "SFMono-Regular", Consolas, monospace;
+      font-size: 12px;
+    }
+
+    .paper-fiber .mark::before {
+      left: -0.22em;
+      right: -0.2em;
+      top: 0.34em;
+      bottom: 0.12em;
+      border-radius: 10px 16px 8px 14px / 16px 9px 15px 8px;
+      background:
+        linear-gradient(172deg, transparent 10%, rgba(75, 98, 45, 0.2) 10% 13%, transparent 13% 25%, rgba(255, 255, 255, 0.42) 25% 28%, transparent 28% 43%, rgba(82, 112, 48, 0.15) 43% 46%, transparent 46% 61%, rgba(255, 255, 255, 0.36) 61% 64%, transparent 64%),
+        radial-gradient(ellipse at 9% 50%, rgba(255, 255, 255, 0.68) 0 1px, transparent 2.4px),
+        radial-gradient(ellipse at 29% 62%, rgba(64, 89, 50, 0.2) 0 0.9px, transparent 2px),
+        radial-gradient(ellipse at 58% 34%, rgba(255, 255, 255, 0.58) 0 1.1px, transparent 2.4px),
+        repeating-linear-gradient(103deg, rgba(64, 92, 56, 0.12) 0 1px, transparent 1px 8px),
+        rgba(177, 210, 118, 0.36);
+      filter: url(#roughen);
+      box-shadow:
+        inset 0 -2px 0 rgba(75, 98, 45, 0.2),
+        inset 0 1px 0 rgba(255, 255, 255, 0.7);
+    }
+
+    .frosted .mark::before {
+      left: -0.12em;
+      right: -0.12em;
+      top: 0.24em;
+      bottom: 0.08em;
+      border-radius: 999px;
+      background:
+        linear-gradient(180deg, rgba(255, 255, 255, 0.78), rgba(255, 255, 255, 0.18) 45%, rgba(129, 199, 230, 0.22)),
+        rgba(161, 216, 238, 0.3);
+      box-shadow:
+        inset 0 0 0 1px rgba(255, 255, 255, 0.9),
+        inset 0 -3px 9px rgba(33, 96, 129, 0.16),
+        0 2px 8px rgba(45, 96, 126, 0.12);
+      backdrop-filter: blur(2.4px) saturate(1.15);
+    }
+
+    .frosted .mark::after {
+      left: 0.04em;
+      right: 0.2em;
+      top: 0.32em;
+      bottom: 0.58em;
+      border-radius: 999px;
+      background: rgba(255, 255, 255, 0.65);
+      filter: blur(0.5px);
+    }
+
+    .soft-stroke .mark::before {
+      left: -0.28em;
+      right: -0.28em;
+      top: 0.46em;
+      bottom: 0.02em;
+      border-radius: 999px 20px 999px 18px / 18px 999px 16px 999px;
+      background:
+        linear-gradient(90deg, rgba(255, 205, 49, 0.22), rgba(255, 246, 172, 0.5), rgba(255, 195, 38, 0.24)),
+        rgba(255, 222, 82, 0.26);
+      filter: blur(1.6px);
+      box-shadow:
+        0 0 0 1px rgba(179, 130, 28, 0.12),
+        0 4px 15px rgba(214, 155, 25, 0.15);
+    }
+
+    .soft-stroke .mark::after {
+      top: 0.58em;
+      bottom: 0.2em;
+      left: -0.16em;
+      right: 0.12em;
+      border-radius: 999px;
+      background: rgba(255, 250, 197, 0.52);
+      filter: blur(2.4px);
+    }
+
+    .micro-glint .mark::before {
+      left: -0.18em;
+      right: -0.18em;
+      top: 0.4em;
+      bottom: 0.12em;
+      border-radius: 12px 10px 11px 9px / 11px 13px 9px 12px;
+      background:
+        radial-gradient(circle at 8% 44%, rgba(255, 255, 255, 0.96) 0 1.8px, transparent 2.6px),
+        radial-gradient(circle at 17% 66%, rgba(117, 96, 188, 0.3) 0 1.2px, transparent 2.1px),
+        radial-gradient(circle at 31% 38%, rgba(255, 255, 255, 0.95) 0 1.5px, transparent 2.5px),
+        radial-gradient(circle at 48% 58%, rgba(100, 187, 176, 0.32) 0 1.2px, transparent 2.2px),
+        radial-gradient(circle at 66% 32%, rgba(255, 255, 255, 0.9) 0 1.6px, transparent 2.6px),
+        radial-gradient(circle at 83% 60%, rgba(130, 105, 205, 0.34) 0 1.2px, transparent 2.2px),
+        rgba(196, 187, 244, 0.23);
+      box-shadow:
+        inset 0 -1px 0 rgba(88, 75, 151, 0.12),
+        inset 0 1px 0 rgba(255, 255, 255, 0.56);
+      animation: glint 1.35s ease-in-out infinite;
+    }
+
+    .micro-glint .mark:nth-of-type(2)::before {
+      animation-duration: 1.65s;
+      animation-delay: -0.5s;
+    }
+
+    @keyframes glint {
+      0%, 100% {
+        opacity: 0.66;
+      }
+      45% {
+        opacity: 1;
+      }
+      70% {
+        opacity: 0.78;
+      }
+    }
+
+    .stroke-path {
+      position: absolute;
+      left: 20px;
+      right: 20px;
+      bottom: 48px;
+      height: 58px;
+      opacity: 0.82;
+    }
+
+    .stroke-path svg {
+      width: 100%;
+      height: 100%;
+      overflow: visible;
+    }
+
+    .stroke-path path {
+      fill: none;
+      stroke: rgba(112, 130, 123, 0.28);
+      stroke-width: 22;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+    }
+
+    .paper-fiber .stroke-path {
+      height: 104px;
+      bottom: 24px;
+    }
+
+    .paper-fiber .stroke-path path {
+      stroke: rgba(143, 181, 78, 0.38);
+      stroke-width: 26;
+      filter: url(#roughen);
+    }
+
+    .paper-fiber .stroke-path .thin-base {
+      stroke-width: 13;
+      stroke: rgba(143, 181, 78, 0.34);
+    }
+
+    .paper-fiber .stroke-path .thick-base {
+      stroke-width: 31;
+      stroke: rgba(143, 181, 78, 0.4);
+    }
+
+    .frosted .stroke-path path {
+      stroke: rgba(106, 185, 222, 0.34);
+      stroke-width: 18;
+    }
+
+    .soft-stroke .stroke-path path {
+      stroke: rgba(255, 206, 48, 0.42);
+      stroke-width: 30;
+      filter: blur(1.2px);
+    }
+
+    .micro-glint .stroke-path path {
+      stroke: rgba(165, 148, 226, 0.26);
+      stroke-width: 20;
+    }
+
+    .stroke-path .fine {
+      stroke: rgba(255, 255, 255, 0.46);
+      stroke-width: 5;
+      stroke-dasharray: 1 17;
+      animation: drift 2.7s ease-in-out infinite alternate;
+    }
+
+    .paper-fiber .stroke-path .fine {
+      stroke: rgba(73, 112, 50, 0.26);
+      stroke-dasharray: 12 10;
+      stroke-width: 2.4;
+      animation-duration: 1.7s;
+    }
+
+    .paper-fiber .stroke-path .fiber {
+      stroke-linecap: round;
+      stroke-linejoin: round;
+      fill: none;
+      filter: none;
+      animation: strand-flow 1.8s linear infinite;
+    }
+
+    .paper-fiber .stroke-path .fiber-a {
+      stroke: rgba(73, 112, 50, 0.36);
+      stroke-width: 2.8;
+      stroke-dasharray: 48 18 22 16;
+      animation-duration: 1.55s;
+    }
+
+    .paper-fiber .stroke-path .fiber-b {
+      stroke: rgba(73, 112, 50, 0.24);
+      stroke-width: 3.2;
+      stroke-dasharray: 34 20 58 24;
+      animation-duration: 2.1s;
+      animation-direction: reverse;
+    }
+
+    .paper-fiber .stroke-path .fiber-c {
+      stroke: rgba(73, 112, 50, 0.28);
+      stroke-width: 2.2;
+      stroke-dasharray: 18 12 40 18;
+      animation-duration: 1.25s;
+    }
+
+    .paper-fiber .stroke-path .fiber-d {
+      stroke: rgba(73, 112, 50, 0.2);
+      stroke-width: 2.4;
+      stroke-dasharray: 24 16 30 20;
+      animation-duration: 2.45s;
+      animation-direction: reverse;
+    }
+
+    .paper-fiber .stroke-path .single-fiber {
+      stroke: rgba(73, 112, 50, 0.34);
+      stroke-width: 2.6;
+      stroke-dasharray: 42 18 28 14;
+      animation: strand-flow 1.6s linear infinite;
+    }
+
+    .paper-fiber .stroke-caption {
+      position: absolute;
+      left: 8px;
+      color: rgba(41, 62, 34, 0.56);
+      font-family: ui-monospace, "SFMono-Regular", Consolas, monospace;
+      font-size: 10px;
+      letter-spacing: 0;
+    }
+
+    .paper-fiber .stroke-caption.thin {
+      top: 10px;
+    }
+
+    .paper-fiber .stroke-caption.thick {
+      top: 54px;
+    }
+
+    .frosted .stroke-path .fine {
+      stroke: rgba(255, 255, 255, 0.78);
+      stroke-dasharray: 44 80;
+      stroke-width: 7;
+    }
+
+    .soft-stroke .stroke-path .fine {
+      stroke: rgba(255, 250, 188, 0.78);
+      stroke-dasharray: none;
+      stroke-width: 10;
+      filter: blur(1px);
+    }
+
+    .micro-glint .stroke-path .fine {
+      stroke: rgba(255, 255, 255, 0.78);
+      stroke-dasharray: 2 18;
+      stroke-width: 5;
+      animation-duration: 1.1s;
+    }
+
+    @keyframes drift {
+      from {
+        stroke-dashoffset: 0;
+      }
+      to {
+        stroke-dashoffset: 18;
+      }
+    }
+
+    @keyframes strand-flow {
+      from {
+        stroke-dashoffset: 0;
+      }
+      to {
+        stroke-dashoffset: -96;
+      }
+    }
+
+    @media (max-width: 800px) {
+      header {
+        display: block;
+      }
+
+      .note {
+        margin-top: 12px;
+      }
+
+      .grid {
+        grid-template-columns: 1fr;
+      }
+
+      .body-copy {
+        font-size: 20px;
+      }
+    }
+  </style>
+</head>
+<body>
+  <svg width="0" height="0" aria-hidden="true">
+    <filter id="roughen">
+      <feTurbulence type="fractalNoise" baseFrequency="0.032 0.16" numOctaves="2" seed="7" result="noise"></feTurbulence>
+      <feDisplacementMap in="SourceGraphic" in2="noise" scale="2.4" xChannelSelector="R" yChannelSelector="G"></feDisplacementMap>
+    </filter>
+  </svg>
+
+  <main>
+    <header>
+      <h1>Marker Highlight Studies</h1>
+      <p class="note">四个方向都使用几乎透明的高亮基底，重点比较“可见但不遮字”的质感。底部曲线模拟真实画笔拖过的边界和连续笔触。</p>
+    </header>
+
+    <section class="grid">
+      <article class="sample paper-fiber">
+        <h2>1. 纸感荧光笔 · 粗笔迹才显示多条</h2>
+        <p class="body-copy">
+          截图标注时，<span class="mark">高亮应该像真实笔触一样轻</span>，文字仍然是第一视觉层级。
+        </p>
+        <div class="stroke-path">
+          <span class="stroke-caption thin">thin marker: single animated strand</span>
+          <span class="stroke-caption thick">thick marker: multiple animated strands</span>
+          <svg viewBox="0 0 520 112" preserveAspectRatio="none">
+            <defs>
+              <mask id="paper-thin-trace-mask" maskUnits="userSpaceOnUse">
+                <rect x="0" y="0" width="520" height="112" fill="black"></rect>
+                <path d="M12 27 C96 18 164 38 246 28 S390 18 508 30" fill="none" stroke="white" stroke-width="13" stroke-linecap="round" stroke-linejoin="round"></path>
+              </mask>
+              <mask id="paper-thick-trace-mask" maskUnits="userSpaceOnUse">
+                <rect x="0" y="0" width="520" height="112" fill="black"></rect>
+                <path d="M10 78 C95 62 160 88 245 74 S390 65 510 80" fill="none" stroke="white" stroke-width="31" stroke-linecap="round" stroke-linejoin="round"></path>
+              </mask>
+            </defs>
+            <path class="thin-base" d="M12 27 C96 18 164 38 246 28 S390 18 508 30"></path>
+            <g mask="url(#paper-thin-trace-mask)">
+              <path class="single-fiber" d="M16 27 C100 19 166 38 248 28 S388 19 504 30"></path>
+            </g>
+            <path class="thick-base" d="M10 78 C95 62 160 88 245 74 S390 65 510 80"></path>
+            <g mask="url(#paper-thick-trace-mask)">
+              <path class="fine" d="M14 77 C100 64 165 87 248 74 S388 66 506 79"></path>
+              <path class="fiber fiber-a" d="M18 67 C105 58 174 79 251 68 S390 59 502 69"></path>
+              <path class="fiber fiber-b" d="M12 76 C98 64 158 89 244 76 S386 68 510 78"></path>
+              <path class="fiber fiber-c" d="M20 85 C112 72 171 95 254 83 S393 75 504 86"></path>
+              <path class="fiber fiber-d" d="M28 93 C116 82 184 98 262 91 S396 84 496 94"></path>
+            </g>
+          </svg>
+        </div>
+        <span class="label">animated strands by marker width</span>
+      </article>
+
+      <article class="sample frosted">
+        <h2>2. 磨砂高亮</h2>
+        <p class="body-copy">
+          截图标注时，<span class="mark">高亮应该像一层薄薄的透明膜</span>，只留下边缘和轻微反光。
+        </p>
+        <div class="stroke-path">
+          <svg viewBox="0 0 520 70" preserveAspectRatio="none">
+            <path d="M10 38 C95 22 160 48 245 34 S390 25 510 40"></path>
+            <path class="fine" d="M14 37 C100 24 165 47 248 34 S388 26 506 39"></path>
+          </svg>
+        </div>
+        <span class="label">frosted film</span>
+      </article>
+
+      <article class="sample soft-stroke">
+        <h2>3. 柔光笔触</h2>
+        <p class="body-copy">
+          截图标注时，<span class="mark">高亮只需要提示这一段被选中</span>，不要出现明显装饰图案。
+        </p>
+        <div class="stroke-path">
+          <svg viewBox="0 0 520 70" preserveAspectRatio="none">
+            <path d="M10 38 C95 22 160 48 245 34 S390 25 510 40"></path>
+            <path class="fine" d="M14 37 C100 24 165 47 248 34 S388 26 506 39"></path>
+          </svg>
+        </div>
+        <span class="label">soft edge + clear center</span>
+      </article>
+
+      <article class="sample micro-glint">
+        <h2>4. 细碎闪粉感</h2>
+        <p class="body-copy">
+          截图标注时，<span class="mark">高亮可以带一点很细的闪动颗粒</span>，但不能像图案贴纸。
+        </p>
+        <div class="stroke-path">
+          <svg viewBox="0 0 520 70" preserveAspectRatio="none">
+            <path d="M10 38 C95 22 160 48 245 34 S390 25 510 40"></path>
+            <path class="fine" d="M14 37 C100 24 165 47 248 34 S388 26 506 39"></path>
+          </svg>
+        </div>
+        <span class="label">tiny glints</span>
+      </article>
+    </section>
+  </main>
+</body>
+</html>

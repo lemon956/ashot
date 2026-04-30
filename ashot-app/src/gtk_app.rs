@@ -7,7 +7,7 @@ use std::{
     path::{Path, PathBuf},
     rc::Rc,
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use crate::render_cache::{RenderCache, RenderCacheCallback, save_png_bytes_to_dir_with_filename};
@@ -17,11 +17,12 @@ use ashot_core::{
     Annotation, AnnotationData, AppConfig, AppearanceMode, Color, DefaultTool, Document,
     EditorHistory, LinuxDistroFamily, OcrBackend, Point, Rect, ResizeHandle, TextStyle, TextWeight,
     default_ocr_languages, detect_linux_distro_family, finalize_capture_with_config,
-    language_install_command, language_package_for_distro, marker_highlight_color, render_filename,
-    search_ocr_languages,
+    language_install_command, language_package_for_distro, marker_fiber_layout,
+    marker_highlight_color, marker_visual_stroke_width, render_filename, search_ocr_languages,
 };
 use ashot_ipc::{
-    APP_ID, CaptureMode, CaptureOutcome, CommandOutcome, DBUS_NAME, DBUS_PATH, OutcomeKind,
+    APP_ID, APP_VERSION, CaptureMode, CaptureOutcome, CommandOutcome, DBUS_NAME, DBUS_PATH,
+    OutcomeKind,
 };
 use glib::prelude::IsA;
 use glib::translate::ToGlibPtr;
@@ -143,6 +144,7 @@ enum UiCommand {
     OpenSettings,
     Pin(PathBuf),
     Capture { mode: CaptureMode, respond_to: oneshot::Sender<CaptureOutcome> },
+    Quit,
 }
 
 #[derive(Debug)]
@@ -303,6 +305,11 @@ impl ServiceState {
             ),
         }
     }
+
+    fn quit(&self) -> CommandOutcome {
+        let _ = self.ui_tx.send(UiCommand::Quit);
+        CommandOutcome::ok("service stopping")
+    }
 }
 
 fn persist_config_change<F>(state: &Arc<ServiceState>, update: F)
@@ -380,6 +387,16 @@ impl DbusService {
     ) -> CaptureOutcome {
         self.state.finalize_capture(source_file_uri, annotations_json)
     }
+
+    #[zbus(name = "Version")]
+    async fn version(&self) -> String {
+        APP_VERSION.to_string()
+    }
+
+    #[zbus(name = "Quit")]
+    async fn quit(&self) -> CommandOutcome {
+        self.state.quit()
+    }
 }
 
 struct UiRuntime {
@@ -453,6 +470,10 @@ impl UiRuntime {
                             mode,
                             respond_to,
                         );
+                    }
+                    UiCommand::Quit => {
+                        app.quit();
+                        return glib::ControlFlow::Break;
                     }
                 }
             }
@@ -1379,6 +1400,30 @@ fn present_editor(
     canvas.set_valign(Align::Start);
     overlay.add_overlay(&canvas);
     info!("present_editor canvas added");
+    let window_for_marker_animation = window.downgrade();
+    let canvas_for_marker_animation = canvas.clone();
+    let document_for_marker_animation = document.clone();
+    let draft_for_marker_animation = draft.clone();
+    glib::timeout_add_local(Duration::from_millis(100), move || {
+        if window_for_marker_animation.upgrade().is_none() {
+            return glib::ControlFlow::Break;
+        }
+
+        let marker_visible = document_for_marker_animation.try_borrow().is_ok_and(|document| {
+            document.active_tool == DefaultTool::Marker
+                || document
+                    .annotations
+                    .iter()
+                    .any(|annotation| matches!(annotation.data, AnnotationData::Marker { .. }))
+        }) || draft_for_marker_animation.try_borrow().is_ok_and(|draft| {
+            draft.as_ref().is_some_and(|draft| draft.tool == DefaultTool::Marker)
+        });
+
+        if marker_visible {
+            canvas_for_marker_animation.queue_draw();
+        }
+        glib::ControlFlow::Continue
+    });
 
     let text_entry = Entry::new();
     text_entry.set_width_chars(24);
@@ -1621,12 +1666,13 @@ fn present_editor(
     canvas.set_draw_func(move |_, cr, draw_width, draw_height| {
         let _ = cr.save();
         let scale = scale_for_draw.get();
+        let marker_animation_time = marker_animation_time_seconds();
         cr.scale(scale, scale);
         cr.set_line_join(gtk::cairo::LineJoin::Round);
         cr.set_line_cap(gtk::cairo::LineCap::Round);
         if let Some(annotations) = annotation_snapshot_for_draw(&doc_for_draw) {
             for annotation in &annotations {
-                draw_annotation(cr, annotation);
+                draw_annotation(cr, annotation, marker_animation_time);
             }
         }
         if let Ok(document) = doc_for_draw.try_borrow()
@@ -1635,19 +1681,19 @@ fn present_editor(
             draw_selection_overlay(cr, bounds, selected_annotation_has_resize_handles(&document));
         }
         if let Some(annotation) = draft_preview_for_draw(&draft_for_draw) {
-            draw_annotation(cr, &annotation);
+            draw_annotation(cr, &annotation, marker_animation_time);
         }
         if let Ok(document) = doc_for_draw.try_borrow()
             && matches!(document.active_tool, DefaultTool::Brush | DefaultTool::Marker)
             && draft_for_draw.try_borrow().is_ok_and(|draft| draft.is_none())
             && let Some(point) = brush_cursor_for_draw.get()
         {
-            draw_brush_cursor_preview(
-                cr,
-                point,
-                active_color_for_draw.get(),
-                active_stroke_for_draw.get(),
-            );
+            let cursor_width = if document.active_tool == DefaultTool::Marker {
+                marker_visual_stroke_width(active_stroke_for_draw.get())
+            } else {
+                active_stroke_for_draw.get()
+            };
+            draw_brush_cursor_preview(cr, point, active_color_for_draw.get(), cursor_width);
         }
         let _ = cr.restore();
         if let Ok(document) = doc_for_draw.try_borrow()
@@ -4212,8 +4258,8 @@ fn editor_favorite_palette() -> [(&'static str, Color); 4] {
     ]
 }
 
-fn editor_stroke_widths() -> [u32; 5] {
-    [2, 4, 6, 8, 12]
+fn editor_stroke_widths() -> [u32; 16] {
+    [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
 }
 
 fn selected_color_preview(active_color: Rc<Cell<Color>>) -> DrawingArea {
@@ -6432,7 +6478,7 @@ impl DraftAnnotation {
             DefaultTool::Marker => Some(Annotation::new(AnnotationData::Marker {
                 points: self.points.clone(),
                 color: marker_highlight_color(self.color),
-                stroke_width: self.stroke_width.max(8),
+                stroke_width: marker_visual_stroke_width(self.stroke_width),
             })),
             DefaultTool::Mosaic => Some(Annotation::new(AnnotationData::Mosaic {
                 rect: Rect::from_points(self.start, end),
@@ -6709,7 +6755,7 @@ fn draw_blur_preview(cr: &gtk::cairo::Context, rect: Rect, radius: u32) {
     let _ = cr.stroke();
 }
 
-fn draw_annotation(cr: &gtk::cairo::Context, annotation: &Annotation) {
+fn draw_annotation(cr: &gtk::cairo::Context, annotation: &Annotation, marker_animation_time: f64) {
     match &annotation.data {
         AnnotationData::Text { origin, text, style } => {
             ashot_core::draw_text_cairo(cr, *origin, text, style);
@@ -6736,13 +6782,7 @@ fn draw_annotation(cr: &gtk::cairo::Context, annotation: &Annotation) {
             if points.is_empty() {
                 return;
             }
-            set_cairo_color(cr, marker_highlight_color(*color));
-            cr.set_line_width(*stroke_width as f64);
-            cr.move_to(points[0].x as f64, points[0].y as f64);
-            for point in points.iter().skip(1) {
-                cr.line_to(point.x as f64, point.y as f64);
-            }
-            let _ = cr.stroke();
+            draw_marker_fibers_preview(cr, points, *color, *stroke_width, marker_animation_time);
         }
         AnnotationData::Rectangle { rect, color, stroke_width } => {
             set_cairo_color(cr, *color);
@@ -6790,6 +6830,125 @@ fn draw_annotation(cr: &gtk::cairo::Context, annotation: &Annotation) {
             let _ = cr.fill();
         }
     }
+}
+
+fn marker_animation_time_seconds() -> f64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs_f64())
+        .unwrap_or(0.0)
+}
+
+fn draw_marker_fibers_preview(
+    cr: &gtk::cairo::Context,
+    points: &[Point],
+    color: Color,
+    stroke_width: u32,
+    marker_animation_time: f64,
+) {
+    draw_marker_trace_preview(cr, points, color, stroke_width);
+    for fiber in marker_fiber_layout(stroke_width) {
+        let offset_points = offset_marker_points(points, fiber.offset);
+        if offset_points.len() < 2 {
+            continue;
+        }
+        let cycle = (fiber.dash + fiber.gap).max(1.0) as f64;
+        let dash_offset =
+            -(marker_animation_time / fiber.period as f64 * cycle + fiber.phase as f64 * cycle);
+        let alpha = (color.a.min(72) as f64 / 255.0)
+            * (0.68 + fiber.opacity as f64 / 255.0 * 0.52).min(1.0);
+        let _ = cr.save();
+        cr.set_line_cap(gtk::cairo::LineCap::Round);
+        cr.set_line_join(gtk::cairo::LineJoin::Round);
+        cr.set_line_width(fiber.stroke_width as f64);
+        cr.set_dash(&[fiber.dash as f64, fiber.gap as f64], dash_offset);
+        set_cairo_color(cr, Color::rgba(color.r, color.g, color.b, (alpha * 255.0).round() as u8));
+        cr.move_to(offset_points[0].x as f64, offset_points[0].y as f64);
+        for point in offset_points.iter().skip(1) {
+            cr.line_to(point.x as f64, point.y as f64);
+        }
+        let _ = cr.stroke();
+        let _ = cr.restore();
+    }
+}
+
+fn draw_marker_trace_preview(
+    cr: &gtk::cairo::Context,
+    points: &[Point],
+    color: Color,
+    stroke_width: u32,
+) {
+    if points.len() < 2 {
+        return;
+    }
+    let _ = cr.save();
+    cr.set_line_cap(gtk::cairo::LineCap::Round);
+    cr.set_line_join(gtk::cairo::LineJoin::Round);
+    cr.move_to(points[0].x as f64, points[0].y as f64);
+    for point in points.iter().skip(1) {
+        cr.line_to(point.x as f64, point.y as f64);
+    }
+    cr.set_line_width(stroke_width as f64 + 2.0);
+    cr.set_source_rgba(
+        color.r as f64 / 255.0,
+        color.g as f64 / 255.0,
+        color.b as f64 / 255.0,
+        color.a.min(72) as f64 / 255.0 * 0.68,
+    );
+    let _ = cr.stroke_preserve();
+    cr.set_line_width(stroke_width as f64);
+    cr.set_source_rgba(
+        color.r as f64 / 255.0,
+        color.g as f64 / 255.0,
+        color.b as f64 / 255.0,
+        color.a.min(72) as f64 / 255.0 * 0.34,
+    );
+    let _ = cr.stroke();
+    let _ = cr.restore();
+}
+
+fn offset_marker_points(points: &[Point], offset: f32) -> Vec<Point> {
+    if offset.abs() <= f32::EPSILON || points.len() < 2 {
+        return points.to_vec();
+    }
+
+    points
+        .iter()
+        .enumerate()
+        .map(|(index, point)| {
+            let mut normal_x = 0.0;
+            let mut normal_y = 0.0;
+            if index > 0 {
+                let previous = points[index - 1];
+                let dx = point.x - previous.x;
+                let dy = point.y - previous.y;
+                let length = (dx * dx + dy * dy).sqrt();
+                if length > f32::EPSILON {
+                    normal_x += -dy / length;
+                    normal_y += dx / length;
+                }
+            }
+            if index + 1 < points.len() {
+                let next = points[index + 1];
+                let dx = next.x - point.x;
+                let dy = next.y - point.y;
+                let length = (dx * dx + dy * dy).sqrt();
+                if length > f32::EPSILON {
+                    normal_x += -dy / length;
+                    normal_y += dx / length;
+                }
+            }
+            let length = (normal_x * normal_x + normal_y * normal_y).sqrt();
+            if length <= f32::EPSILON {
+                *point
+            } else {
+                Point::new(
+                    point.x + normal_x / length * offset,
+                    point.y + normal_y / length * offset,
+                )
+            }
+        })
+        .collect()
 }
 
 fn draw_brush_cursor_preview(
@@ -7687,7 +7846,7 @@ mod tests {
     }
 
     #[test]
-    fn marker_draft_uses_highlighter_alpha_and_minimum_width() {
+    fn marker_draft_uses_highlighter_alpha_and_visual_width_multiplier() {
         let mut draft = DraftAnnotation::new(
             DefaultTool::Marker,
             Point::new(10.0, 20.0),
@@ -7701,7 +7860,7 @@ mod tests {
         match preview.data {
             AnnotationData::Marker { color, stroke_width, .. } => {
                 assert_eq!(color.a, MARKER_HIGHLIGHT_ALPHA);
-                assert_eq!(stroke_width, 8);
+                assert_eq!(stroke_width, 40);
             }
             other => panic!("expected marker, got {other:?}"),
         }
@@ -8361,6 +8520,26 @@ mod tests {
     }
 
     #[test]
+    fn flatpak_metainfo_exposes_current_cargo_version() {
+        let metainfo = include_str!("../../packaging/io.github.ashot.App.metainfo.xml");
+
+        assert!(
+            metainfo.contains(&format!("<release version=\"{}\"", env!("CARGO_PKG_VERSION"))),
+            "Flatpak/AppStream metadata must expose the Cargo package version so flatpak can parse it"
+        );
+    }
+
+    #[test]
+    fn flatpak_install_script_starts_new_service_after_install() {
+        let script = include_str!("../../scripts/install-flatpak.sh");
+
+        assert!(script.contains("flatpak run"));
+        assert!(script.contains("--command=ashot-app"));
+        assert!(script.contains("io.github.ashot.App"));
+        assert!(script.contains("--service"));
+    }
+
+    #[test]
     fn ocr_space_uses_single_language_or_auto_for_multiple() {
         assert_eq!(ocr_space_language_arg(&["chi_sim".to_string()]), "chs");
         assert_eq!(ocr_space_language_arg(&["chi_sim".to_string(), "eng".to_string()]), "auto");
@@ -8447,7 +8626,10 @@ mod tests {
 
     #[test]
     fn editor_stroke_dropdown_has_practical_widths() {
-        assert_eq!(editor_stroke_widths(), [2, 4, 6, 8, 12]);
+        assert_eq!(
+            editor_stroke_widths().as_slice(),
+            &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+        );
     }
 
     #[test]

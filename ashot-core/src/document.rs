@@ -43,9 +43,75 @@ impl Color {
 }
 
 pub const MARKER_HIGHLIGHT_ALPHA: u8 = 72;
+pub const MARKER_STROKE_MULTIPLIER: u32 = 10;
 
 pub fn marker_highlight_color(color: Color) -> Color {
     Color::rgba(color.r, color.g, color.b, color.a.min(MARKER_HIGHLIGHT_ALPHA))
+}
+
+pub fn marker_visual_stroke_width(user_width: u32) -> u32 {
+    user_width.max(1).saturating_mul(MARKER_STROKE_MULTIPLIER)
+}
+
+pub const MARKER_MULTI_FIBER_MIN_WIDTH: u32 = 36;
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MarkerFiber {
+    pub offset: f32,
+    pub stroke_width: f32,
+    pub opacity: u8,
+    pub dash: f32,
+    pub gap: f32,
+    pub phase: f32,
+    pub period: f32,
+}
+
+pub fn marker_fiber_layout(stroke_width: u32) -> Vec<MarkerFiber> {
+    let stroke = stroke_width.max(1) as f32;
+    let count = if stroke_width < MARKER_MULTI_FIBER_MIN_WIDTH {
+        1
+    } else {
+        ((stroke / 18.0).round() as usize).clamp(2, 6)
+    };
+    let line_width = (stroke * 0.075).clamp(1.6, 5.5);
+    let max_offset = (stroke * 0.5 - line_width * 0.65).max(0.0);
+
+    (0..count)
+        .map(|index| {
+            let offset = if count == 1 {
+                0.0
+            } else {
+                let t = index as f32 / (count - 1) as f32;
+                (t - 0.5) * 2.0 * max_offset * 0.72
+            };
+            let seed = marker_fiber_seed(index as u32, stroke_width);
+            let width_jitter = 0.82 + unit_noise(seed, 0) * 0.34;
+            let stroke_width = line_width * width_jitter;
+            let opacity = (78.0 + unit_noise(seed, 1) * 64.0).round() as u8;
+            let dash = (stroke * (0.52 + unit_noise(seed, 2) * 0.34)).clamp(12.0, 64.0);
+            let gap = (stroke * (0.22 + unit_noise(seed, 3) * 0.24)).clamp(7.0, 34.0);
+            let phase = unit_noise(seed, 4);
+            let period = 1.25 + unit_noise(seed, 5) * 1.35;
+            MarkerFiber { offset, stroke_width, opacity, dash, gap, phase, period }
+        })
+        .collect()
+}
+
+fn marker_fiber_seed(index: u32, stroke_width: u32) -> u32 {
+    index
+        .wrapping_mul(0x9E37_79B9)
+        .wrapping_add(stroke_width.rotate_left(13))
+        .wrapping_add(0xA511_E9B3)
+}
+
+fn unit_noise(seed: u32, salt: u32) -> f32 {
+    let mut value = seed.wrapping_add(salt.wrapping_mul(0x85EB_CA6B));
+    value ^= value >> 16;
+    value = value.wrapping_mul(0x7FEB_352D);
+    value ^= value >> 15;
+    value = value.wrapping_mul(0x846C_A68B);
+    value ^= value >> 16;
+    value as f32 / u32::MAX as f32
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
@@ -281,8 +347,10 @@ impl Annotation {
             | AnnotationData::Arrow { stroke_width, .. }
             | AnnotationData::Brush { stroke_width, .. }
             | AnnotationData::Rectangle { stroke_width, .. }
-            | AnnotationData::Ellipse { stroke_width, .. }
-            | AnnotationData::Marker { stroke_width, .. } => *stroke_width = width,
+            | AnnotationData::Ellipse { stroke_width, .. } => *stroke_width = width,
+            AnnotationData::Marker { stroke_width, .. } => {
+                *stroke_width = marker_visual_stroke_width(width)
+            }
             AnnotationData::Mosaic { pixel_size, .. } => *pixel_size = width,
             AnnotationData::Blur { radius, .. } => *radius = width,
             AnnotationData::Counter { radius, .. } => *radius = width,
@@ -475,7 +543,7 @@ impl Document {
 mod tests {
     use super::{
         Annotation, AnnotationData, Color, DefaultTool, Document, Point, Rect, ResizeHandle,
-        TextStyle, TextWeight,
+        TextStyle, TextWeight, marker_fiber_layout, marker_visual_stroke_width,
     };
 
     #[test]
@@ -573,6 +641,45 @@ mod tests {
     #[test]
     fn ocr_tool_is_available_without_annotation_data() {
         assert_eq!(format!("{:?}", DefaultTool::Ocr), "Ocr");
+    }
+
+    #[test]
+    fn marker_visual_stroke_width_uses_fixed_multiplier() {
+        assert_eq!(marker_visual_stroke_width(1), 10);
+        assert_eq!(marker_visual_stroke_width(4), 40);
+        assert_eq!(marker_visual_stroke_width(16), 160);
+    }
+
+    #[test]
+    fn marker_fiber_layout_uses_one_strand_for_thin_marker() {
+        let fibers = marker_fiber_layout(24);
+
+        assert_eq!(fibers.len(), 1);
+        assert_eq!(fibers[0].offset, 0.0);
+    }
+
+    #[test]
+    fn marker_fiber_layout_uses_multiple_strands_for_thick_marker() {
+        let fibers = marker_fiber_layout(80);
+
+        assert!(fibers.len() >= 3, "thick markers should split into multiple inner strands");
+        assert!(
+            fibers.iter().any(|fiber| fiber.offset < 0.0)
+                && fibers.iter().any(|fiber| fiber.offset > 0.0),
+            "multiple strands should be distributed across the marker width"
+        );
+    }
+
+    #[test]
+    fn marker_fiber_layout_keeps_strands_inside_marker_width() {
+        let stroke_width = marker_visual_stroke_width(8);
+        let radius = stroke_width as f32 * 0.5;
+        let fibers = marker_fiber_layout(stroke_width);
+
+        assert!(
+            fibers.iter().all(|fiber| fiber.offset.abs() + fiber.stroke_width * 0.5 <= radius),
+            "fibers must stay inside the marker stroke mask"
+        );
     }
 
     #[test]

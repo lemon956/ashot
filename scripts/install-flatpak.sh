@@ -41,6 +41,8 @@ flatpak override \
   --own-name=io.github.ashot.Service \
   io.github.ashot.App
 
+nohup flatpak run --command=ashot-app io.github.ashot.App --service >/dev/null 2>&1 &
+
 flatpak build-bundle \
   "${BUILD_DIR}/repo" \
   "${BUNDLE_PATH}" \

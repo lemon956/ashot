@@ -3,6 +3,7 @@ use url::Url;
 use zvariant::Type;
 
 pub const APP_ID: &str = "io.github.ashot.App";
+pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const DBUS_NAME: &str = "io.github.ashot.Service";
 pub const DBUS_PATH: &str = "/io/github/ashot/App";
 pub const DBUS_INTERFACE: &str = "io.github.ashot.App";
@@ -86,4 +87,10 @@ pub trait Ashot {
         source_file_uri: &str,
         annotations_json: &str,
     ) -> zbus::Result<CaptureOutcome>;
+
+    #[zbus(name = "Version")]
+    async fn version(&self) -> zbus::Result<String>;
+
+    #[zbus(name = "Quit")]
+    async fn quit(&self) -> zbus::Result<CommandOutcome>;
 }
