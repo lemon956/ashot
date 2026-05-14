@@ -659,6 +659,34 @@ fn scaled_image_size(image_width: u32, image_height: u32, scale: f64) -> (i32, i
     )
 }
 
+fn editor_display_image(
+    image: &image::DynamicImage,
+    display_width: i32,
+    display_height: i32,
+) -> image::RgbaImage {
+    let display_width = display_width.max(1) as u32;
+    let display_height = display_height.max(1) as u32;
+    if image.width() == display_width && image.height() == display_height {
+        return image.to_rgba8();
+    }
+    image
+        .resize_exact(display_width, display_height, image::imageops::FilterType::Triangle)
+        .to_rgba8()
+}
+
+fn editor_display_texture(
+    image: &image::DynamicImage,
+    display_width: i32,
+    display_height: i32,
+) -> gtk::gdk::MemoryTexture {
+    let display_image = editor_display_image(image, display_width, display_height);
+    let width = display_image.width() as i32;
+    let height = display_image.height() as i32;
+    let stride = display_image.width() as usize * 4;
+    let bytes = glib::Bytes::from_owned(display_image.into_raw());
+    gtk::gdk::MemoryTexture::new(width, height, gtk::gdk::MemoryFormat::R8g8b8a8, &bytes, stride)
+}
+
 fn scaled_canvas_point(x: f64, y: f64, scale: f64) -> Point {
     let scale = scale.max(0.05);
     Point::new((x / scale) as f32, (y / scale) as f32)
@@ -1382,13 +1410,19 @@ fn present_editor(
         action_text_button("document-save-as-symbolic", save_exit_label, "Save and Exit");
 
     let overlay = Overlay::new();
-    overlay.set_hexpand(true);
-    overlay.set_vexpand(true);
+    overlay.set_hexpand(false);
+    overlay.set_vexpand(false);
+    overlay.set_size_request(scaled_width, scaled_height);
+    overlay.set_halign(Align::Start);
+    overlay.set_valign(Align::Start);
     overlay.add_css_class("ashot-canvas-surface");
-    let picture = Picture::for_filename(&image_path);
+    let display_texture = editor_display_texture(&base_image, scaled_width, scaled_height);
+    let picture = Picture::for_paintable(&display_texture);
     picture.set_can_shrink(true);
     picture.set_halign(Align::Start);
     picture.set_valign(Align::Start);
+    picture.set_hexpand(false);
+    picture.set_vexpand(false);
     picture.set_size_request(scaled_width, scaled_height);
     overlay.set_child(Some(&picture));
     info!("present_editor picture added");
@@ -1396,8 +1430,11 @@ fn present_editor(
     let canvas = DrawingArea::new();
     canvas.set_content_width(scaled_width);
     canvas.set_content_height(scaled_height);
+    canvas.set_size_request(scaled_width, scaled_height);
     canvas.set_halign(Align::Start);
     canvas.set_valign(Align::Start);
+    canvas.set_hexpand(false);
+    canvas.set_vexpand(false);
     overlay.add_overlay(&canvas);
     info!("present_editor canvas added");
     let window_for_marker_animation = window.downgrade();
@@ -7730,26 +7767,27 @@ mod tests {
         clamp_magnifier_zoom, clamp_text_size, crop_image_region, cursor_name_for_resize_handle,
         cursor_name_for_surface_edge, draft_preview_for_draw, draft_tool_can_draw,
         editor_color_palette, editor_cursor_for_tool, editor_cursor_kind_for_tool,
-        editor_favorite_palette, editor_initial_size, editor_status_text, editor_stroke_widths,
-        editor_tool_layout, extract_ocr_install_command, eyedropper_magnifier_point,
-        filter_font_families, filter_ocr_symbols, fit_scale, font_family_preview_markup,
-        font_family_row_content_halign, font_family_row_fixed_height, font_family_row_text_xalign,
-        format_magnifier_zoom, hsl_to_color, hsv_to_color, image_color_at, magnifier_geometry,
-        magnifier_size_for_zoom, mosaic_pixel_size_for_stroke, moving_delta_and_update,
-        next_pin_scale_save_generation, normalized_save_filename, ocr_language_label,
-        ocr_result_body_text, ocr_result_primary_action, ocr_result_title, ocr_space_curl_args,
-        ocr_space_language_arg, output_action_menu_items, output_action_primary_label,
-        parse_hex_color, parse_ocr_space_response, pin_click_action, pin_context_popover_rect,
-        pin_dimension_label, pin_display_size, pin_initial_scale, pin_initial_scale_with_saved,
-        pin_picture_can_target, pin_picture_size, pin_scale_save_generation_is_current,
-        pin_window_size, pin_window_size_for_scale, pin_zoom_from_scroll, push_recent_color,
-        remove_favorite_color, render_document_png_bytes, resize_handle_at, rgb_to_hsl, rgb_to_hsv,
-        rgba_color_at, save_editor_document_to_dir_with_filename, scaled_canvas_point,
-        selected_annotation_bounds, set_active_text_edit, suggested_save_filename_at,
-        take_active_text_edit, tesseract_command_args, tesseract_command_invocation,
-        text_controls_width, text_font_button_width, text_for_annotation, text_size_button_width,
-        text_size_options, text_size_wheel_options, tool_can_select_existing, tool_icon_label,
-        tool_icon_stroke_width, tool_picks_canvas_color, update_ocr_language_selection,
+        editor_display_image, editor_favorite_palette, editor_initial_size, editor_status_text,
+        editor_stroke_widths, editor_tool_layout, extract_ocr_install_command,
+        eyedropper_magnifier_point, filter_font_families, filter_ocr_symbols, fit_scale,
+        font_family_preview_markup, font_family_row_content_halign, font_family_row_fixed_height,
+        font_family_row_text_xalign, format_magnifier_zoom, hsl_to_color, hsv_to_color,
+        image_color_at, magnifier_geometry, magnifier_size_for_zoom, mosaic_pixel_size_for_stroke,
+        moving_delta_and_update, next_pin_scale_save_generation, normalized_save_filename,
+        ocr_language_label, ocr_result_body_text, ocr_result_primary_action, ocr_result_title,
+        ocr_space_curl_args, ocr_space_language_arg, output_action_menu_items,
+        output_action_primary_label, parse_hex_color, parse_ocr_space_response, pin_click_action,
+        pin_context_popover_rect, pin_dimension_label, pin_display_size, pin_initial_scale,
+        pin_initial_scale_with_saved, pin_picture_can_target, pin_picture_size,
+        pin_scale_save_generation_is_current, pin_window_size, pin_window_size_for_scale,
+        pin_zoom_from_scroll, push_recent_color, remove_favorite_color, render_document_png_bytes,
+        resize_handle_at, rgb_to_hsl, rgb_to_hsv, rgba_color_at,
+        save_editor_document_to_dir_with_filename, scaled_canvas_point, selected_annotation_bounds,
+        set_active_text_edit, suggested_save_filename_at, take_active_text_edit,
+        tesseract_command_args, tesseract_command_invocation, text_controls_width,
+        text_font_button_width, text_for_annotation, text_size_button_width, text_size_options,
+        text_size_wheel_options, tool_can_select_existing, tool_icon_label, tool_icon_stroke_width,
+        tool_picks_canvas_color, update_ocr_language_selection,
     };
 
     use chrono::{Local, TimeZone};
@@ -7828,6 +7866,19 @@ mod tests {
     fn scaled_canvas_points_map_back_to_image_coordinates() {
         let point = scaled_canvas_point(320.0, 180.0, 0.5);
         assert_eq!(point, Point::new(640.0, 360.0));
+    }
+
+    #[test]
+    fn editor_display_image_is_resampled_to_canvas_size() {
+        let image = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            8,
+            16,
+            image::Rgba([16, 32, 48, 255]),
+        ));
+
+        let display = editor_display_image(&image, 4, 8);
+
+        assert_eq!(display.dimensions(), (4, 8));
     }
 
     #[test]
