@@ -674,17 +674,47 @@ fn editor_display_image(
         .to_rgba8()
 }
 
-fn editor_display_texture(
+fn cairo_argb32_bytes_from_rgba(image: &image::RgbaImage, stride: usize) -> Vec<u8> {
+    let width = image.width() as usize;
+    let height = image.height() as usize;
+    let mut bytes = vec![0; stride * height];
+    for y in 0..height {
+        for x in 0..width {
+            let [r, g, b, a] = image.get_pixel(x as u32, y as u32).0;
+            let alpha = a as u16;
+            let premultiply = |channel: u8| ((channel as u16 * alpha + 127) / 255) as u8;
+            let offset = y * stride + x * 4;
+            #[cfg(target_endian = "little")]
+            {
+                bytes[offset] = premultiply(b);
+                bytes[offset + 1] = premultiply(g);
+                bytes[offset + 2] = premultiply(r);
+                bytes[offset + 3] = a;
+            }
+            #[cfg(target_endian = "big")]
+            {
+                bytes[offset] = a;
+                bytes[offset + 1] = premultiply(r);
+                bytes[offset + 2] = premultiply(g);
+                bytes[offset + 3] = premultiply(b);
+            }
+        }
+    }
+    bytes
+}
+
+fn editor_display_surface(
     image: &image::DynamicImage,
     display_width: i32,
     display_height: i32,
-) -> gtk::gdk::MemoryTexture {
+) -> std::result::Result<gtk::cairo::ImageSurface, gtk::cairo::Error> {
     let display_image = editor_display_image(image, display_width, display_height);
     let width = display_image.width() as i32;
     let height = display_image.height() as i32;
-    let stride = display_image.width() as usize * 4;
-    let bytes = glib::Bytes::from_owned(display_image.into_raw());
-    gtk::gdk::MemoryTexture::new(width, height, gtk::gdk::MemoryFormat::R8g8b8a8, &bytes, stride)
+    let format = gtk::cairo::Format::ARgb32;
+    let stride = format.stride_for_width(display_image.width())?;
+    let bytes = cairo_argb32_bytes_from_rgba(&display_image, stride as usize);
+    gtk::cairo::ImageSurface::create_for_data(bytes, format, width, height, stride)
 }
 
 fn scaled_canvas_point(x: f64, y: f64, scale: f64) -> Point {
@@ -1416,16 +1446,10 @@ fn present_editor(
     overlay.set_halign(Align::Start);
     overlay.set_valign(Align::Start);
     overlay.add_css_class("ashot-canvas-surface");
-    let display_texture = editor_display_texture(&base_image, scaled_width, scaled_height);
-    let picture = Picture::for_paintable(&display_texture);
-    picture.set_can_shrink(true);
-    picture.set_halign(Align::Start);
-    picture.set_valign(Align::Start);
-    picture.set_hexpand(false);
-    picture.set_vexpand(false);
-    picture.set_size_request(scaled_width, scaled_height);
-    overlay.set_child(Some(&picture));
-    info!("present_editor picture added");
+    let display_surface = Rc::new(
+        editor_display_surface(&base_image, scaled_width, scaled_height)
+            .context("failed to prepare editor display surface")?,
+    );
 
     let canvas = DrawingArea::new();
     canvas.set_content_width(scaled_width);
@@ -1435,7 +1459,7 @@ fn present_editor(
     canvas.set_valign(Align::Start);
     canvas.set_hexpand(false);
     canvas.set_vexpand(false);
-    overlay.add_overlay(&canvas);
+    overlay.set_child(Some(&canvas));
     info!("present_editor canvas added");
     let window_for_marker_animation = window.downgrade();
     let canvas_for_marker_animation = canvas.clone();
@@ -1700,8 +1724,21 @@ fn present_editor(
     let active_magnifier_enabled_for_draw = active_magnifier_enabled.clone();
     let active_magnifier_zoom_for_draw = active_magnifier_zoom.clone();
     let base_rgba_for_magnifier = base_rgba.clone();
+    let display_surface_for_draw = display_surface.clone();
+    let display_width_for_draw = scaled_width;
+    let display_height_for_draw = scaled_height;
     canvas.set_draw_func(move |_, cr, draw_width, draw_height| {
         let _ = cr.save();
+        cr.rectangle(0.0, 0.0, display_width_for_draw as f64, display_height_for_draw as f64);
+        cr.clip();
+        if cr.set_source_surface(display_surface_for_draw.as_ref(), 0.0, 0.0).is_ok() {
+            let _ = cr.paint();
+        }
+        let _ = cr.restore();
+
+        let _ = cr.save();
+        cr.rectangle(0.0, 0.0, display_width_for_draw as f64, display_height_for_draw as f64);
+        cr.clip();
         let scale = scale_for_draw.get();
         let marker_animation_time = marker_animation_time_seconds();
         cr.scale(scale, scale);
@@ -1715,7 +1752,8 @@ fn present_editor(
         if let Ok(document) = doc_for_draw.try_borrow()
             && let Some(bounds) = selected_annotation_bounds(&document)
         {
-            draw_selection_overlay(cr, bounds, selected_annotation_has_resize_handles(&document));
+            let handles = selected_resize_handle_points(&document).unwrap_or_default();
+            draw_selection_overlay(cr, bounds, &handles);
         }
         if let Some(annotation) = draft_preview_for_draw(&draft_for_draw) {
             draw_annotation(cr, &annotation, marker_animation_time);
@@ -6256,26 +6294,6 @@ fn selected_annotation_bounds(document: &Document) -> Option<Rect> {
         .map(Annotation::bounds)
 }
 
-fn selected_annotation_has_resize_handles(document: &Document) -> bool {
-    let Some(id) = document.selected else {
-        return false;
-    };
-    document
-        .annotations
-        .iter()
-        .find(|annotation| annotation.id == id)
-        .is_some_and(annotation_has_resize_handles)
-}
-
-fn selected_resizable_annotation_bounds(document: &Document) -> Option<Rect> {
-    let id = document.selected?;
-    document
-        .annotations
-        .iter()
-        .find(|annotation| annotation.id == id && annotation_has_resize_handles(annotation))
-        .map(Annotation::bounds)
-}
-
 fn resize_handle_points(rect: Rect) -> [(ResizeHandle, Point); 8] {
     let left = rect.x;
     let center_x = rect.x + rect.width * 0.5;
@@ -6295,28 +6313,63 @@ fn resize_handle_points(rect: Rect) -> [(ResizeHandle, Point); 8] {
     ]
 }
 
+fn resize_handle_points_for_annotation(annotation: &Annotation) -> Vec<(ResizeHandle, Point)> {
+    match annotation.data {
+        AnnotationData::Line { start, end, .. } | AnnotationData::Arrow { start, end, .. } => {
+            vec![(ResizeHandle::Left, start), (ResizeHandle::Right, end)]
+        }
+        AnnotationData::Rectangle { rect, .. }
+        | AnnotationData::Ellipse { rect, .. }
+        | AnnotationData::Mosaic { rect, .. }
+        | AnnotationData::Blur { rect, .. }
+        | AnnotationData::FilledBox { rect, .. } => resize_handle_points(rect).to_vec(),
+        AnnotationData::Counter { center, radius, .. } => {
+            let diameter = radius as f32 * 2.0;
+            resize_handle_points(Rect {
+                x: center.x - radius as f32,
+                y: center.y - radius as f32,
+                width: diameter,
+                height: diameter,
+            })
+            .to_vec()
+        }
+        AnnotationData::Text { .. }
+        | AnnotationData::Brush { .. }
+        | AnnotationData::Marker { .. } => Vec::new(),
+    }
+}
+
+fn selected_resize_handle_points(document: &Document) -> Option<Vec<(ResizeHandle, Point)>> {
+    let id = document.selected?;
+    document
+        .annotations
+        .iter()
+        .find(|annotation| annotation.id == id && annotation_has_resize_handles(annotation))
+        .map(resize_handle_points_for_annotation)
+}
+
 fn resize_handle_at(document: &Document, point: Point, tolerance: f32) -> Option<ResizeHandle> {
-    let bounds = selected_resizable_annotation_bounds(document)?;
-    resize_handle_points(bounds).iter().find_map(|(handle, center)| {
+    let handles = selected_resize_handle_points(document)?;
+    handles.iter().find_map(|(handle, center)| {
         let dx = point.x - center.x;
         let dy = point.y - center.y;
         ((dx * dx + dy * dy).sqrt() <= tolerance).then_some(*handle)
     })
 }
 
-fn draw_selection_overlay(cr: &gtk::cairo::Context, rect: Rect, show_handles: bool) {
+fn draw_selection_overlay(cr: &gtk::cairo::Context, rect: Rect, handles: &[(ResizeHandle, Point)]) {
     let _ = cr.save();
     cr.set_source_rgba(0.13, 0.48, 0.95, 0.88);
     cr.set_line_width(1.4);
     cr.rectangle(rect.x as f64, rect.y as f64, rect.width as f64, rect.height as f64);
     let _ = cr.stroke();
 
-    if !show_handles {
+    if handles.is_empty() {
         let _ = cr.restore();
         return;
     }
 
-    for (_, center) in resize_handle_points(rect) {
+    for (_, center) in handles {
         cr.set_source_rgba(1.0, 1.0, 1.0, 0.96);
         cr.arc(
             center.x as f64,
@@ -7767,8 +7820,8 @@ mod tests {
         clamp_magnifier_zoom, clamp_text_size, crop_image_region, cursor_name_for_resize_handle,
         cursor_name_for_surface_edge, draft_preview_for_draw, draft_tool_can_draw,
         editor_color_palette, editor_cursor_for_tool, editor_cursor_kind_for_tool,
-        editor_display_image, editor_favorite_palette, editor_initial_size, editor_status_text,
-        editor_stroke_widths, editor_tool_layout, extract_ocr_install_command,
+        editor_display_image, editor_display_surface, editor_favorite_palette, editor_initial_size,
+        editor_status_text, editor_stroke_widths, editor_tool_layout, extract_ocr_install_command,
         eyedropper_magnifier_point, filter_font_families, filter_ocr_symbols, fit_scale,
         font_family_preview_markup, font_family_row_content_halign, font_family_row_fixed_height,
         font_family_row_text_xalign, format_magnifier_zoom, hsl_to_color, hsv_to_color,
@@ -7879,6 +7932,20 @@ mod tests {
         let display = editor_display_image(&image, 4, 8);
 
         assert_eq!(display.dimensions(), (4, 8));
+    }
+
+    #[test]
+    fn editor_display_surface_matches_canvas_size() {
+        let image = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            8,
+            16,
+            image::Rgba([16, 32, 48, 255]),
+        ));
+
+        let surface = editor_display_surface(&image, 4, 8).expect("display surface");
+
+        assert_eq!(surface.width(), 4);
+        assert_eq!(surface.height(), 8);
     }
 
     #[test]
@@ -8258,6 +8325,29 @@ mod tests {
             Some(ResizeHandle::BottomRight)
         );
         assert_eq!(resize_handle_at(&document, Point::new(30.0, 35.0), 6.0), None);
+    }
+
+    #[test]
+    fn line_resize_hit_testing_ignores_line_middle() {
+        let mut document = Document::new(160, 90, DefaultTool::Select);
+        let annotation = Annotation::new(AnnotationData::Line {
+            start: Point::new(20.0, 40.0),
+            end: Point::new(120.0, 40.0),
+            color: Color::rgba(255, 0, 0, 255),
+            stroke_width: 4,
+        });
+        let id = annotation.id;
+        document.add_annotation(annotation);
+        document.selected = Some(id);
+
+        assert_eq!(
+            resize_handle_at(&document, Point::new(70.0, 40.0), SELECTION_HANDLE_HIT_TOLERANCE),
+            None
+        );
+        assert_eq!(
+            resize_handle_at(&document, Point::new(20.0, 40.0), SELECTION_HANDLE_HIT_TOLERANCE),
+            Some(ResizeHandle::Left)
+        );
     }
 
     #[test]
