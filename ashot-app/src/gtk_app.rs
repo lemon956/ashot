@@ -21,8 +21,8 @@ use ashot_core::{
     marker_highlight_color, marker_visual_stroke_width, render_filename, search_ocr_languages,
 };
 use ashot_ipc::{
-    APP_ID, APP_VERSION, CaptureMode, CaptureOutcome, CommandOutcome, DBUS_NAME, DBUS_PATH,
-    OutcomeKind,
+    APP_ID, CaptureMode, CaptureOutcome, CommandOutcome, DBUS_NAME, DBUS_PATH, OutcomeKind,
+    SERVICE_IDENTITY,
 };
 use glib::prelude::IsA;
 use glib::translate::ToGlibPtr;
@@ -390,7 +390,7 @@ impl DbusService {
 
     #[zbus(name = "Version")]
     async fn version(&self) -> String {
-        APP_VERSION.to_string()
+        SERVICE_IDENTITY.to_string()
     }
 
     #[zbus(name = "Quit")]
@@ -8673,7 +8673,12 @@ mod tests {
     #[test]
     fn flatpak_install_script_starts_new_service_after_install() {
         let script = include_str!("../../scripts/install-flatpak.sh");
+        let kill_position =
+            script.find("flatpak kill").expect("install script should stop old service");
+        let start_position =
+            script.find("nohup flatpak run").expect("install script should start service");
 
+        assert!(kill_position < start_position);
         assert!(script.contains("flatpak run"));
         assert!(script.contains("--command=ashot-app"));
         assert!(script.contains("io.github.ashot.App"));

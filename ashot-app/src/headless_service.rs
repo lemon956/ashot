@@ -7,7 +7,8 @@ use anyhow::{Context, Result};
 use ashot_capture::{CaptureClient, CaptureError};
 use ashot_core::{Annotation, AppConfig, finalize_capture_with_config};
 use ashot_ipc::{
-    APP_VERSION, CaptureMode, CaptureOutcome, CommandOutcome, DBUS_NAME, DBUS_PATH, OutcomeKind,
+    CaptureMode, CaptureOutcome, CommandOutcome, DBUS_NAME, DBUS_PATH, OutcomeKind,
+    SERVICE_IDENTITY,
 };
 use tokio::{
     runtime::Builder,
@@ -245,7 +246,7 @@ impl HeadlessDbusService {
 
     #[zbus(name = "Version")]
     async fn version(&self) -> String {
-        APP_VERSION.to_string()
+        SERVICE_IDENTITY.to_string()
     }
 
     #[zbus(name = "Quit")]

@@ -41,6 +41,7 @@ flatpak override \
   --own-name=io.github.ashot.Service \
   io.github.ashot.App
 
+flatpak kill io.github.ashot.App >/dev/null 2>&1 || true
 nohup flatpak run --command=ashot-app io.github.ashot.App --service >/dev/null 2>&1 &
 
 flatpak build-bundle \

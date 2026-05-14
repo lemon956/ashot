@@ -7,7 +7,9 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use ashot_ipc::{APP_VERSION, AshotProxy, CaptureOutcome, CommandOutcome, DBUS_NAME, OutcomeKind};
+use ashot_ipc::{
+    AshotProxy, CaptureOutcome, CommandOutcome, DBUS_NAME, OutcomeKind, SERVICE_IDENTITY,
+};
 use clap::{Args, Parser, Subcommand};
 use tokio::{process::Command, time::sleep};
 use tracing_subscriber::{EnvFilter, fmt};
@@ -295,7 +297,7 @@ async fn current_service_is_running(connection: &Connection) -> Result<bool> {
 }
 
 fn service_version_status(reported_version: Option<&str>) -> bool {
-    reported_version == Some(APP_VERSION)
+    reported_version == Some(SERVICE_IDENTITY)
 }
 
 fn resolve_app_binary() -> Result<PathBuf> {
@@ -389,7 +391,8 @@ mod tests {
 
     #[test]
     fn service_version_status_requires_current_version() {
-        assert!(service_version_status(Some(env!("CARGO_PKG_VERSION"))));
+        assert!(service_version_status(Some(ashot_ipc::SERVICE_IDENTITY)));
+        assert!(!service_version_status(Some(env!("CARGO_PKG_VERSION"))));
         assert!(!service_version_status(Some("0.0.0")));
         assert!(!service_version_status(None));
     }

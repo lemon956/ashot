@@ -4,6 +4,8 @@ use zvariant::Type;
 
 pub const APP_ID: &str = "io.github.ashot.App";
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+pub const APP_BUILD_ID: &str = env!("ASHOT_BUILD_ID");
+pub const SERVICE_IDENTITY: &str = concat!(env!("CARGO_PKG_VERSION"), "+", env!("ASHOT_BUILD_ID"));
 pub const DBUS_NAME: &str = "io.github.ashot.Service";
 pub const DBUS_PATH: &str = "/io/github/ashot/App";
 pub const DBUS_INTERFACE: &str = "io.github.ashot.App";
