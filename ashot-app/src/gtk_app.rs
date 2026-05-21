@@ -9557,10 +9557,13 @@ mod tests {
         assert!(readme.contains("./scripts/install-gnome-extension.sh"));
         assert!(readme.contains("gnome-service-client"));
         assert!(readme.contains("ashot-gnome-shell-extension"));
-        assert!(readme.contains("ashot-gnome"));
+        assert!(readme.contains("scripts/install-release-packages.sh"));
         assert!(architecture.contains("ashot-pin"));
         assert!(architecture.contains("Meta.Window.make_above()"));
         assert!(release.contains("GNOME Shell extension"));
+        assert!(!readme.contains("Meta package"));
+        assert!(!readme.contains("ashot-gnome_*"));
+        assert!(!readme.contains("ashot-gnome-*.noarch.rpm"));
         assert!(!readme.contains("GNOME Shell extension integration has been removed"));
         assert!(!architecture.contains("no longer depends on a GNOME Shell extension"));
         assert!(!release.contains("Confirm that no GNOME Shell extension is required"));
@@ -9570,6 +9573,7 @@ mod tests {
     fn release_workflow_builds_flatpak_distro_packages_and_extension_bundle() {
         let workflow = include_str!("../../.github/workflows/release.yml");
         let script = include_str!("../../scripts/build-distro-packages.sh");
+        let installer = include_str!("../../scripts/install-release-packages.sh");
         let readme = include_str!("../../README.md");
 
         assert!(workflow.contains("./scripts/build-distro-packages.sh"));
@@ -9577,14 +9581,27 @@ mod tests {
         assert!(workflow.contains("build-packages/*.deb"));
         assert!(workflow.contains("build-packages/*.rpm"));
         assert!(workflow.contains("build-packages/*.shell-extension.zip"));
+        assert!(workflow.contains("build-packages/install.sh"));
+        assert!(workflow.contains("s#__ASHOT_REPO__#${GITHUB_REPOSITORY}#g"));
         assert!(script.contains("build_deb_package \"ashot\""));
         assert!(script.contains("build_deb_package \"ashot-gnome-shell-extension\""));
-        assert!(script.contains("build_deb_package \"ashot-gnome\""));
         assert!(script.contains("build_rpm_package \"ashot\""));
         assert!(script.contains("build_rpm_package \"ashot-gnome-shell-extension\""));
-        assert!(script.contains("build_rpm_package \"ashot-gnome\""));
+        assert!(!script.contains("build_deb_package \"ashot-gnome\""));
+        assert!(!script.contains("build_rpm_package \"ashot-gnome\""));
+        assert!(installer.contains("install_rpm_packages"));
+        assert!(installer.contains("install_deb_packages"));
+        assert!(installer.contains("detect_package_kind"));
+        assert!(installer.contains("resolve_latest_version"));
+        assert!(installer.contains("__ASHOT_REPO__"));
+        assert!(installer.contains("ashot-gnome-shell-extension"));
+        assert!(installer.contains("EXT_UUID=\"ashot-pin@io.github.ashot\""));
+        assert!(installer.contains("gnome-extensions enable \"${EXT_UUID}\""));
         assert!(readme.contains("| `io.github.ashot.App-*.flatpak` |"));
         assert!(readme.contains("| `ashot_*_amd64.deb` / `ashot-*.x86_64.rpm` |"));
+        assert!(readme.contains(
+            "curl -fsSL https://github.com/owner/ashot/releases/latest/download/install.sh | sh"
+        ));
         assert!(readme.contains("gnome-extensions enable ashot-pin@io.github.ashot"));
     }
 

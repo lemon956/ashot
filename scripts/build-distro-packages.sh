@@ -98,8 +98,6 @@ build_deb_package() {
     ashot-gnome-shell-extension)
       install_extension_payload "${root}"
       ;;
-    ashot-gnome)
-      ;;
   esac
   dpkg-deb --root-owner-group --build "${root}" \
     "${OUTPUT_DIR}/${package}_${PACKAGE_VERSION}_${arch}.deb"
@@ -158,11 +156,6 @@ build_rpm_package() {
     ashot-gnome-shell-extension)
       install_extension_payload "${payload_root}"
       ;;
-    ashot-gnome)
-      install -d "${payload_root}/usr/share/doc/ashot-gnome"
-      echo "Meta package for aShot GNOME integration." \
-        >"${payload_root}/usr/share/doc/ashot-gnome/README"
-      ;;
   esac
   write_rpm_spec "${package}" "${arch}" "${requires}" "${description}" \
     "${payload_root}" "${spec_path}"
@@ -179,17 +172,11 @@ build_deb_package "ashot" "amd64" "${DEB_APP_DEPS}" \
   "Wayland-native screenshot workflow for GNOME"
 build_deb_package "ashot-gnome-shell-extension" "all" "${DEB_EXT_DEPS}" \
   "GNOME Shell extension for aShot pinned windows"
-build_deb_package "ashot-gnome" "all" \
-  "ashot (= ${PACKAGE_VERSION}), ashot-gnome-shell-extension (= ${PACKAGE_VERSION})" \
-  "Meta package for aShot with GNOME pin-window integration"
 
 build_rpm_package "ashot" "x86_64" "${RPM_APP_DEPS}" \
   "Wayland-native screenshot workflow for GNOME"
 build_rpm_package "ashot-gnome-shell-extension" "noarch" "${RPM_EXT_DEPS}" \
   "GNOME Shell extension for aShot pinned windows"
-build_rpm_package "ashot-gnome" "noarch" \
-  "ashot = ${RPM_VERSION}, ashot-gnome-shell-extension = ${RPM_VERSION}" \
-  "Meta package for aShot with GNOME pin-window integration"
 
 echo "Built packages in ${OUTPUT_DIR}:"
 find "${OUTPUT_DIR}" -maxdepth 1 -type f \( -name "*.deb" -o -name "*.rpm" \) -print | sort

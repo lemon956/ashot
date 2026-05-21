@@ -82,6 +82,10 @@ jobs:
             -f \
             -o build-packages \
             gnome-shell/extensions/ashot-pin@io.github.ashot
+          sed "s#__ASHOT_REPO__#${GITHUB_REPOSITORY}#g" \
+            scripts/install-release-packages.sh \
+            > build-packages/install.sh
+          chmod +x build-packages/install.sh
 
       - name: Prepare repo
         run: |
@@ -108,6 +112,7 @@ jobs:
             build-packages/*.deb
             build-packages/*.rpm
             build-packages/*.shell-extension.zip
+            build-packages/install.sh
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

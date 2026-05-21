@@ -34,7 +34,8 @@
 - Icon is present
 - CLI is exposed for Linux shortcut binding
 - `scripts/install-gnome-extension.sh` installs and enables the GNOME Shell extension for user-level testing
-- Distribution packaging keeps `ashot`, `ashot-gnome-shell-extension`, and the optional `ashot-gnome` meta package separate
+- Distribution packaging keeps `ashot` and `ashot-gnome-shell-extension` separate
+- `scripts/install-release-packages.sh` can download and install both native packages for RPM or DEB users
 - GitHub Release uploads Flatpak, GNOME Shell extension zip, Debian packages, and RPM packages
 
 ## Environment Caveats

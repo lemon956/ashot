@@ -54,24 +54,40 @@ aShot:
 | `io.github.ashot.App-*.flatpak` | Sandboxed app and CLI | Portable app install | Needs separate host extension install |
 | `ashot_*_amd64.deb` / `ashot-*.x86_64.rpm` | Native app and CLI | Debian/Fedora-style native install without GNOME integration | Not by itself |
 | `ashot-gnome-shell-extension_*_all.deb` / `ashot-gnome-shell-extension-*.noarch.rpm` | GNOME Shell extension only | Adding reliable pinning to an existing native app install | Yes, after enabling the extension |
-| `ashot-gnome_*_all.deb` / `ashot-gnome-*.noarch.rpm` | Meta package depending on app + extension | One-command native GNOME 50 install | Yes, after enabling the extension |
 | `ashot-pin@io.github.ashot.shell-extension.zip` | GNOME Shell extension bundle only | Manual extension install or Flatpak users | Yes, after enabling the extension |
+| `install.sh` | Downloads and installs the native app package plus the extension package | One-line native install from GitHub Releases | Yes |
 
-Native package examples:
+The `ashot-gnome-shell-extension` package does not install the screenshot app.
+It only installs the GNOME Shell code that detects `ashot-pin` windows and asks
+Mutter to keep them above other windows. Install it together with the `ashot`
+app package when you want reliable GNOME 50 pin-window behavior.
+
+One-line native install from GitHub Releases:
+
+```bash
+# Auto-detect RPM or DEB package manager
+curl -fsSL https://github.com/owner/ashot/releases/latest/download/install.sh | sh
+
+# Force RPM
+curl -fsSL https://github.com/owner/ashot/releases/latest/download/install.sh | sh -s -- rpm
+
+# Force DEB
+curl -fsSL https://github.com/owner/ashot/releases/latest/download/install.sh | sh -s -- deb
+```
+
+Native package examples when you already downloaded the release assets:
 
 ```bash
 # Debian/Ubuntu style, app only
 sudo apt install ./ashot_0.1.0_amd64.deb
 
-# Debian/Ubuntu style, app + GNOME extension through the meta package
+# Debian/Ubuntu style, app + GNOME extension
 sudo apt install ./ashot_0.1.0_amd64.deb \
-  ./ashot-gnome-shell-extension_0.1.0_all.deb \
-  ./ashot-gnome_0.1.0_all.deb
+  ./ashot-gnome-shell-extension_0.1.0_all.deb
 
-# Fedora/RHEL style, app + GNOME extension through the meta package
+# Fedora/RHEL style, app + GNOME extension
 sudo dnf install ./ashot-0.1.0-1.x86_64.rpm \
-  ./ashot-gnome-shell-extension-0.1.0-1.noarch.rpm \
-  ./ashot-gnome-0.1.0-1.noarch.rpm
+  ./ashot-gnome-shell-extension-0.1.0-1.noarch.rpm
 ```
 
 GNOME Shell extensions are enabled per user, so native extension packages still
@@ -79,6 +95,17 @@ need this user-level step:
 
 ```bash
 gnome-extensions enable ashot-pin@io.github.ashot
+```
+
+When running the installer directly from a checkout instead of the release
+asset, provide the repository and optionally the release tag:
+
+```bash
+# RPM distributions
+ASHOT_REPO=owner/ashot ASHOT_VERSION=v0.1.0 ./scripts/install-release-packages.sh rpm
+
+# Debian/Ubuntu distributions
+ASHOT_REPO=owner/ashot ASHOT_VERSION=v0.1.0 ./scripts/install-release-packages.sh deb
 ```
 
 ## Flatpak
@@ -159,11 +186,11 @@ Install and enable the user-level extension after installing the app:
 
 Flatpak remains the app packaging path, but the GNOME Shell extension is a
 host-side component and is not installed inside the Flatpak sandbox. For
-distribution packaging, keep the components split:
+distribution packaging, keep the components split and install both packages
+when GNOME pin-window integration is required:
 
 - `ashot`: the Rust/GTK application and CLI
 - `ashot-gnome-shell-extension`: the GNOME Shell extension
-- `ashot-gnome`: a meta package that depends on both for one-command installs
 
 ## OCR
 

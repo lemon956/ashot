@@ -59,6 +59,7 @@ jobs:
           bash -n scripts/install-flatpak.sh
           bash -n scripts/install-gnome-extension.sh
           bash -n scripts/build-distro-packages.sh
+          sh -n scripts/install-release-packages.sh
 
       - name: Test core
         run: cargo test -p ashot-core --all-features
