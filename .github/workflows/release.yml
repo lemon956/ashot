@@ -10,15 +10,24 @@ permissions:
 
 jobs:
   build-release:
-    name: Build Flatpak
+    name: Build Release Artifacts
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install flatpak-builder
+      - name: Install packaging dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y flatpak-builder
+          sudo apt-get install -y \
+            dpkg-dev \
+            flatpak-builder \
+            gnome-shell \
+            libadwaita-1-dev \
+            libglib2.0-dev \
+            libgtk-4-dev \
+            libssl-dev \
+            pkg-config \
+            rpm
 
       - name: Install Rust
         run: |
@@ -58,6 +67,22 @@ jobs:
             build-flatpak/io.github.ashot.App-${ASHOT_VERSION}.flatpak \
             io.github.ashot.App
 
+      - name: Build native release binaries
+        run: |
+          cargo build --release --locked -p ashot-app -p ashot-cli
+
+      - name: Build distro packages
+        run: |
+          ASHOT_VERSION=${GITHUB_REF_NAME} ./scripts/build-distro-packages.sh
+
+      - name: Build GNOME Shell extension bundle
+        run: |
+          mkdir -p build-packages
+          gnome-extensions pack \
+            -f \
+            -o build-packages \
+            gnome-shell/extensions/ashot-pin@io.github.ashot
+
       - name: Prepare repo
         run: |
           ASHOT_VERSION=${GITHUB_REF_NAME}
@@ -80,6 +105,9 @@ jobs:
           files: |
             build-flatpak/io.github.ashot.App-${{ github.ref_name }}.flatpak
             build-flatpak/io.github.ashot.App-${{ github.ref_name }}.repo.tar.gz
+            build-packages/*.deb
+            build-packages/*.rpm
+            build-packages/*.shell-extension.zip
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

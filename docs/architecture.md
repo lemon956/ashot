@@ -2,7 +2,7 @@
 
 ## Summary
 
-`aShot` is split into small Rust crates so system screenshot capture, DBus integration, GTK UI, and portable annotation/export logic remain separated. The current architecture is portal-first and no longer depends on a GNOME Shell extension.
+`aShot` is split into small Rust crates so system screenshot capture, DBus integration, GTK UI, and portable annotation/export logic remain separated. The capture/editor path is portal-first; reliable GNOME 50 Wayland pin stacking is handled by a small GNOME Shell extension.
 
 ## Crates
 
@@ -42,7 +42,15 @@
 - Registers the DBus service
 - Serializes capture requests with a mutex to prevent concurrent sessions
 - Opens launcher, settings, editor, and pin windows on the GTK side
+- Starts pin windows through `gnome-service-client -t ashot-pin` so only pin viewer processes receive the window tag
 - Keeps GTK-specific code behind the `gtk-ui` feature because the build requires system GTK/libadwaita development packages
+
+### GNOME Shell Extension
+
+- Lives under `gnome-shell/extensions/ashot-pin@io.github.ashot`
+- Runs in the background without a top-panel indicator
+- Matches pin windows by the `ashot-pin` tag
+- Calls `Meta.Window.make_above()` and `stick()` so GNOME Shell/Mutter, not GTK, owns the global stacking behavior
 
 ## Data Flow
 
@@ -54,6 +62,7 @@
 6. `ashot-app` opens the GTK editor with that image.
 7. The editor mutates an `ashot-core::Document`.
 8. Saving, copying, or pinning renders the document back into a PNG via `ashot-core`.
+9. Pinning launches a tagged pin viewer; the GNOME Shell extension keeps that tagged window above normal application windows.
 
 ## Editor Model
 

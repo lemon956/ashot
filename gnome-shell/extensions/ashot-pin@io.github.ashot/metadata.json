@@ -1,0 +1,7 @@
+{
+  "uuid": "ashot-pin@io.github.ashot",
+  "name": "aShot Pin Windows",
+  "description": "Keeps aShot pinned screenshot windows above other windows on GNOME Wayland.",
+  "shell-version": ["50"],
+  "url": "https://example.invalid/ashot"
+}

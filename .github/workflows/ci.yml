@@ -54,6 +54,12 @@ jobs:
       - name: Check types
         run: cargo check --all-targets
 
+      - name: Check packaging scripts
+        run: |
+          bash -n scripts/install-flatpak.sh
+          bash -n scripts/install-gnome-extension.sh
+          bash -n scripts/build-distro-packages.sh
+
       - name: Test core
         run: cargo test -p ashot-core --all-features
 

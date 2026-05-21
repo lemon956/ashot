@@ -5,6 +5,7 @@ use std::{
     fs,
     os::raw::c_char,
     path::{Path, PathBuf},
+    process::{Command as ProcessCommand, Stdio},
     rc::Rc,
     sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -27,11 +28,12 @@ use ashot_ipc::{
 use glib::prelude::IsA;
 use glib::translate::ToGlibPtr;
 use glib::types::StaticType;
-use gtk::gdk::prelude::ToplevelExt;
+use gtk::gdk::prelude::{SurfaceExt, ToplevelExt};
 use gtk::pango::prelude::FontFamilyExt;
 use gtk::prelude::{
-    Cast, EventControllerExt, FileChooserExt, FileChooserExtManual, GestureSingleExt,
-    NativeDialogExt, NativeDialogExtManual, NativeExt, StyleContextExt, WidgetExt,
+    AdjustmentExt, Cast, EventControllerExt, FileChooserExt, FileChooserExtManual,
+    GestureSingleExt, NativeDialogExt, NativeDialogExtManual, NativeExt, StyleContextExt,
+    WidgetExt,
 };
 use gtk::{
     Adjustment, Align, Box as GtkBox, Button, DrawingArea, Entry, Grid, HeaderBar, Label,
@@ -73,12 +75,19 @@ const STROKE_PREVIEW_WIDTH: i32 = 104;
 const STROKE_PREVIEW_HEIGHT: i32 = 20;
 const STROKE_MENU_BUTTON_WIDTH: i32 = 58;
 const STROKE_MENU_BUTTON_HEIGHT: i32 = 32;
+const EDITOR_DEFAULT_WIDTH: i32 = 1280;
+const EDITOR_DEFAULT_HEIGHT: i32 = 860;
+const EDITOR_MIN_SCALE: f64 = 0.1;
+const EDITOR_MAX_SCALE: f64 = 8.0;
+const EDITOR_WHEEL_SCROLL_STEP: f64 = 64.0;
 const EYEDROPPER_MAGNIFIER_MIN_ZOOM: f64 = 4.0;
 const EYEDROPPER_MAGNIFIER_MAX_ZOOM: f64 = 16.0;
 const EYEDROPPER_MAGNIFIER_DEFAULT_ZOOM: f64 = 8.0;
 const EYEDROPPER_MAGNIFIER_SAMPLE_RADIUS: i32 = 5;
 const PIN_MIN_SCALE: f64 = 0.1;
 const PIN_MAX_SCALE: f64 = 8.0;
+const PIN_WINDOW_TAG: &str = "ashot-pin";
+const PIN_VIEWER_ARG: &str = "--pin-viewer";
 const TEXT_SIZE_MIN: u32 = 8;
 const TEXT_SIZE_MAX: u32 = 72;
 #[cfg(test)]
@@ -93,19 +102,161 @@ type ColorMemoryButtons = Rc<RefCell<Vec<(Rc<Cell<Color>>, DrawingArea, Button)>
 type StatusCallback = Rc<dyn Fn(Option<String>)>;
 type ToastCallback = Rc<dyn Fn(&str)>;
 
-pub fn run() -> Result<()> {
-    let _ = fmt().with_env_filter(EnvFilter::from_env("ASHOT_LOG")).with_target(false).try_init();
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AppStartupMode {
+    Launcher,
+    Service,
+    PinViewer(PathBuf),
+}
 
-    let mut service_only = false;
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PinViewerLaunchCommand {
+    program: String,
+    args: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AppStartupBehavior {
+    register_dbus_service: bool,
+    non_unique_application: bool,
+    activate_pin_viewer: bool,
+}
+
+fn app_startup_behavior(mode: &AppStartupMode) -> AppStartupBehavior {
+    match mode {
+        AppStartupMode::Launcher => AppStartupBehavior {
+            register_dbus_service: true,
+            non_unique_application: false,
+            activate_pin_viewer: false,
+        },
+        AppStartupMode::Service => AppStartupBehavior {
+            register_dbus_service: true,
+            non_unique_application: true,
+            activate_pin_viewer: false,
+        },
+        AppStartupMode::PinViewer(_) => AppStartupBehavior {
+            register_dbus_service: false,
+            non_unique_application: true,
+            activate_pin_viewer: true,
+        },
+    }
+}
+
+fn pin_window_tag() -> &'static str {
+    PIN_WINDOW_TAG
+}
+
+fn pin_viewer_arg() -> &'static str {
+    PIN_VIEWER_ARG
+}
+
+fn startup_mode_from_args<I, S>(args: I) -> Result<(AppStartupMode, Vec<String>)>
+where
+    I: IntoIterator<Item = S>,
+    S: Into<String>,
+{
+    let mut mode = AppStartupMode::Launcher;
     let mut filtered_args = Vec::new();
-    let mut args = env::args();
+    let mut args = args.into_iter().map(Into::into);
     while let Some(arg) = args.next() {
         if arg == "--service" {
-            service_only = true;
+            mode = AppStartupMode::Service;
+            continue;
+        }
+        if arg == PIN_VIEWER_ARG {
+            let Some(path) = args.next() else {
+                return Err(anyhow::anyhow!("{PIN_VIEWER_ARG} requires an image path"));
+            };
+            mode = AppStartupMode::PinViewer(PathBuf::from(path));
             continue;
         }
         filtered_args.push(arg);
     }
+    Ok((mode, filtered_args))
+}
+
+fn path_command_arg(path: &Path) -> String {
+    path.to_string_lossy().into_owned()
+}
+
+fn pin_viewer_launch_command(
+    app_binary: &Path,
+    image_path: &Path,
+    in_flatpak: bool,
+) -> PinViewerLaunchCommand {
+    if in_flatpak {
+        return PinViewerLaunchCommand {
+            program: "flatpak-spawn".to_string(),
+            args: vec![
+                "--host".to_string(),
+                "gnome-service-client".to_string(),
+                "-t".to_string(),
+                pin_window_tag().to_string(),
+                "--".to_string(),
+                "flatpak".to_string(),
+                "run".to_string(),
+                "--command=ashot-app".to_string(),
+                APP_ID.to_string(),
+                pin_viewer_arg().to_string(),
+                path_command_arg(image_path),
+            ],
+        };
+    }
+
+    PinViewerLaunchCommand {
+        program: "gnome-service-client".to_string(),
+        args: vec![
+            "-t".to_string(),
+            pin_window_tag().to_string(),
+            "--".to_string(),
+            path_command_arg(app_binary),
+            pin_viewer_arg().to_string(),
+            path_command_arg(image_path),
+        ],
+    }
+}
+
+fn pin_viewer_launcher_check_command(in_flatpak: bool) -> Option<PinViewerLaunchCommand> {
+    in_flatpak.then(|| PinViewerLaunchCommand {
+        program: "flatpak-spawn".to_string(),
+        args: vec![
+            "--host".to_string(),
+            "sh".to_string(),
+            "-c".to_string(),
+            "command -v gnome-service-client >/dev/null 2>&1".to_string(),
+        ],
+    })
+}
+
+fn executable_exists_in_path(program: &str) -> bool {
+    env::var_os("PATH")
+        .map(|path| env::split_paths(&path).any(|directory| directory.join(program).is_file()))
+        .unwrap_or(false)
+}
+
+fn command_exits_successfully(command: &PinViewerLaunchCommand) -> bool {
+    ProcessCommand::new(&command.program)
+        .args(&command.args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+fn pin_viewer_launcher_available(in_flatpak: bool) -> bool {
+    if let Some(command) = pin_viewer_launcher_check_command(in_flatpak) {
+        return command_exits_successfully(&command);
+    }
+    executable_exists_in_path("gnome-service-client")
+}
+
+pub fn run() -> Result<()> {
+    let _ = fmt().with_env_filter(EnvFilter::from_env("ASHOT_LOG")).with_target(false).try_init();
+
+    let (startup_mode, filtered_args) = startup_mode_from_args(env::args())?;
+    let startup_behavior = app_startup_behavior(&startup_mode);
+    let service_only = startup_mode == AppStartupMode::Service;
     let _ = adw::init();
     let runtime = Builder::new_multi_thread()
         .enable_all()
@@ -116,20 +267,31 @@ pub fn run() -> Result<()> {
     apply_appearance_mode(config.appearance_mode);
     let state = Arc::new(ServiceState::new(config, ui_tx));
 
-    let service_state = state.clone();
-    runtime.spawn(async move {
-        if let Err(error) = register_service(service_state).await {
-            error!("failed to register DBus service: {error:#}");
-        }
-    });
+    if startup_behavior.register_dbus_service {
+        let service_state = state.clone();
+        runtime.spawn(async move {
+            if let Err(error) = register_service(service_state).await {
+                error!("failed to register DBus service: {error:#}");
+            }
+        });
+    }
 
-    let app_flags = if service_only {
+    let app_flags = if startup_behavior.non_unique_application {
         gio::ApplicationFlags::NON_UNIQUE
     } else {
         gio::ApplicationFlags::empty()
     };
     let app = adw::Application::builder().application_id(APP_ID).flags(app_flags).build();
     let _hold_guard = if service_only { Some(app.hold()) } else { None };
+
+    if let AppStartupMode::PinViewer(path) = startup_mode {
+        let state_for_pin_viewer = state.clone();
+        app.connect_activate(move |app| {
+            present_pin_window(app, state_for_pin_viewer.clone(), path.clone());
+        });
+        app.run_with_args(&filtered_args);
+        return Ok(());
+    }
 
     let ui_runtime = UiRuntime::new(app.clone(), state, runtime.handle().clone(), ui_rx);
     ui_runtime.attach(service_only);
@@ -498,7 +660,7 @@ fn present_window_command(
             present_settings(app, state);
         }
         WindowCommand::Pin(path) => {
-            present_pin_window(app, state, path);
+            present_pin_window_request(app, state, path);
         }
     }
 }
@@ -633,10 +795,8 @@ fn capture_should_use_fresh_anchor(_has_active_window: bool) -> bool {
     true
 }
 
-fn editor_initial_size(image_width: u32, image_height: u32) -> (i32, i32) {
-    let width = (image_width as i32 + 320).clamp(980, 1440);
-    let height = (image_height as i32 + 180).clamp(620, 980);
-    (width, height)
+fn editor_initial_size(_image_width: u32, _image_height: u32) -> (i32, i32) {
+    (EDITOR_DEFAULT_WIDTH, EDITOR_DEFAULT_HEIGHT)
 }
 
 fn fit_scale(
@@ -659,19 +819,74 @@ fn scaled_image_size(image_width: u32, image_height: u32, scale: f64) -> (i32, i
     )
 }
 
-fn editor_display_image(
-    image: &image::DynamicImage,
-    display_width: i32,
-    display_height: i32,
-) -> image::RgbaImage {
-    let display_width = display_width.max(1) as u32;
-    let display_height = display_height.max(1) as u32;
-    if image.width() == display_width && image.height() == display_height {
-        return image.to_rgba8();
+fn editor_initial_scale(
+    image_width: u32,
+    image_height: u32,
+    viewport_width: i32,
+    viewport_height: i32,
+) -> f64 {
+    fit_scale(image_width, image_height, viewport_width, viewport_height)
+        .clamp(EDITOR_MIN_SCALE, EDITOR_MAX_SCALE)
+}
+
+fn editor_zoom_from_scroll(current: f64, dy: f64) -> f64 {
+    let factor = if dy.abs() > f64::EPSILON { 1.1_f64.powf(-dy) } else { 1.0 };
+    (current * factor).clamp(EDITOR_MIN_SCALE, EDITOR_MAX_SCALE)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum EditorScrollAction {
+    PassThrough,
+    Horizontal(f64),
+    Zoom(f64),
+}
+
+fn editor_scroll_action(
+    current_scale: f64,
+    dx: f64,
+    dy: f64,
+    modifiers: gtk::gdk::ModifierType,
+) -> EditorScrollAction {
+    if modifiers.contains(gtk::gdk::ModifierType::CONTROL_MASK) {
+        return EditorScrollAction::Zoom(editor_zoom_from_scroll(current_scale, dy));
     }
-    image
-        .resize_exact(display_width, display_height, image::imageops::FilterType::Triangle)
-        .to_rgba8()
+    if modifiers.contains(gtk::gdk::ModifierType::SHIFT_MASK) {
+        let delta = if dx.abs() > f64::EPSILON { dx } else { dy };
+        return EditorScrollAction::Horizontal(delta * EDITOR_WHEEL_SCROLL_STEP);
+    }
+    EditorScrollAction::PassThrough
+}
+
+fn editor_adjustment_value_after_scroll(
+    current_value: f64,
+    upper: f64,
+    page_size: f64,
+    delta: f64,
+) -> f64 {
+    let max_value = (upper - page_size).max(0.0);
+    (current_value + delta).clamp(0.0, max_value)
+}
+
+fn editor_zoom_anchor_adjustment_value(
+    current_value: f64,
+    cursor_content_position: f64,
+    old_scale: f64,
+    new_scale: f64,
+    new_content_size: f64,
+    page_size: f64,
+) -> f64 {
+    let old_scale = old_scale.clamp(EDITOR_MIN_SCALE, EDITOR_MAX_SCALE);
+    let new_scale = new_scale.clamp(EDITOR_MIN_SCALE, EDITOR_MAX_SCALE);
+    let viewport_position = cursor_content_position - current_value;
+    let image_position = cursor_content_position / old_scale;
+    let next_value = image_position * new_scale - viewport_position;
+    let max_value = (new_content_size - page_size).max(0.0);
+    next_value.clamp(0.0, max_value)
+}
+
+fn editor_view_size(image_width: u32, image_height: u32, scale: f64) -> (i32, i32) {
+    let scale = scale.clamp(EDITOR_MIN_SCALE, EDITOR_MAX_SCALE);
+    scaled_image_size(image_width.max(1), image_height.max(1), scale)
 }
 
 fn cairo_argb32_bytes_from_rgba(image: &image::RgbaImage, stride: usize) -> Vec<u8> {
@@ -703,18 +918,42 @@ fn cairo_argb32_bytes_from_rgba(image: &image::RgbaImage, stride: usize) -> Vec<
     bytes
 }
 
-fn editor_display_surface(
+fn editor_base_surface(
     image: &image::DynamicImage,
-    display_width: i32,
-    display_height: i32,
 ) -> std::result::Result<gtk::cairo::ImageSurface, gtk::cairo::Error> {
-    let display_image = editor_display_image(image, display_width, display_height);
-    let width = display_image.width() as i32;
-    let height = display_image.height() as i32;
+    let base_image = image.to_rgba8();
+    let width = base_image.width() as i32;
+    let height = base_image.height() as i32;
     let format = gtk::cairo::Format::ARgb32;
-    let stride = format.stride_for_width(display_image.width())?;
-    let bytes = cairo_argb32_bytes_from_rgba(&display_image, stride as usize);
+    let stride = format.stride_for_width(base_image.width())?;
+    let bytes = cairo_argb32_bytes_from_rgba(&base_image, stride as usize);
     gtk::cairo::ImageSurface::create_for_data(bytes, format, width, height, stride)
+}
+
+fn set_editor_image_source(
+    cr: &gtk::cairo::Context,
+    surface: &gtk::cairo::ImageSurface,
+) -> std::result::Result<(), gtk::cairo::Error> {
+    cr.set_source_surface(surface, 0.0, 0.0)?;
+    cr.source().set_filter(gtk::cairo::Filter::Nearest);
+    Ok(())
+}
+
+fn apply_editor_zoom(
+    overlay: &Overlay,
+    canvas: &DrawingArea,
+    image_width: u32,
+    image_height: u32,
+    scale: f64,
+) {
+    let (display_width, display_height) = editor_view_size(image_width, image_height, scale);
+    overlay.set_size_request(display_width, display_height);
+    canvas.set_content_width(display_width);
+    canvas.set_content_height(display_height);
+    canvas.set_size_request(display_width, display_height);
+    overlay.queue_resize();
+    canvas.queue_resize();
+    canvas.queue_draw();
 }
 
 fn scaled_canvas_point(x: f64, y: f64, scale: f64) -> Point {
@@ -1349,7 +1588,7 @@ fn present_editor(
     info!("present_editor initial size calculated: {initial_width}x{initial_height}");
     let viewport_width = initial_width - 292;
     let viewport_height = initial_height - 70;
-    let image_scale = Rc::new(Cell::new(fit_scale(
+    let image_scale = Rc::new(Cell::new(editor_initial_scale(
         base_image.width(),
         base_image.height(),
         viewport_width,
@@ -1357,7 +1596,7 @@ fn present_editor(
     )));
     info!("present_editor image scale calculated");
     let (scaled_width, scaled_height) =
-        scaled_image_size(base_image.width(), base_image.height(), image_scale.get());
+        editor_view_size(base_image.width(), base_image.height(), image_scale.get());
     info!("present_editor scaled size calculated: {scaled_width}x{scaled_height}");
     let window = ApplicationWindow::builder()
         .application(app)
@@ -1442,24 +1681,26 @@ fn present_editor(
     let overlay = Overlay::new();
     overlay.set_hexpand(false);
     overlay.set_vexpand(false);
-    overlay.set_size_request(scaled_width, scaled_height);
     overlay.set_halign(Align::Start);
     overlay.set_valign(Align::Start);
     overlay.add_css_class("ashot-canvas-surface");
-    let display_surface = Rc::new(
-        editor_display_surface(&base_image, scaled_width, scaled_height)
-            .context("failed to prepare editor display surface")?,
+    let base_surface = Rc::new(
+        editor_base_surface(&base_image).context("failed to prepare editor display surface")?,
     );
 
     let canvas = DrawingArea::new();
-    canvas.set_content_width(scaled_width);
-    canvas.set_content_height(scaled_height);
-    canvas.set_size_request(scaled_width, scaled_height);
     canvas.set_halign(Align::Start);
     canvas.set_valign(Align::Start);
     canvas.set_hexpand(false);
     canvas.set_vexpand(false);
     overlay.set_child(Some(&canvas));
+    apply_editor_zoom(
+        &overlay,
+        &canvas,
+        base_image.width(),
+        base_image.height(),
+        image_scale.get(),
+    );
     info!("present_editor canvas added");
     let window_for_marker_animation = window.downgrade();
     let canvas_for_marker_animation = canvas.clone();
@@ -1511,6 +1752,77 @@ fn present_editor(
         .child(&canvas_frame)
         .build();
     scrolled.add_css_class("view");
+    let editor_scroll = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::BOTH_AXES);
+    editor_scroll.set_propagation_phase(gtk::PropagationPhase::Capture);
+    let scrolled_for_editor_scroll = scrolled.clone();
+    let overlay_for_editor_scroll = overlay.clone();
+    let canvas_for_editor_scroll = canvas.clone();
+    let image_scale_for_editor_scroll = image_scale.clone();
+    let image_width_for_editor_scroll = base_image.width();
+    let image_height_for_editor_scroll = base_image.height();
+    editor_scroll.connect_scroll(move |controller, dx, dy| {
+        match editor_scroll_action(
+            image_scale_for_editor_scroll.get(),
+            dx,
+            dy,
+            controller.current_event_state(),
+        ) {
+            EditorScrollAction::PassThrough => glib::Propagation::Proceed,
+            EditorScrollAction::Horizontal(delta) => {
+                let adjustment = scrolled_for_editor_scroll.hadjustment();
+                adjustment.set_value(editor_adjustment_value_after_scroll(
+                    adjustment.value(),
+                    adjustment.upper(),
+                    adjustment.page_size(),
+                    delta,
+                ));
+                glib::Propagation::Stop
+            }
+            EditorScrollAction::Zoom(next_scale) => {
+                let old_scale = image_scale_for_editor_scroll.get();
+                let (cursor_x, cursor_y) = controller
+                    .current_event()
+                    .and_then(|event| event.position())
+                    .unwrap_or((0.0, 0.0));
+                let (display_width, display_height) = editor_view_size(
+                    image_width_for_editor_scroll,
+                    image_height_for_editor_scroll,
+                    next_scale,
+                );
+                let hadjustment = scrolled_for_editor_scroll.hadjustment();
+                let vadjustment = scrolled_for_editor_scroll.vadjustment();
+                let next_hadjustment = editor_zoom_anchor_adjustment_value(
+                    hadjustment.value(),
+                    cursor_x,
+                    old_scale,
+                    next_scale,
+                    display_width as f64,
+                    hadjustment.page_size(),
+                );
+                let next_vadjustment = editor_zoom_anchor_adjustment_value(
+                    vadjustment.value(),
+                    cursor_y,
+                    old_scale,
+                    next_scale,
+                    display_height as f64,
+                    vadjustment.page_size(),
+                );
+
+                image_scale_for_editor_scroll.set(next_scale);
+                apply_editor_zoom(
+                    &overlay_for_editor_scroll,
+                    &canvas_for_editor_scroll,
+                    image_width_for_editor_scroll,
+                    image_height_for_editor_scroll,
+                    next_scale,
+                );
+                hadjustment.set_value(next_hadjustment);
+                vadjustment.set_value(next_vadjustment);
+                glib::Propagation::Stop
+            }
+        }
+    });
+    canvas.add_controller(editor_scroll);
 
     let editor_body = GtkBox::new(Orientation::Horizontal, 8);
     editor_body.set_hexpand(true);
@@ -1724,22 +2036,26 @@ fn present_editor(
     let active_magnifier_enabled_for_draw = active_magnifier_enabled.clone();
     let active_magnifier_zoom_for_draw = active_magnifier_zoom.clone();
     let base_rgba_for_magnifier = base_rgba.clone();
-    let display_surface_for_draw = display_surface.clone();
-    let display_width_for_draw = scaled_width;
-    let display_height_for_draw = scaled_height;
+    let base_surface_for_draw = base_surface.clone();
+    let image_width_for_draw = base_image.width();
+    let image_height_for_draw = base_image.height();
     canvas.set_draw_func(move |_, cr, draw_width, draw_height| {
+        let scale = scale_for_draw.get();
+        let (display_width, display_height) =
+            editor_view_size(image_width_for_draw, image_height_for_draw, scale);
+
         let _ = cr.save();
-        cr.rectangle(0.0, 0.0, display_width_for_draw as f64, display_height_for_draw as f64);
+        cr.rectangle(0.0, 0.0, display_width as f64, display_height as f64);
         cr.clip();
-        if cr.set_source_surface(display_surface_for_draw.as_ref(), 0.0, 0.0).is_ok() {
+        cr.scale(scale, scale);
+        if set_editor_image_source(cr, base_surface_for_draw.as_ref()).is_ok() {
             let _ = cr.paint();
         }
         let _ = cr.restore();
 
         let _ = cr.save();
-        cr.rectangle(0.0, 0.0, display_width_for_draw as f64, display_height_for_draw as f64);
+        cr.rectangle(0.0, 0.0, display_width as f64, display_height as f64);
         cr.clip();
-        let scale = scale_for_draw.get();
         let marker_animation_time = marker_animation_time_seconds();
         cr.scale(scale, scale);
         cr.set_line_join(gtk::cairo::LineJoin::Round);
@@ -2432,7 +2748,7 @@ fn present_editor(
                                         error!("{error}");
                                     }
                                     if pin_after_save {
-                                        present_pin_window(
+                                        present_pin_window_request(
                                             &app_for_result,
                                             state_for_result,
                                             output,
@@ -2674,6 +2990,7 @@ fn present_editor(
     let runtime_for_pin = runtime.clone();
     let app_for_pin = app.clone();
     let state_for_pin = state.clone();
+    let window_for_pin = window.clone();
     let refresh_status_for_pin = refresh_status.clone();
     let show_toast_for_pin = show_toast.clone();
     pin.connect_clicked(move |button| {
@@ -2686,6 +3003,7 @@ fn present_editor(
         let runtime_for_write = runtime_for_pin.clone();
         let app_for_result = app_for_pin.clone();
         let state_for_result = state_for_pin.clone();
+        let window_for_result = window_for_pin.clone();
         let button_for_result = button.clone();
         let refresh_status_for_result = refresh_status_for_pin.clone();
         let show_toast_for_result = show_toast_for_pin.clone();
@@ -2700,8 +3018,15 @@ fn present_editor(
                     move |save_result| {
                         match save_result {
                             Ok(output) => {
-                                present_pin_window(&app_for_result, state_for_result, output);
+                                present_pin_window_request(
+                                    &app_for_result,
+                                    state_for_result,
+                                    output,
+                                );
                                 show_toast_for_result("Pinned");
+                                if pin_editor_should_close_after_success() {
+                                    window_for_result.close();
+                                }
                             }
                             Err(error) => {
                                 error!("{error}");
@@ -2737,10 +3062,47 @@ fn present_editor(
     Ok(())
 }
 
+fn present_pin_window_request(
+    app: &adw::Application,
+    state: Arc<ServiceState>,
+    image_path: PathBuf,
+) {
+    match launch_tagged_pin_viewer(&image_path) {
+        Ok(()) => info!("launched tagged pin viewer for {}", image_path.display()),
+        Err(error) => {
+            error!(
+                "failed to launch tagged pin viewer, falling back to local pin window: {error:#}"
+            );
+            present_pin_window(app, state, image_path);
+        }
+    }
+}
+
+fn resolve_pin_viewer_app_binary() -> PathBuf {
+    env::current_exe().unwrap_or_else(|_| PathBuf::from("ashot-app"))
+}
+
+fn launch_tagged_pin_viewer(image_path: &Path) -> Result<()> {
+    let in_flatpak = running_in_flatpak();
+    if !pin_viewer_launcher_available(in_flatpak) {
+        return Err(anyhow::anyhow!(
+            "gnome-service-client is unavailable; cannot launch tagged pin viewer"
+        ));
+    }
+    let command =
+        pin_viewer_launch_command(&resolve_pin_viewer_app_binary(), image_path, in_flatpak);
+    ProcessCommand::new(&command.program)
+        .args(&command.args)
+        .spawn()
+        .with_context(|| format!("failed to spawn {}", command.program))?;
+    Ok(())
+}
+
 fn present_pin_window(app: &adw::Application, state: Arc<ServiceState>, image_path: PathBuf) {
     let (image_width, image_height) = image::image_dimensions(&image_path).unwrap_or((480, 320));
     let (window_width, window_height) = pin_window_size(image_width, image_height);
     let config = state.config_snapshot();
+    let policy = pin_window_policy();
     let initial_scale = pin_initial_scale_with_saved(
         image_width,
         image_height,
@@ -2755,7 +3117,9 @@ fn present_pin_window(app: &adw::Application, state: Arc<ServiceState>, image_pa
         .default_width(window_width)
         .default_height(window_height)
         .build();
-    window.set_resizable(true);
+    window.set_decorated(policy.decorated);
+    window.set_modal(policy.modal);
+    window.set_resizable(policy.resizable);
     window.set_opacity(config.last_pin_opacity.clamp(0.35, 1.0));
 
     let image_overlay = Overlay::new();
@@ -2827,6 +3191,9 @@ fn present_pin_window(app: &adw::Application, state: Arc<ServiceState>, image_pa
             image_height,
             next,
         );
+        if policy.represent_after_interaction {
+            present_pin_window_front(&window_for_scroll);
+        }
         let generation = next_pin_scale_save_generation(save_generation_for_scroll.get());
         save_generation_for_scroll.set(generation);
         let state_for_save = state_for_scroll.clone();
@@ -2843,15 +3210,17 @@ fn present_pin_window(app: &adw::Application, state: Arc<ServiceState>, image_pa
     pin_content.add_controller(scroll);
 
     let click = gtk::GestureClick::new();
-    click.set_button(0);
+    click.set_button(pin_click_controller_button());
     click.set_propagation_phase(gtk::PropagationPhase::Capture);
     let window_for_click = window.clone();
     let pin_content_for_click = pin_content.clone();
-    let state_for_click = state.clone();
-    let image_path_for_click = image_path.clone();
     click.connect_pressed(move |gesture, n_press, x, y| {
         let button = gesture.current_button();
-        if pin_click_action(n_press, button) == Some(PinClickAction::Close) {
+        let click_action = pin_click_action(n_press, button);
+        if policy.represent_after_interaction && pin_should_represent_before_action(click_action) {
+            present_pin_window_front(&window_for_click);
+        }
+        if click_action == Some(PinClickAction::Close) {
             window_for_click.close();
             return;
         }
@@ -2869,12 +3238,12 @@ fn present_pin_window(app: &adw::Application, state: Arc<ServiceState>, image_pa
             begin_pin_window_move(&window_for_click, gesture, x, y);
             return;
         }
-        if pin_click_action(n_press, button) == Some(PinClickAction::Menu) {
+        if click_action == Some(PinClickAction::Menu) {
             show_pin_context_popover(
                 &pin_content_for_click,
                 &window_for_click,
-                state_for_click.clone(),
-                image_path_for_click.clone(),
+                state.clone(),
+                image_path.clone(),
                 x,
                 y,
             );
@@ -2903,8 +3272,9 @@ fn present_pin_window(app: &adw::Application, state: Arc<ServiceState>, image_pa
     });
     pin_content.add_controller(pin_motion);
 
-    window.set_content(Some(&image_overlay));
+    set_pin_window_content(&window, &image_overlay);
     window.present();
+    present_pin_window_front(&window);
 }
 
 fn action_icon_button(icon_name: &str, tooltip: &str) -> Button {
@@ -3038,6 +3408,51 @@ fn set_button_loading(button: &Button, loading: bool) {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PinWindowPolicy {
+    decorated: bool,
+    modal: bool,
+    resizable: bool,
+    represent_after_interaction: bool,
+}
+
+fn pin_window_policy() -> PinWindowPolicy {
+    PinWindowPolicy {
+        decorated: false,
+        modal: true,
+        resizable: true,
+        represent_after_interaction: true,
+    }
+}
+
+fn pin_editor_should_close_after_success() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PinZoomGeometry {
+    display_width: i32,
+    display_height: i32,
+    window_width: i32,
+    window_height: i32,
+}
+
+impl PinZoomGeometry {
+    fn display_size(self) -> (i32, i32) {
+        (self.display_width, self.display_height)
+    }
+
+    fn window_size(self) -> (i32, i32) {
+        (self.window_width, self.window_height)
+    }
+}
+
+fn pin_zoom_geometry(image_width: u32, image_height: u32, scale: f64) -> PinZoomGeometry {
+    let (display_width, display_height) = pin_picture_size(image_width, image_height, scale);
+    let (window_width, window_height) = pin_window_size_for_scale(image_width, image_height, scale);
+    PinZoomGeometry { display_width, display_height, window_width, window_height }
+}
+
 fn pin_window_size(image_width: u32, image_height: u32) -> (i32, i32) {
     let scale = fit_scale(image_width, image_height, 900, 640);
     let (display_width, display_height) = pin_display_size(image_width, image_height, scale);
@@ -3117,6 +3532,10 @@ enum PinClickAction {
     Menu,
 }
 
+fn pin_click_controller_button() -> u32 {
+    0
+}
+
 fn pin_click_action(n_press: i32, button: u32) -> Option<PinClickAction> {
     if button == 3 && n_press == 1 {
         return Some(PinClickAction::Menu);
@@ -3129,6 +3548,14 @@ fn pin_click_action(n_press: i32, button: u32) -> Option<PinClickAction> {
         };
     }
     None
+}
+
+fn pin_should_represent_before_action(action: Option<PinClickAction>) -> bool {
+    action != Some(PinClickAction::Menu)
+}
+
+fn pin_context_menu_labels() -> &'static [&'static str] {
+    &["Copy", "Save", "Opacity 100%", "Opacity 85%", "Opacity 70%", "Close"]
 }
 
 fn pin_context_popover_rect(x: f64, y: f64) -> (i32, i32, i32, i32) {
@@ -3240,18 +3667,15 @@ fn show_pin_context_popover(
     root.set_margin_start(8);
     root.set_margin_end(8);
 
-    let copy = pin_menu_button("edit-copy-symbolic", "Copy");
-    let save = pin_menu_button("document-save-symbolic", "Save");
-    let opacity_100 = pin_menu_button("view-visible-symbolic", "Opacity 100%");
-    let opacity_85 = pin_menu_button("view-visible-symbolic", "Opacity 85%");
-    let opacity_70 = pin_menu_button("view-visible-symbolic", "Opacity 70%");
-    let always_on_top = pin_menu_button("view-pin-symbolic", "Always on Top");
-    always_on_top.set_sensitive(false);
-    always_on_top.set_tooltip_text(Some("Not reliably supported by GTK4 on Wayland"));
-    let close = pin_menu_button("window-close-symbolic", "Close");
+    let copy = pin_menu_button("edit-copy-symbolic", pin_context_menu_labels()[0]);
+    let save = pin_menu_button("document-save-symbolic", pin_context_menu_labels()[1]);
+    let opacity_100 = pin_menu_button("view-visible-symbolic", pin_context_menu_labels()[2]);
+    let opacity_85 = pin_menu_button("view-visible-symbolic", pin_context_menu_labels()[3]);
+    let opacity_70 = pin_menu_button("view-visible-symbolic", pin_context_menu_labels()[4]);
+    let close = pin_menu_button("window-close-symbolic", pin_context_menu_labels()[5]);
     close.add_css_class("destructive-action");
 
-    for button in [&copy, &save, &opacity_100, &opacity_85, &opacity_70, &always_on_top, &close] {
+    for button in [&copy, &save, &opacity_100, &opacity_85, &opacity_70, &close] {
         button.set_hexpand(true);
         root.append(button);
     }
@@ -3353,9 +3777,9 @@ fn apply_pin_zoom(
     image_height: u32,
     scale: f64,
 ) {
-    let (display_width, display_height) = pin_picture_size(image_width, image_height, scale);
-    let (window_width, window_height) = pin_window_size_for_scale(image_width, image_height, scale);
-    window.set_default_size(window_width, window_height);
+    let geometry = pin_zoom_geometry(image_width, image_height, scale);
+    let (display_width, display_height) = geometry.display_size();
+    request_pin_window_frame_resize(window, geometry);
     image_overlay.set_size_request(display_width, display_height);
     pin_content.set_size_request(display_width, display_height);
     picture.set_size_request(display_width, display_height);
@@ -3366,7 +3790,37 @@ fn apply_pin_zoom(
         display_height,
         scale,
     ));
+    image_overlay.queue_resize();
+    pin_content.queue_resize();
+    picture.queue_resize();
     window.queue_resize();
+}
+
+fn request_pin_window_frame_resize(window: &ApplicationWindow, geometry: PinZoomGeometry) {
+    let (window_width, window_height) = geometry.window_size();
+    window.set_default_size(window_width, window_height);
+    window.set_size_request(window_width, window_height);
+    if let Some(surface) = window.surface() {
+        surface.request_layout();
+    }
+}
+
+fn set_pin_window_content(window: &ApplicationWindow, content: &impl IsA<gtk::Widget>) {
+    window.set_content(Some(content));
+}
+
+fn present_pin_window_front(window: &ApplicationWindow) {
+    window.present();
+    let Some(surface) = window.surface() else {
+        return;
+    };
+    surface.request_layout();
+    let Ok(toplevel) = surface.downcast::<gtk::gdk::Toplevel>() else {
+        return;
+    };
+    let layout = gtk::gdk::ToplevelLayout::new();
+    layout.set_resizable(pin_window_policy().resizable);
+    toplevel.present(&layout);
 }
 
 fn section_title(text: &str) -> Label {
@@ -7799,29 +8253,37 @@ fn show_save_filename_popover<F>(
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::RefCell, rc::Rc};
+    use std::{
+        cell::RefCell,
+        path::{Path, PathBuf},
+        rc::Rc,
+    };
 
     use ashot_core::{
         Annotation, AnnotationData, AppConfig, AppearanceMode, Color, DefaultTool, Document,
         MARKER_HIGHLIGHT_ALPHA, Point, Rect, ResizeHandle,
     };
+    use ashot_ipc::APP_ID;
 
     use super::{
-        ActiveTextEdit, Align, COLOR_MEMORY_BUTTON_SIZE, COLOR_MEMORY_SWATCH_SIZE, COLOR_ROW_LIMIT,
-        COLOR_VALUE_BUTTON_HEIGHT, COLOR_VALUE_BUTTON_WIDTH, DraftAnnotation, EditorCursorKind,
-        HslColor, PinClickAction, SELECTION_HANDLE_HIT_TOLERANCE, SIDEBAR_ACTION_BUTTON_HEIGHT,
+        ActiveTextEdit, Align, AppStartupBehavior, AppStartupMode, COLOR_MEMORY_BUTTON_SIZE,
+        COLOR_MEMORY_SWATCH_SIZE, COLOR_ROW_LIMIT, COLOR_VALUE_BUTTON_HEIGHT,
+        COLOR_VALUE_BUTTON_WIDTH, DraftAnnotation, EditorCursorKind, EditorScrollAction, HslColor,
+        PinClickAction, SELECTION_HANDLE_HIT_TOLERANCE, SIDEBAR_ACTION_BUTTON_HEIGHT,
         SIDEBAR_ACTION_BUTTON_WIDTH, SIDEBAR_TOOL_BUTTON_HEIGHT, SIDEBAR_TOOL_BUTTON_WIDTH,
         STROKE_MENU_BUTTON_HEIGHT, STROKE_MENU_BUTTON_WIDTH, STROKE_PREVIEW_HEIGHT,
         STROKE_PREVIEW_WIDTH, TOOL_ICON_CANVAS_SIZE, add_favorite_color,
         annotation_keeps_selection_after_creation, annotation_snapshot_for_draw,
-        appearance_color_scheme, appearance_mode_from_index, appearance_mode_index,
-        appearance_mode_labels, arrow_head_geometry, arrow_head_points, arrow_shape_geometry,
-        arrow_visual_stroke_width, blur_radius_for_stroke, capture_should_use_fresh_anchor,
-        clamp_magnifier_zoom, clamp_text_size, crop_image_region, cursor_name_for_resize_handle,
-        cursor_name_for_surface_edge, draft_preview_for_draw, draft_tool_can_draw,
+        app_startup_behavior, appearance_color_scheme, appearance_mode_from_index,
+        appearance_mode_index, appearance_mode_labels, arrow_head_geometry, arrow_head_points,
+        arrow_shape_geometry, arrow_visual_stroke_width, blur_radius_for_stroke,
+        capture_should_use_fresh_anchor, clamp_magnifier_zoom, clamp_text_size, crop_image_region,
+        cursor_name_for_resize_handle, cursor_name_for_surface_edge, draft_preview_for_draw,
+        draft_tool_can_draw, editor_adjustment_value_after_scroll, editor_base_surface,
         editor_color_palette, editor_cursor_for_tool, editor_cursor_kind_for_tool,
-        editor_display_image, editor_display_surface, editor_favorite_palette, editor_initial_size,
-        editor_status_text, editor_stroke_widths, editor_tool_layout, extract_ocr_install_command,
+        editor_favorite_palette, editor_initial_scale, editor_initial_size, editor_scroll_action,
+        editor_status_text, editor_stroke_widths, editor_tool_layout, editor_view_size,
+        editor_zoom_anchor_adjustment_value, editor_zoom_from_scroll, extract_ocr_install_command,
         eyedropper_magnifier_point, filter_font_families, filter_ocr_symbols, fit_scale,
         font_family_preview_markup, font_family_row_content_halign, font_family_row_fixed_height,
         font_family_row_text_xalign, format_magnifier_zoom, hsl_to_color, hsv_to_color,
@@ -7830,17 +8292,21 @@ mod tests {
         ocr_language_label, ocr_result_body_text, ocr_result_primary_action, ocr_result_title,
         ocr_space_curl_args, ocr_space_language_arg, output_action_menu_items,
         output_action_primary_label, parse_hex_color, parse_ocr_space_response, pin_click_action,
-        pin_context_popover_rect, pin_dimension_label, pin_display_size, pin_initial_scale,
-        pin_initial_scale_with_saved, pin_picture_can_target, pin_picture_size,
-        pin_scale_save_generation_is_current, pin_window_size, pin_window_size_for_scale,
-        pin_zoom_from_scroll, push_recent_color, remove_favorite_color, render_document_png_bytes,
+        pin_click_controller_button, pin_context_menu_labels, pin_context_popover_rect,
+        pin_dimension_label, pin_display_size, pin_editor_should_close_after_success,
+        pin_initial_scale, pin_initial_scale_with_saved, pin_picture_can_target, pin_picture_size,
+        pin_scale_save_generation_is_current, pin_should_represent_before_action, pin_viewer_arg,
+        pin_viewer_launch_command, pin_viewer_launcher_check_command, pin_window_policy,
+        pin_window_size, pin_window_size_for_scale, pin_window_tag, pin_zoom_from_scroll,
+        pin_zoom_geometry, push_recent_color, remove_favorite_color, render_document_png_bytes,
         resize_handle_at, rgb_to_hsl, rgb_to_hsv, rgba_color_at,
         save_editor_document_to_dir_with_filename, scaled_canvas_point, selected_annotation_bounds,
-        set_active_text_edit, suggested_save_filename_at, take_active_text_edit,
-        tesseract_command_args, tesseract_command_invocation, text_controls_width,
-        text_font_button_width, text_for_annotation, text_size_button_width, text_size_options,
-        text_size_wheel_options, tool_can_select_existing, tool_icon_label, tool_icon_stroke_width,
-        tool_picks_canvas_color, update_ocr_language_selection,
+        set_active_text_edit, set_editor_image_source, startup_mode_from_args,
+        suggested_save_filename_at, take_active_text_edit, tesseract_command_args,
+        tesseract_command_invocation, text_controls_width, text_font_button_width,
+        text_for_annotation, text_size_button_width, text_size_options, text_size_wheel_options,
+        tool_can_select_existing, tool_icon_label, tool_icon_stroke_width, tool_picks_canvas_color,
+        update_ocr_language_selection,
     };
 
     use chrono::{Local, TimeZone};
@@ -7853,14 +8319,9 @@ mod tests {
     }
 
     #[test]
-    fn editor_initial_size_reserves_space_for_image_and_chrome() {
-        let (width, height) = editor_initial_size(3200, 1800);
-        assert_eq!(width, 1440);
-        assert_eq!(height, 980);
-
-        let (small_width, small_height) = editor_initial_size(640, 360);
-        assert!(small_width >= 980);
-        assert!(small_height >= 620);
+    fn editor_initial_size_is_fixed_for_large_and_small_captures() {
+        assert_eq!(editor_initial_size(3200, 1800), (1280, 860));
+        assert_eq!(editor_initial_size(640, 360), (1280, 860));
     }
 
     #[test]
@@ -7916,36 +8377,86 @@ mod tests {
     }
 
     #[test]
+    fn editor_initial_scale_fits_large_images_without_upscaling_small_images() {
+        assert!(editor_initial_scale(2560, 1440, 988, 790) < 1.0);
+        assert_eq!(editor_initial_scale(640, 360, 988, 790), 1.0);
+    }
+
+    #[test]
+    fn editor_view_size_tracks_zoomed_image_size() {
+        assert_eq!(editor_view_size(1200, 800, 0.5), (600, 400));
+        assert_eq!(editor_view_size(1200, 800, 1.25), (1500, 1000));
+    }
+
+    #[test]
+    fn editor_ctrl_wheel_zoom_clamps_to_editor_limits() {
+        assert!(editor_zoom_from_scroll(1.0, -1.0) > 1.0);
+        assert!(editor_zoom_from_scroll(1.0, 1.0) < 1.0);
+        assert_eq!(editor_zoom_from_scroll(0.1, 1.0), 0.1);
+        assert_eq!(editor_zoom_from_scroll(8.0, -1.0), 8.0);
+    }
+
+    #[test]
+    fn editor_scroll_action_splits_plain_shift_and_ctrl_wheel_input() {
+        assert_eq!(
+            editor_scroll_action(1.0, 0.0, 1.0, gtk4::gdk::ModifierType::empty()),
+            EditorScrollAction::PassThrough
+        );
+        assert_eq!(
+            editor_scroll_action(1.0, 0.0, 1.0, gtk4::gdk::ModifierType::SHIFT_MASK),
+            EditorScrollAction::Horizontal(64.0)
+        );
+        assert_eq!(
+            editor_scroll_action(1.0, 0.0, -1.0, gtk4::gdk::ModifierType::CONTROL_MASK),
+            EditorScrollAction::Zoom(editor_zoom_from_scroll(1.0, -1.0))
+        );
+    }
+
+    #[test]
+    fn editor_scroll_adjustment_values_are_clamped_to_scrollable_range() {
+        assert_eq!(editor_adjustment_value_after_scroll(20.0, 300.0, 100.0, 64.0), 84.0);
+        assert_eq!(editor_adjustment_value_after_scroll(20.0, 300.0, 100.0, -64.0), 0.0);
+        assert_eq!(editor_adjustment_value_after_scroll(180.0, 300.0, 100.0, 64.0), 200.0);
+    }
+
+    #[test]
+    fn editor_zoom_anchor_keeps_pointer_image_coordinate_stable() {
+        assert_eq!(
+            editor_zoom_anchor_adjustment_value(100.0, 250.0, 1.0, 2.0, 2000.0, 500.0),
+            350.0
+        );
+        assert_eq!(editor_zoom_anchor_adjustment_value(100.0, 250.0, 2.0, 0.5, 300.0, 500.0), 0.0);
+    }
+
+    #[test]
     fn scaled_canvas_points_map_back_to_image_coordinates() {
         let point = scaled_canvas_point(320.0, 180.0, 0.5);
         assert_eq!(point, Point::new(640.0, 360.0));
     }
 
     #[test]
-    fn editor_display_image_is_resampled_to_canvas_size() {
+    fn editor_base_surface_keeps_original_image_size() {
         let image = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
             8,
             16,
             image::Rgba([16, 32, 48, 255]),
         ));
 
-        let display = editor_display_image(&image, 4, 8);
+        let surface = editor_base_surface(&image).expect("display surface");
 
-        assert_eq!(display.dimensions(), (4, 8));
+        assert_eq!(surface.width(), 8);
+        assert_eq!(surface.height(), 16);
     }
 
     #[test]
-    fn editor_display_surface_matches_canvas_size() {
-        let image = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
-            8,
-            16,
-            image::Rgba([16, 32, 48, 255]),
-        ));
+    fn editor_image_source_uses_nearest_filter_for_crisp_pixels() {
+        let target = gtk4::cairo::ImageSurface::create(gtk4::cairo::Format::ARgb32, 4, 4).unwrap();
+        let source = gtk4::cairo::ImageSurface::create(gtk4::cairo::Format::ARgb32, 2, 2).unwrap();
+        let cr = gtk4::cairo::Context::new(&target).unwrap();
 
-        let surface = editor_display_surface(&image, 4, 8).expect("display surface");
+        set_editor_image_source(&cr, &source).unwrap();
 
-        assert_eq!(surface.width(), 4);
-        assert_eq!(surface.height(), 8);
+        assert_eq!(cr.source().filter(), gtk4::cairo::Filter::Nearest);
     }
 
     #[test]
@@ -8632,6 +9143,22 @@ mod tests {
     }
 
     #[test]
+    fn flatpak_manifest_has_only_ashot_module() {
+        let manifest: serde_json::Value =
+            serde_json::from_str(include_str!("../../flatpak/io.github.ashot.App.json"))
+                .expect("valid Flatpak manifest JSON");
+        let module_names = manifest
+            .get("modules")
+            .and_then(serde_json::Value::as_array)
+            .expect("modules array")
+            .iter()
+            .filter_map(|module| module.get("name").and_then(serde_json::Value::as_str))
+            .collect::<Vec<_>>();
+
+        assert_eq!(module_names, vec!["ashot"]);
+    }
+
+    #[test]
     fn flatpak_release_artifacts_include_git_tag_version() {
         let release = include_str!("../../.github/workflows/release.yml");
         let ci = include_str!("../../.github/workflows/ci.yml");
@@ -8892,9 +9419,203 @@ mod tests {
     }
 
     #[test]
+    fn startup_args_parse_service_and_pin_viewer_modes() {
+        let (mode, filtered) =
+            startup_mode_from_args(["ashot-app", "--service"]).expect("service args");
+        assert_eq!(mode, AppStartupMode::Service);
+        assert_eq!(filtered, vec!["ashot-app"]);
+
+        let (mode, filtered) =
+            startup_mode_from_args(["ashot-app", pin_viewer_arg(), "/tmp/pin.png"])
+                .expect("pin viewer args");
+        assert_eq!(mode, AppStartupMode::PinViewer(PathBuf::from("/tmp/pin.png")));
+        assert_eq!(filtered, vec!["ashot-app"]);
+    }
+
+    #[test]
+    fn pin_viewer_startup_is_non_unique_and_skips_dbus_service() {
+        assert_eq!(
+            app_startup_behavior(&AppStartupMode::PinViewer(PathBuf::from("/tmp/pin.png"))),
+            AppStartupBehavior {
+                register_dbus_service: false,
+                non_unique_application: true,
+                activate_pin_viewer: true,
+            }
+        );
+        assert_eq!(
+            app_startup_behavior(&AppStartupMode::Service),
+            AppStartupBehavior {
+                register_dbus_service: true,
+                non_unique_application: true,
+                activate_pin_viewer: false,
+            }
+        );
+        assert_eq!(
+            app_startup_behavior(&AppStartupMode::Launcher),
+            AppStartupBehavior {
+                register_dbus_service: true,
+                non_unique_application: false,
+                activate_pin_viewer: false,
+            }
+        );
+    }
+
+    #[test]
+    fn pin_viewer_launch_command_uses_gnome_service_client_on_host() {
+        let command = pin_viewer_launch_command(
+            Path::new("/usr/bin/ashot-app"),
+            Path::new("/tmp/pin.png"),
+            false,
+        );
+
+        assert_eq!(command.program, "gnome-service-client");
+        assert_eq!(
+            command.args,
+            vec![
+                "-t",
+                pin_window_tag(),
+                "--",
+                "/usr/bin/ashot-app",
+                pin_viewer_arg(),
+                "/tmp/pin.png"
+            ]
+        );
+    }
+
+    #[test]
+    fn pin_viewer_launch_command_uses_host_gnome_service_client_from_flatpak() {
+        let command = pin_viewer_launch_command(
+            Path::new("/app/bin/ashot-app"),
+            Path::new("/tmp/pin.png"),
+            true,
+        );
+
+        assert_eq!(command.program, "flatpak-spawn");
+        assert_eq!(
+            command.args,
+            vec![
+                "--host",
+                "gnome-service-client",
+                "-t",
+                pin_window_tag(),
+                "--",
+                "flatpak",
+                "run",
+                "--command=ashot-app",
+                APP_ID,
+                pin_viewer_arg(),
+                "/tmp/pin.png"
+            ]
+        );
+    }
+
+    #[test]
+    fn pin_viewer_launcher_check_command_verifies_host_gnome_service_client_from_flatpak() {
+        let command = pin_viewer_launcher_check_command(true).expect("flatpak preflight command");
+
+        assert_eq!(command.program, "flatpak-spawn");
+        assert_eq!(
+            command.args,
+            vec!["--host", "sh", "-c", "command -v gnome-service-client >/dev/null 2>&1"]
+        );
+        assert!(pin_viewer_launcher_check_command(false).is_none());
+    }
+
+    #[test]
+    fn gnome_shell_extension_matches_pin_tag_and_makes_window_above() {
+        let metadata =
+            include_str!("../../gnome-shell/extensions/ashot-pin@io.github.ashot/metadata.json");
+        let extension =
+            include_str!("../../gnome-shell/extensions/ashot-pin@io.github.ashot/extension.js");
+
+        assert!(metadata.contains("\"uuid\": \"ashot-pin@io.github.ashot\""));
+        assert!(metadata.contains("\"50\""));
+        assert!(extension.contains("const PIN_WINDOW_TAG = 'ashot-pin';"));
+        assert!(extension.contains("window.get_tag()"));
+        assert!(extension.contains("window.make_above()"));
+        assert!(extension.contains("window.stick()"));
+        assert!(extension.contains("window-created"));
+        assert!(!extension.contains("PanelMenu"));
+    }
+
+    #[test]
+    fn gnome_extension_install_script_installs_user_extension_and_enables_it() {
+        let script = include_str!("../../scripts/install-gnome-extension.sh");
+
+        assert!(script.contains("UUID=\"ashot-pin@io.github.ashot\""));
+        assert!(script.contains("gnome-shell/extensions/${UUID}"));
+        assert!(script.contains("TARGET_DIR=\"${DATA_HOME}/gnome-shell/extensions/${UUID}\""));
+        assert!(script.contains("gnome-extensions enable \"${UUID}\""));
+    }
+
+    #[test]
+    fn docs_describe_gnome_pin_extension_packaging() {
+        let readme = include_str!("../../README.md");
+        let architecture = include_str!("../../docs/architecture.md");
+        let release = include_str!("../../docs/release-checklist.md");
+
+        assert!(readme.contains("./scripts/install-gnome-extension.sh"));
+        assert!(readme.contains("gnome-service-client"));
+        assert!(readme.contains("ashot-gnome-shell-extension"));
+        assert!(readme.contains("ashot-gnome"));
+        assert!(architecture.contains("ashot-pin"));
+        assert!(architecture.contains("Meta.Window.make_above()"));
+        assert!(release.contains("GNOME Shell extension"));
+        assert!(!readme.contains("GNOME Shell extension integration has been removed"));
+        assert!(!architecture.contains("no longer depends on a GNOME Shell extension"));
+        assert!(!release.contains("Confirm that no GNOME Shell extension is required"));
+    }
+
+    #[test]
+    fn release_workflow_builds_flatpak_distro_packages_and_extension_bundle() {
+        let workflow = include_str!("../../.github/workflows/release.yml");
+        let script = include_str!("../../scripts/build-distro-packages.sh");
+        let readme = include_str!("../../README.md");
+
+        assert!(workflow.contains("./scripts/build-distro-packages.sh"));
+        assert!(workflow.contains("gnome-extensions pack"));
+        assert!(workflow.contains("build-packages/*.deb"));
+        assert!(workflow.contains("build-packages/*.rpm"));
+        assert!(workflow.contains("build-packages/*.shell-extension.zip"));
+        assert!(script.contains("build_deb_package \"ashot\""));
+        assert!(script.contains("build_deb_package \"ashot-gnome-shell-extension\""));
+        assert!(script.contains("build_deb_package \"ashot-gnome\""));
+        assert!(script.contains("build_rpm_package \"ashot\""));
+        assert!(script.contains("build_rpm_package \"ashot-gnome-shell-extension\""));
+        assert!(script.contains("build_rpm_package \"ashot-gnome\""));
+        assert!(readme.contains("| `io.github.ashot.App-*.flatpak` |"));
+        assert!(readme.contains("| `ashot_*_amd64.deb` / `ashot-*.x86_64.rpm` |"));
+        assert!(readme.contains("gnome-extensions enable ashot-pin@io.github.ashot"));
+    }
+
+    #[test]
+    fn pin_click_controller_listens_to_all_buttons_for_context_menu() {
+        assert_eq!(pin_click_controller_button(), 0);
+    }
+
+    #[test]
+    fn pin_context_menu_restores_actions_without_topmost_entries() {
+        let labels = pin_context_menu_labels();
+
+        assert_eq!(
+            labels,
+            &["Copy", "Save", "Opacity 100%", "Opacity 85%", "Opacity 70%", "Close"]
+        );
+        assert!(!labels.contains(&"Always on Top"));
+        assert!(!labels.contains(&"Window Menu..."));
+    }
+
+    #[test]
     fn pin_context_menu_anchors_to_click_position() {
         assert_eq!(pin_context_popover_rect(24.4, 35.6), (24, 36, 1, 1));
         assert_eq!(pin_context_popover_rect(-8.0, f64::NAN), (0, 0, 1, 1));
+    }
+
+    #[test]
+    fn pin_context_menu_action_does_not_represent_window_before_using_event() {
+        assert!(!pin_should_represent_before_action(Some(PinClickAction::Menu)));
+        assert!(pin_should_represent_before_action(Some(PinClickAction::Move)));
+        assert!(pin_should_represent_before_action(None));
     }
 
     #[test]
@@ -8908,6 +9629,32 @@ mod tests {
     #[test]
     fn pin_dimension_label_reports_display_size_and_scale() {
         assert_eq!(pin_dimension_label(1920, 1080, 960, 540, 0.5), "960 x 540 px · 50%");
+    }
+
+    #[test]
+    fn pin_success_closes_editor_after_creating_pin_window() {
+        assert!(pin_editor_should_close_after_success());
+    }
+
+    #[test]
+    fn pin_window_defaults_to_front_presentation_policy() {
+        let policy = pin_window_policy();
+
+        assert!(!policy.decorated);
+        assert!(policy.modal);
+        assert!(policy.resizable);
+        assert!(policy.represent_after_interaction);
+    }
+
+    #[test]
+    fn pin_zoom_geometry_keeps_window_frame_matched_to_image() {
+        let small = pin_zoom_geometry(1200, 800, 0.5);
+        let large = pin_zoom_geometry(1200, 800, 1.25);
+
+        assert_eq!(small.display_size(), (600, 400));
+        assert_eq!(small.window_size(), (600, 400));
+        assert_eq!(large.display_size(), (1500, 1000));
+        assert_eq!(large.window_size(), (1500, 1000));
     }
 
     #[test]

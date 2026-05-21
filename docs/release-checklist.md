@@ -22,7 +22,8 @@
 - Undo and redo operate on annotation snapshots
 - Saving writes into the configured default directory
 - Copy action places the rendered image in the clipboard
-- Pin action opens a separate preview window
+- Pin action opens a separate tagged preview window
+- With the GNOME Shell extension enabled, the pin window stays above other windows on GNOME 50 Wayland
 
 ## Packaging
 
@@ -32,8 +33,12 @@
 - AppStream metadata validates
 - Icon is present
 - CLI is exposed for Linux shortcut binding
+- `scripts/install-gnome-extension.sh` installs and enables the GNOME Shell extension for user-level testing
+- Distribution packaging keeps `ashot`, `ashot-gnome-shell-extension`, and the optional `ashot-gnome` meta package separate
+- GitHub Release uploads Flatpak, GNOME Shell extension zip, Debian packages, and RPM packages
 
 ## Environment Caveats
 
-- Confirm that no GNOME Shell extension is required
+- Confirm that the GNOME Shell extension is enabled when validating reliable pin-window always-on-top behavior
+- Confirm that `gnome-service-client` is available on GNOME 50 systems used for tagged pin-window validation
 - Confirm that the screenshot and editor workflows are validated on a Wayland session
