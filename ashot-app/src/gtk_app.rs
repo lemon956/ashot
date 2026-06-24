@@ -889,6 +889,17 @@ fn editor_view_size(image_width: u32, image_height: u32, scale: f64) -> (i32, i3
     scaled_image_size(image_width.max(1), image_height.max(1), scale)
 }
 
+/// Content-space coordinate of the visible viewport centre, used as the anchor
+/// point when zooming via buttons/shortcuts (the wheel anchors on the cursor).
+fn editor_viewport_center(scrolled: &ScrolledWindow) -> (f64, f64) {
+    let hadjustment = scrolled.hadjustment();
+    let vadjustment = scrolled.vadjustment();
+    (
+        hadjustment.value() + hadjustment.page_size() / 2.0,
+        vadjustment.value() + vadjustment.page_size() / 2.0,
+    )
+}
+
 fn cairo_argb32_bytes_from_rgba(image: &image::RgbaImage, stride: usize) -> Vec<u8> {
     let width = image.width() as usize;
     let height = image.height() as usize;
@@ -933,10 +944,89 @@ fn editor_base_surface(
 fn set_editor_image_source(
     cr: &gtk::cairo::Context,
     surface: &gtk::cairo::ImageSurface,
+    scale: f64,
 ) -> std::result::Result<(), gtk::cairo::Error> {
     cr.set_source_surface(surface, 0.0, 0.0)?;
-    cr.source().set_filter(gtk::cairo::Filter::Nearest);
+    // Fixed policy: nearest-neighbour while magnifying (>1x) keeps individual
+    // pixels crisp for inspection; high-quality smoothing while minifying (<=1x)
+    // removes the jagged aliasing the old nearest-only path produced when a large
+    // screenshot was shrunk to fit the viewport.
+    let filter = if scale >= 1.0 { gtk::cairo::Filter::Nearest } else { gtk::cairo::Filter::Good };
+    cr.source().set_filter(filter);
     Ok(())
+}
+
+/// High-quality, pre-scaled bitmap of the base screenshot.
+///
+/// Rebuilt off the hot draw path (on a debounce) whenever the zoom level or the
+/// monitor scale factor settles, then painted 1:1 so minified views are resampled
+/// with Lanczos3 instead of Cairo's cheaper realtime filter, and HiDPI monitors
+/// receive true device-pixel detail. This is purely a display cache and is never
+/// consulted by the export/clipboard pipeline (which always renders from the
+/// full-resolution `base_rgba`), so zooming can never degrade exported images.
+#[derive(Default)]
+struct HiqImageCache {
+    surface: Option<gtk::cairo::ImageSurface>,
+    scale: f64,
+    scale_factor: i32,
+}
+
+impl HiqImageCache {
+    fn matches(&self, scale: f64, scale_factor: i32) -> bool {
+        self.surface.is_some()
+            && self.scale_factor == scale_factor
+            && (self.scale - scale).abs() < 1e-6
+    }
+}
+
+fn build_hiq_surface(
+    base_rgba: &image::RgbaImage,
+    image_width: u32,
+    image_height: u32,
+    scale: f64,
+    scale_factor: i32,
+) -> Option<gtk::cairo::ImageSurface> {
+    let scale_factor = scale_factor.max(1);
+    let (display_width, display_height) = editor_view_size(image_width, image_height, scale);
+    let device_width = (display_width.max(1) * scale_factor) as u32;
+    let device_height = (display_height.max(1) * scale_factor) as u32;
+    if device_width == 0 || device_height == 0 {
+        return None;
+    }
+    let resized = if device_width == base_rgba.width() && device_height == base_rgba.height() {
+        base_rgba.clone()
+    } else {
+        image::imageops::resize(
+            base_rgba,
+            device_width,
+            device_height,
+            image::imageops::FilterType::Lanczos3,
+        )
+    };
+    let format = gtk::cairo::Format::ARgb32;
+    let stride = format.stride_for_width(device_width).ok()?;
+    let bytes = cairo_argb32_bytes_from_rgba(&resized, stride as usize);
+    let surface = gtk::cairo::ImageSurface::create_for_data(
+        bytes,
+        format,
+        device_width as i32,
+        device_height as i32,
+        stride,
+    )
+    .ok()?;
+    // Map the device-resolution bitmap back to logical units so it paints at the
+    // same on-screen size as the fast path while keeping its extra detail.
+    surface.set_device_scale(scale_factor as f64, scale_factor as f64);
+    Some(surface)
+}
+
+/// Maps number keys `1`..=`9` to the tools shown in the sidebar grid, in order.
+fn tool_for_digit(digit: u32) -> Option<DefaultTool> {
+    if (1..=9).contains(&digit) {
+        editor_tool_layout().get((digit - 1) as usize).map(|(_, tool)| *tool)
+    } else {
+        None
+    }
 }
 
 fn apply_editor_zoom(
@@ -1666,17 +1756,28 @@ fn present_editor(
     root.append(&header);
     info!("present_editor header installed");
 
-    let undo = action_icon_button("edit-undo-symbolic", "Undo");
-    let redo = action_icon_button("edit-redo-symbolic", "Redo");
-    let copy = action_icon_button("edit-copy-symbolic", "Copy to Clipboard");
+    let undo = action_icon_button("edit-undo-symbolic", "Undo (Ctrl+Z)");
+    let redo = action_icon_button("edit-redo-symbolic", "Redo (Ctrl+Y)");
+    let copy = action_icon_button("edit-copy-symbolic", "Copy to Clipboard (Ctrl+C)");
     let pin = action_icon_button("view-pin-symbolic", "Pin Screenshot");
     let [save_label, save_to_label, save_exit_label] = output_action_menu_items();
-    let save = action_text_button("document-save-symbolic", save_label, "Save");
+    let save = action_text_button("document-save-symbolic", save_label, "Save (Ctrl+S)");
     let copy_exit =
         action_text_button("edit-copy-symbolic", output_action_primary_label(), "Copy and Exit");
-    let save_to = action_text_button("folder-save-symbolic", save_to_label, "Save to a folder");
+    let save_to = action_text_button(
+        "folder-save-symbolic",
+        save_to_label,
+        "Save to a folder (Ctrl+Shift+S)",
+    );
     let save_close =
         action_text_button("document-save-as-symbolic", save_exit_label, "Save and Exit");
+
+    // The header used to be empty; host the editing actions here so the sidebar
+    // can lead with the tools instead of an action row.
+    header.pack_start(&undo);
+    header.pack_start(&redo);
+    header.pack_end(&pin);
+    header.pack_end(&copy);
 
     let overlay = Overlay::new();
     overlay.set_hexpand(false);
@@ -1702,6 +1803,63 @@ fn present_editor(
         image_scale.get(),
     );
     info!("present_editor canvas added");
+
+    // High-quality display cache (Lanczos3 + HiDPI device pixels). Rebuilt on a
+    // short debounce after the zoom/scale-factor settles so continuous wheel
+    // zooming stays smooth (showing the fast Cairo-filtered path meanwhile).
+    let hiq_cache: Rc<RefCell<HiqImageCache>> = Rc::new(RefCell::new(HiqImageCache::default()));
+    let hiq_rebuild_gen = Rc::new(Cell::new(0u64));
+    let request_hiq_rebuild: Rc<dyn Fn()> = {
+        let base_rgba = base_rgba.clone();
+        let image_scale = image_scale.clone();
+        let canvas = canvas.clone();
+        let hiq_cache = hiq_cache.clone();
+        let hiq_rebuild_gen = hiq_rebuild_gen.clone();
+        let image_width = base_image.width();
+        let image_height = base_image.height();
+        Rc::new(move || {
+            let generation = hiq_rebuild_gen.get().wrapping_add(1);
+            hiq_rebuild_gen.set(generation);
+            let base_rgba = base_rgba.clone();
+            let image_scale = image_scale.clone();
+            let canvas = canvas.clone();
+            let hiq_cache = hiq_cache.clone();
+            let hiq_rebuild_gen = hiq_rebuild_gen.clone();
+            glib::timeout_add_local_once(Duration::from_millis(120), move || {
+                if hiq_rebuild_gen.get() != generation {
+                    return;
+                }
+                let scale = image_scale.get();
+                let scale_factor = canvas.scale_factor();
+                if hiq_cache.borrow().matches(scale, scale_factor) {
+                    return;
+                }
+                if let Some(surface) = build_hiq_surface(
+                    base_rgba.as_ref(),
+                    image_width,
+                    image_height,
+                    scale,
+                    scale_factor,
+                ) {
+                    *hiq_cache.borrow_mut() =
+                        HiqImageCache { surface: Some(surface), scale, scale_factor };
+                    canvas.queue_draw();
+                }
+            });
+        })
+    };
+    // Rebuild the crisp bitmap once the editor is on screen, and again whenever it
+    // is dragged onto a monitor with a different scale factor.
+    request_hiq_rebuild();
+    {
+        let request_hiq_rebuild = request_hiq_rebuild.clone();
+        canvas.connect_scale_factor_notify(move |_| request_hiq_rebuild());
+    }
+
+    // Live zoom percentage readout, shared by the wheel, buttons and shortcuts.
+    let zoom_percent_label =
+        Label::new(Some(&format!("{}%", (image_scale.get() * 100.0).round() as i32)));
+    zoom_percent_label.set_width_chars(5);
     let window_for_marker_animation = window.downgrade();
     let canvas_for_marker_animation = canvas.clone();
     let document_for_marker_animation = document.clone();
@@ -1754,12 +1912,58 @@ fn present_editor(
     scrolled.add_css_class("view");
     let editor_scroll = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::BOTH_AXES);
     editor_scroll.set_propagation_phase(gtk::PropagationPhase::Capture);
+
+    // Single zoom entry point shared by the wheel, the sidebar buttons and the
+    // keyboard. `target_scale` is clamped; (anchor_x, anchor_y) is the content
+    // point to keep stationary. Only the display `image_scale` is touched, so
+    // the export/clipboard pipeline is never affected by zooming.
+    let apply_zoom: Rc<dyn Fn(f64, f64, f64)> = {
+        let scrolled = scrolled.clone();
+        let overlay = overlay.clone();
+        let canvas = canvas.clone();
+        let image_scale = image_scale.clone();
+        let zoom_percent_label = zoom_percent_label.clone();
+        let request_hiq_rebuild = request_hiq_rebuild.clone();
+        let image_width = base_image.width();
+        let image_height = base_image.height();
+        Rc::new(move |target_scale: f64, anchor_x: f64, anchor_y: f64| {
+            let next_scale = target_scale.clamp(EDITOR_MIN_SCALE, EDITOR_MAX_SCALE);
+            let old_scale = image_scale.get();
+            if (next_scale - old_scale).abs() < f64::EPSILON {
+                return;
+            }
+            let (display_width, display_height) =
+                editor_view_size(image_width, image_height, next_scale);
+            let hadjustment = scrolled.hadjustment();
+            let vadjustment = scrolled.vadjustment();
+            let next_hadjustment = editor_zoom_anchor_adjustment_value(
+                hadjustment.value(),
+                anchor_x,
+                old_scale,
+                next_scale,
+                display_width as f64,
+                hadjustment.page_size(),
+            );
+            let next_vadjustment = editor_zoom_anchor_adjustment_value(
+                vadjustment.value(),
+                anchor_y,
+                old_scale,
+                next_scale,
+                display_height as f64,
+                vadjustment.page_size(),
+            );
+            image_scale.set(next_scale);
+            apply_editor_zoom(&overlay, &canvas, image_width, image_height, next_scale);
+            hadjustment.set_value(next_hadjustment);
+            vadjustment.set_value(next_vadjustment);
+            zoom_percent_label.set_text(&format!("{}%", (next_scale * 100.0).round() as i32));
+            request_hiq_rebuild();
+        })
+    };
+
     let scrolled_for_editor_scroll = scrolled.clone();
-    let overlay_for_editor_scroll = overlay.clone();
-    let canvas_for_editor_scroll = canvas.clone();
     let image_scale_for_editor_scroll = image_scale.clone();
-    let image_width_for_editor_scroll = base_image.width();
-    let image_height_for_editor_scroll = base_image.height();
+    let apply_zoom_for_scroll = apply_zoom.clone();
     editor_scroll.connect_scroll(move |controller, dx, dy| {
         match editor_scroll_action(
             image_scale_for_editor_scroll.get(),
@@ -1779,45 +1983,11 @@ fn present_editor(
                 glib::Propagation::Stop
             }
             EditorScrollAction::Zoom(next_scale) => {
-                let old_scale = image_scale_for_editor_scroll.get();
                 let (cursor_x, cursor_y) = controller
                     .current_event()
                     .and_then(|event| event.position())
                     .unwrap_or((0.0, 0.0));
-                let (display_width, display_height) = editor_view_size(
-                    image_width_for_editor_scroll,
-                    image_height_for_editor_scroll,
-                    next_scale,
-                );
-                let hadjustment = scrolled_for_editor_scroll.hadjustment();
-                let vadjustment = scrolled_for_editor_scroll.vadjustment();
-                let next_hadjustment = editor_zoom_anchor_adjustment_value(
-                    hadjustment.value(),
-                    cursor_x,
-                    old_scale,
-                    next_scale,
-                    display_width as f64,
-                    hadjustment.page_size(),
-                );
-                let next_vadjustment = editor_zoom_anchor_adjustment_value(
-                    vadjustment.value(),
-                    cursor_y,
-                    old_scale,
-                    next_scale,
-                    display_height as f64,
-                    vadjustment.page_size(),
-                );
-
-                image_scale_for_editor_scroll.set(next_scale);
-                apply_editor_zoom(
-                    &overlay_for_editor_scroll,
-                    &canvas_for_editor_scroll,
-                    image_width_for_editor_scroll,
-                    image_height_for_editor_scroll,
-                    next_scale,
-                );
-                hadjustment.set_value(next_hadjustment);
-                vadjustment.set_value(next_vadjustment);
+                apply_zoom_for_scroll(next_scale, cursor_x, cursor_y);
                 glib::Propagation::Stop
             }
         }
@@ -1837,15 +2007,8 @@ fn present_editor(
     left_panel.set_margin_start(4);
     left_panel.set_margin_end(4);
 
-    left_panel.append(&section_title("Actions"));
+    left_panel.append(&section_title("Output"));
     info!("present_editor left panel actions added");
-    let quick_actions = GtkBox::new(Orientation::Horizontal, 6);
-    quick_actions.append(&undo);
-    quick_actions.append(&redo);
-    quick_actions.append(&copy);
-    quick_actions.append(&pin);
-    left_panel.append(&quick_actions);
-
     let output_actions = GtkBox::new(Orientation::Horizontal, 6);
     copy_exit.set_hexpand(true);
     output_actions.append(&copy_exit);
@@ -1864,7 +2027,9 @@ fn present_editor(
         let button = Button::new();
         let icon = tool_icon_area(*tool);
         button.set_child(Some(&icon));
-        button.set_tooltip_text(Some(label));
+        let tooltip =
+            if index < 9 { format!("{label} ({})", index + 1) } else { (*label).to_string() };
+        button.set_tooltip_text(Some(&tooltip));
         button.set_hexpand(true);
         button.set_size_request(SIDEBAR_TOOL_BUTTON_WIDTH, SIDEBAR_TOOL_BUTTON_HEIGHT);
         button.add_css_class("ashot-tool-button");
@@ -1885,11 +2050,85 @@ fn present_editor(
             });
             refresh_status_for_tool(None);
         });
-        tool_grid.attach(&button, (index % 3) as i32, (index / 3) as i32, 1, 1);
+        tool_grid.attach(&button, (index % 4) as i32, (index / 4) as i32, 1, 1);
         tool_buttons.borrow_mut().push((tool, button));
     }
     left_panel.append(&tool_grid);
     info!("present_editor tool grid added");
+
+    // View / zoom controls — physical buttons mirroring the Ctrl+wheel zoom.
+    left_panel.append(&section_title("View"));
+    let zoom_controls = GtkBox::new(Orientation::Horizontal, 6);
+    let zoom_out_button = Button::with_label("\u{2212}");
+    zoom_out_button.set_tooltip_text(Some("Zoom out (Ctrl+-)"));
+    zoom_out_button.add_css_class("ashot-action-button");
+    zoom_out_button.set_size_request(SIDEBAR_ACTION_BUTTON_WIDTH, SIDEBAR_ACTION_BUTTON_HEIGHT);
+    let zoom_in_button = Button::with_label("+");
+    zoom_in_button.set_tooltip_text(Some("Zoom in (Ctrl++)"));
+    zoom_in_button.add_css_class("ashot-action-button");
+    zoom_in_button.set_size_request(SIDEBAR_ACTION_BUTTON_WIDTH, SIDEBAR_ACTION_BUTTON_HEIGHT);
+    zoom_percent_label.set_hexpand(true);
+    zoom_percent_label.add_css_class("ashot-zoom-label");
+    zoom_controls.append(&zoom_out_button);
+    zoom_controls.append(&zoom_percent_label);
+    zoom_controls.append(&zoom_in_button);
+    left_panel.append(&zoom_controls);
+
+    let zoom_actions = GtkBox::new(Orientation::Horizontal, 6);
+    let zoom_reset_button = Button::with_label("100%");
+    zoom_reset_button.set_tooltip_text(Some("Actual size (Ctrl+0)"));
+    zoom_reset_button.add_css_class("ashot-action-button");
+    zoom_reset_button.set_hexpand(true);
+    let zoom_fit_button = Button::with_label("Fit");
+    zoom_fit_button.set_tooltip_text(Some("Fit to window"));
+    zoom_fit_button.add_css_class("ashot-action-button");
+    zoom_fit_button.set_hexpand(true);
+    zoom_actions.append(&zoom_reset_button);
+    zoom_actions.append(&zoom_fit_button);
+    left_panel.append(&zoom_actions);
+
+    {
+        let apply_zoom = apply_zoom.clone();
+        let image_scale = image_scale.clone();
+        let scrolled = scrolled.clone();
+        zoom_in_button.connect_clicked(move |_| {
+            let (cx, cy) = editor_viewport_center(&scrolled);
+            apply_zoom(image_scale.get() * 1.25, cx, cy);
+        });
+    }
+    {
+        let apply_zoom = apply_zoom.clone();
+        let image_scale = image_scale.clone();
+        let scrolled = scrolled.clone();
+        zoom_out_button.connect_clicked(move |_| {
+            let (cx, cy) = editor_viewport_center(&scrolled);
+            apply_zoom(image_scale.get() * 0.8, cx, cy);
+        });
+    }
+    {
+        let apply_zoom = apply_zoom.clone();
+        let scrolled = scrolled.clone();
+        zoom_reset_button.connect_clicked(move |_| {
+            let (cx, cy) = editor_viewport_center(&scrolled);
+            apply_zoom(1.0, cx, cy);
+        });
+    }
+    {
+        let apply_zoom = apply_zoom.clone();
+        let scrolled = scrolled.clone();
+        let image_width = base_image.width();
+        let image_height = base_image.height();
+        zoom_fit_button.connect_clicked(move |_| {
+            let hadjustment = scrolled.hadjustment();
+            let vadjustment = scrolled.vadjustment();
+            let viewport_width = hadjustment.page_size().max(1.0) as i32;
+            let viewport_height = vadjustment.page_size().max(1.0) as i32;
+            let fit =
+                editor_initial_scale(image_width, image_height, viewport_width, viewport_height);
+            let (cx, cy) = editor_viewport_center(&scrolled);
+            apply_zoom(fit, cx, cy);
+        });
+    }
 
     left_panel.append(&section_title("OCR"));
     let ocr_tool_button = Button::new();
@@ -2037,19 +2276,37 @@ fn present_editor(
     let active_magnifier_zoom_for_draw = active_magnifier_zoom.clone();
     let base_rgba_for_magnifier = base_rgba.clone();
     let base_surface_for_draw = base_surface.clone();
+    let hiq_cache_for_draw = hiq_cache.clone();
     let image_width_for_draw = base_image.width();
     let image_height_for_draw = base_image.height();
-    canvas.set_draw_func(move |_, cr, draw_width, draw_height| {
+    canvas.set_draw_func(move |area, cr, draw_width, draw_height| {
         let scale = scale_for_draw.get();
+        let scale_factor = area.scale_factor();
         let (display_width, display_height) =
             editor_view_size(image_width_for_draw, image_height_for_draw, scale);
 
         let _ = cr.save();
         cr.rectangle(0.0, 0.0, display_width as f64, display_height as f64);
         cr.clip();
-        cr.scale(scale, scale);
-        if set_editor_image_source(cr, base_surface_for_draw.as_ref()).is_ok() {
-            let _ = cr.paint();
+        let painted_hiq = hiq_cache_for_draw
+            .try_borrow()
+            .ok()
+            .and_then(|cache| cache.matches(scale, scale_factor).then(|| cache.surface.clone()))
+            .flatten()
+            .map(|surface| {
+                // The cached bitmap already carries the target device resolution,
+                // so paint it 1:1; its device scale maps it to the same logical
+                // size the fast path would have produced.
+                let _ = cr.set_source_surface(&surface, 0.0, 0.0);
+                cr.source().set_filter(gtk::cairo::Filter::Nearest);
+                let _ = cr.paint();
+            })
+            .is_some();
+        if !painted_hiq {
+            cr.scale(scale, scale);
+            if set_editor_image_source(cr, base_surface_for_draw.as_ref(), scale).is_ok() {
+                let _ = cr.paint();
+            }
         }
         let _ = cr.restore();
 
@@ -2554,23 +2811,124 @@ fn present_editor(
         }
     });
 
+    // Shared tool switch used by both the sidebar buttons and the 1-9 shortcuts.
+    let select_tool: Rc<dyn Fn(DefaultTool)> = {
+        let document = document.clone();
+        let tool_buttons = tool_buttons.clone();
+        let canvas = canvas.clone();
+        let state = state.clone();
+        let refresh_status = refresh_status.clone();
+        Rc::new(move |tool: DefaultTool| {
+            if let Ok(mut document) = document.try_borrow_mut() {
+                document.active_tool = tool;
+            }
+            update_tool_button_selection(&tool_buttons, tool);
+            apply_editor_cursor(&canvas, tool);
+            persist_config_change(&state, |config| {
+                config.default_tool = tool;
+            });
+            refresh_status(None);
+        })
+    };
+
     let key_controller = gtk::EventControllerKey::new();
     let doc_for_keys = document.clone();
     let history_for_keys = history.clone();
     let canvas_for_keys = canvas.clone();
     let undo_for_keys = undo.clone();
     let redo_for_keys = redo.clone();
+    let copy_for_keys = copy.clone();
+    let save_for_keys = save.clone();
+    let save_to_for_keys = save_to.clone();
+    let select_tool_for_keys = select_tool.clone();
+    let apply_zoom_for_keys = apply_zoom.clone();
+    let image_scale_for_keys = image_scale.clone();
+    let scrolled_for_keys = scrolled.clone();
+    let window_for_keys = window.downgrade();
     let active_text_edit_for_keys = active_text_edit.clone();
     let queue_render_cache_for_keys = queue_render_cache.clone();
     key_controller.connect_key_pressed(move |_, key, _, modifiers| {
+        // While editing text, let every key reach the entry untouched.
         if active_text_edit_for_keys.try_borrow().is_ok_and(|edit| edit.is_some()) {
             return glib::Propagation::Proceed;
         }
 
         let ctrl = modifiers.contains(gtk::gdk::ModifierType::CONTROL_MASK);
         let shift = modifiers.contains(gtk::gdk::ModifierType::SHIFT_MASK);
-        let nudge = if shift { 10.0 } else { 1.0 };
+        let unicode = key.to_unicode();
 
+        // Editor-wide accelerators that do not go through the annotation/history
+        // path. These reuse the existing buttons so behaviour stays identical.
+        if ctrl {
+            match unicode {
+                Some('z') | Some('Z') if !shift => {
+                    undo_for_keys.activate();
+                    return glib::Propagation::Stop;
+                }
+                Some('z') | Some('Z') | Some('y') | Some('Y') => {
+                    redo_for_keys.activate();
+                    return glib::Propagation::Stop;
+                }
+                Some('c') | Some('C') => {
+                    copy_for_keys.activate();
+                    return glib::Propagation::Stop;
+                }
+                Some('s') | Some('S') if shift => {
+                    save_to_for_keys.activate();
+                    return glib::Propagation::Stop;
+                }
+                Some('s') | Some('S') => {
+                    save_for_keys.activate();
+                    return glib::Propagation::Stop;
+                }
+                Some('+') | Some('=') => {
+                    let (cx, cy) = editor_viewport_center(&scrolled_for_keys);
+                    apply_zoom_for_keys(image_scale_for_keys.get() * 1.25, cx, cy);
+                    return glib::Propagation::Stop;
+                }
+                Some('-') | Some('_') => {
+                    let (cx, cy) = editor_viewport_center(&scrolled_for_keys);
+                    apply_zoom_for_keys(image_scale_for_keys.get() * 0.8, cx, cy);
+                    return glib::Propagation::Stop;
+                }
+                Some('0') => {
+                    let (cx, cy) = editor_viewport_center(&scrolled_for_keys);
+                    apply_zoom_for_keys(1.0, cx, cy);
+                    return glib::Propagation::Stop;
+                }
+                _ => {}
+            }
+        }
+
+        // Number keys 1-9 pick a tool (no modifiers).
+        if !ctrl
+            && !shift
+            && let Some(tool) = unicode.and_then(|c| c.to_digit(10)).and_then(tool_for_digit)
+        {
+            select_tool_for_keys(tool);
+            return glib::Propagation::Stop;
+        }
+
+        // Esc clears the current selection, or closes the editor when nothing is
+        // selected.
+        if key == gtk::gdk::Key::Escape {
+            let cleared = doc_for_keys
+                .try_borrow_mut()
+                .map(|mut document| {
+                    let had_selection = document.selected.is_some();
+                    document.selected = None;
+                    had_selection
+                })
+                .unwrap_or(false);
+            if cleared {
+                canvas_for_keys.queue_draw();
+            } else if let Some(window) = window_for_keys.upgrade() {
+                window.close();
+            }
+            return glib::Propagation::Stop;
+        }
+
+        let nudge = if shift { 10.0 } else { 1.0 };
         let changed = if let Ok(mut document) = doc_for_keys.try_borrow_mut() {
             let before = document.annotations.clone();
             let changed = match key {
@@ -3895,6 +4253,10 @@ fn install_editor_css() {
             font-size: 0.78em;
             font-weight: 700;
             letter-spacing: 0.03em;
+        }
+        .ashot-zoom-label {
+            font-feature-settings: "tnum";
+            font-weight: 600;
         }
         .ashot-action-button,
         .ashot-tool-button,
@@ -8305,8 +8667,8 @@ mod tests {
         suggested_save_filename_at, take_active_text_edit, tesseract_command_args,
         tesseract_command_invocation, text_controls_width, text_font_button_width,
         text_for_annotation, text_size_button_width, text_size_options, text_size_wheel_options,
-        tool_can_select_existing, tool_icon_label, tool_icon_stroke_width, tool_picks_canvas_color,
-        update_ocr_language_selection,
+        tool_can_select_existing, tool_for_digit, tool_icon_label, tool_icon_stroke_width,
+        tool_picks_canvas_color, update_ocr_language_selection,
     };
 
     use chrono::{Local, TimeZone};
@@ -8449,14 +8811,31 @@ mod tests {
     }
 
     #[test]
-    fn editor_image_source_uses_nearest_filter_for_crisp_pixels() {
+    fn tool_digits_map_to_sidebar_order() {
+        let layout = editor_tool_layout();
+        assert_eq!(tool_for_digit(1), Some(layout[0].1));
+        assert_eq!(tool_for_digit(9), Some(layout[8].1));
+        assert_eq!(tool_for_digit(0), None);
+        assert_eq!(tool_for_digit(10), None);
+    }
+
+    #[test]
+    fn editor_image_source_filter_follows_zoom_direction() {
         let target = gtk4::cairo::ImageSurface::create(gtk4::cairo::Format::ARgb32, 4, 4).unwrap();
         let source = gtk4::cairo::ImageSurface::create(gtk4::cairo::Format::ARgb32, 2, 2).unwrap();
         let cr = gtk4::cairo::Context::new(&target).unwrap();
 
-        set_editor_image_source(&cr, &source).unwrap();
-
+        // Magnifying keeps pixels crisp with nearest-neighbour.
+        set_editor_image_source(&cr, &source, 2.0).unwrap();
         assert_eq!(cr.source().filter(), gtk4::cairo::Filter::Nearest);
+
+        // 1:1 also stays nearest (no resampling needed).
+        set_editor_image_source(&cr, &source, 1.0).unwrap();
+        assert_eq!(cr.source().filter(), gtk4::cairo::Filter::Nearest);
+
+        // Minifying smooths to avoid aliasing.
+        set_editor_image_source(&cr, &source, 0.5).unwrap();
+        assert_eq!(cr.source().filter(), gtk4::cairo::Filter::Good);
     }
 
     #[test]
