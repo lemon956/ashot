@@ -1,6 +1,11 @@
 /target
 /build-flatpak
+/build-packages
+/repo
 /.flatpak-builder
 /.superpowers
 /flatpak/vendor
 /flatpak/cargo-config.toml
+
+# Packaging artifacts (produced by CI / local build scripts, not source)
+*.flatpak

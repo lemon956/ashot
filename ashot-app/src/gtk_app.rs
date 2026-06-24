@@ -1645,6 +1645,8 @@ fn present_editor(
     let draft = Rc::new(RefCell::new(None::<DraftAnnotation>));
     let moving = Rc::new(RefCell::new(None::<Point>));
     let resizing = Rc::new(RefCell::new(None::<ResizeHandle>));
+    // Select-tool drag on empty canvas pans the view (hand tool).
+    let panning = Rc::new(Cell::new(false));
     let brush_cursor_preview = Rc::new(Cell::new(None::<Point>));
     let active_text_edit = Rc::new(RefCell::new(None::<ActiveTextEdit>));
     let active_color = Rc::new(Cell::new(config.default_color));
@@ -2481,8 +2483,15 @@ fn present_editor(
     let doc_for_motion = document.clone();
     let canvas_for_motion = canvas.clone();
     let scale_for_motion = image_scale.clone();
+    let scrolled_for_motion = scrolled.clone();
+    let panning_for_motion = panning.clone();
     let brush_cursor_for_motion = brush_cursor_preview.clone();
     motion.connect_motion(move |_, x, y| {
+        // Keep the grabbing cursor while a pan is in progress.
+        if panning_for_motion.get() {
+            canvas_for_motion.set_cursor_from_name(Some("grabbing"));
+            return;
+        }
         let point = scaled_canvas_point(x, y, scale_for_motion.get());
         brush_cursor_for_motion.set(Some(point));
         if let Ok(document) = doc_for_motion.try_borrow() {
@@ -2491,6 +2500,7 @@ fn present_editor(
                 &document,
                 point,
                 SELECTION_HANDLE_HIT_TOLERANCE / (scale_for_motion.get().max(0.1) as f32),
+                editor_view_is_pannable(&scrolled_for_motion),
             );
         }
         canvas_for_motion.queue_draw();
@@ -2564,6 +2574,7 @@ fn present_editor(
     let draft_for_drag = draft.clone();
     let moving_for_drag = moving.clone();
     let resizing_for_drag = resizing.clone();
+    let panning_for_drag = panning.clone();
     let history_for_drag = history.clone();
     let color_for_drag = active_color.clone();
     let color_ui_refresh_for_drag = color_ui_refresh.clone();
@@ -2630,6 +2641,10 @@ fn present_editor(
                 if let Ok(mut moving) = moving_for_drag.try_borrow_mut() {
                     *moving = Some(point);
                 }
+            } else {
+                // Empty canvas with the Select tool: drag pans the view.
+                panning_for_drag.set(true);
+                canvas_for_drag.set_cursor_from_name(Some("grabbing"));
             }
             canvas_for_drag.queue_draw();
             return;
@@ -2654,9 +2669,21 @@ fn present_editor(
     let draft_for_update = draft.clone();
     let moving_for_update = moving.clone();
     let resizing_for_update = resizing.clone();
+    let panning_for_update = panning.clone();
+    let scrolled_for_update = scrolled.clone();
     let canvas_for_update = canvas.clone();
     let scale_for_update = image_scale.clone();
     drag.connect_drag_update(move |gesture, dx, dy| {
+        if panning_for_update.get() {
+            // Pan the viewport. Reading the live adjustment value each update makes
+            // this self-correcting: the canvas scrolls under the pointer, so the
+            // gesture offset stays incremental. set_value clamps to bounds.
+            let hadjustment = scrolled_for_update.hadjustment();
+            let vadjustment = scrolled_for_update.vadjustment();
+            hadjustment.set_value(hadjustment.value() - dx);
+            vadjustment.set_value(vadjustment.value() - dy);
+            return;
+        }
         let (start_x, start_y) = gesture.start_point().unwrap_or((0.0, 0.0));
         let current = scaled_canvas_point(start_x + dx, start_y + dy, scale_for_update.get());
         let resize_handle = resizing_for_update.try_borrow().ok().and_then(|handle| *handle);
@@ -2695,6 +2722,7 @@ fn present_editor(
     let draft_for_end = draft.clone();
     let moving_for_end = moving.clone();
     let resizing_for_end = resizing.clone();
+    let panning_for_end = panning.clone();
     let canvas_for_end = canvas.clone();
     let state_for_ocr = state.clone();
     let runtime_for_ocr = runtime.clone();
@@ -2707,6 +2735,13 @@ fn present_editor(
     let recent_for_end = recent_color_recorder.clone();
     let queue_render_cache_for_end = queue_render_cache.clone();
     drag.connect_drag_end(move |_, _, _| {
+        if panning_for_end.get() {
+            panning_for_end.set(false);
+            // Hand the cursor back; the next motion event refines it (grab/move).
+            apply_editor_cursor(&canvas_for_end, DefaultTool::Select);
+            canvas_for_end.queue_draw();
+            return;
+        }
         let was_moving = moving_for_end.try_borrow().ok().and_then(|moving| *moving).is_some();
         let was_resizing =
             resizing_for_end.try_borrow().ok().and_then(|resizing| *resizing).is_some();
@@ -4662,55 +4697,61 @@ fn draw_tool_icon(
 
     match tool {
         DefaultTool::Select => {
-            cr.move_to(7.0, 4.0);
-            cr.line_to(18.0, 12.0);
-            cr.line_to(13.2, 13.1);
-            cr.line_to(16.0, 20.0);
-            cr.line_to(13.2, 21.0);
-            cr.line_to(10.5, 14.2);
-            cr.line_to(6.5, 17.1);
+            // Classic pointer/cursor arrow.
+            cr.move_to(5.5, 3.5);
+            cr.line_to(5.5, 17.8);
+            cr.line_to(9.3, 14.2);
+            cr.line_to(11.8, 20.1);
+            cr.line_to(13.9, 19.2);
+            cr.line_to(11.4, 13.5);
+            cr.line_to(16.6, 13.2);
             cr.close_path();
             let _ = cr.stroke();
         }
         DefaultTool::Brush => {
-            cr.move_to(5.2, 18.7);
-            cr.line_to(6.9, 14.0);
-            cr.line_to(16.6, 4.2);
-            cr.line_to(20.0, 7.6);
-            cr.line_to(10.2, 17.2);
+            // Pencil from lower-left graphite tip to upper-right end.
+            cr.move_to(4.8, 19.2);
+            cr.line_to(6.6, 13.8);
+            cr.line_to(15.4, 5.0);
+            cr.line_to(19.0, 8.6);
+            cr.line_to(10.2, 17.4);
             cr.close_path();
             let _ = cr.stroke();
-            cr.move_to(7.0, 14.0);
-            cr.line_to(10.1, 17.1);
-            cr.move_to(16.0, 4.9);
-            cr.line_to(19.3, 8.2);
-            cr.move_to(4.5, 19.4);
-            cr.curve_to(6.4, 20.6, 8.8, 20.1, 10.5, 18.4);
+            cr.move_to(6.6, 13.8);
+            cr.line_to(10.2, 17.4);
+            cr.move_to(13.7, 6.7);
+            cr.line_to(17.3, 10.3);
             let _ = cr.stroke();
         }
         DefaultTool::Line => {
             cr.move_to(6.0, 18.0);
             cr.line_to(18.0, 6.0);
             let _ = cr.stroke();
+            cr.arc(6.0, 18.0, 1.4, 0.0, std::f64::consts::TAU);
+            let _ = cr.fill();
+            cr.arc(18.0, 6.0, 1.4, 0.0, std::f64::consts::TAU);
+            let _ = cr.fill();
         }
         DefaultTool::Arrow => {
-            cr.move_to(5.5, 18.0);
-            cr.line_to(18.0, 5.5);
-            cr.move_to(18.0, 5.5);
-            cr.line_to(17.0, 11.0);
-            cr.move_to(18.0, 5.5);
-            cr.line_to(12.5, 6.5);
+            cr.move_to(5.5, 18.5);
+            cr.line_to(17.4, 6.6);
+            let _ = cr.stroke();
+            // Symmetric arrowhead pointing to the top-right corner.
+            cr.move_to(18.2, 5.8);
+            cr.line_to(11.8, 6.9);
+            cr.move_to(18.2, 5.8);
+            cr.line_to(17.1, 12.2);
             let _ = cr.stroke();
         }
         DefaultTool::Rectangle => {
-            draw_round_rect(cr, 5.0, 6.0, 14.0, 12.0, 2.0);
+            draw_round_rect(cr, 4.5, 6.5, 15.0, 11.0, 2.4);
             let _ = cr.stroke();
         }
         DefaultTool::Ellipse => {
             let _ = cr.save();
             cr.translate(12.0, 12.0);
-            cr.scale(1.25, 0.86);
-            cr.arc(0.0, 0.0, 6.0, 0.0, std::f64::consts::TAU);
+            cr.scale(1.22, 0.9);
+            cr.arc(0.0, 0.0, 6.2, 0.0, std::f64::consts::TAU);
             let _ = cr.restore();
             let _ = cr.stroke();
         }
@@ -4720,39 +4761,30 @@ fn draw_tool_icon(
             let icon_b = color.blue() as f64;
             let icon_a = color.alpha() as f64;
 
-            cr.set_source_rgba(icon_r, icon_g, icon_b, icon_a * 0.18);
-            cr.move_to(8.0, 8.6);
-            cr.line_to(4.6, 18.2);
-            cr.line_to(19.8, 18.2);
-            cr.close_path();
+            // Faint highlight swash the pen has laid down along the bottom.
+            cr.set_source_rgba(icon_r, icon_g, icon_b, icon_a * 0.28);
+            draw_round_rect(cr, 4.2, 16.6, 15.6, 3.4, 1.4);
             let _ = cr.fill();
-
             cr.set_source_rgba(icon_r, icon_g, icon_b, icon_a);
-            cr.move_to(8.0, 8.6);
-            cr.line_to(4.6, 18.2);
-            cr.move_to(8.0, 8.6);
-            cr.line_to(19.8, 18.2);
-            let _ = cr.stroke();
 
-            cr.set_source_rgba(icon_r, icon_g, icon_b, icon_a * 0.36);
-            draw_round_rect(cr, 4.4, 16.5, 15.8, 4.0, 1.8);
-            let _ = cr.fill();
-
-            cr.set_source_rgba(icon_r, icon_g, icon_b, icon_a);
+            // Highlighter pen, tilted, nib resting on the swash.
             let _ = cr.save();
-            cr.translate(7.6, 6.7);
-            cr.rotate(-0.48);
-            draw_round_rect(cr, -3.5, -2.4, 7.0, 4.8, 2.1);
+            cr.translate(13.2, 9.4);
+            cr.rotate(0.62);
+            draw_round_rect(cr, -3.1, -6.0, 6.2, 8.0, 1.8);
             let _ = cr.stroke();
-            cr.arc(1.4, 0.0, 1.3, 0.0, std::f64::consts::TAU);
+            // collar between barrel and nib
+            cr.move_to(-3.1, 0.6);
+            cr.line_to(3.1, 0.6);
+            let _ = cr.stroke();
+            // chisel nib
+            cr.move_to(-2.2, 2.0);
+            cr.line_to(2.2, 2.0);
+            cr.line_to(1.2, 4.6);
+            cr.line_to(-1.2, 4.6);
+            cr.close_path();
             let _ = cr.stroke();
             let _ = cr.restore();
-
-            cr.arc(12.1, 15.0, 1.5, 0.0, std::f64::consts::TAU);
-            let _ = cr.stroke();
-            cr.move_to(5.0, 21.0);
-            cr.line_to(19.4, 21.0);
-            let _ = cr.stroke();
         }
         DefaultTool::Text => {
             cr.move_to(6.0, 6.0);
@@ -4774,38 +4806,38 @@ fn draw_tool_icon(
             let _ = cr.stroke();
         }
         DefaultTool::Mosaic => {
-            let cells = [
-                (5.4, 5.4, 4.0),
-                (10.1, 5.4, 3.2),
-                (14.1, 5.4, 4.5),
-                (5.4, 10.1, 3.4),
-                (9.4, 9.5, 5.1),
-                (15.0, 10.2, 3.6),
-                (5.4, 14.2, 4.7),
-                (10.6, 15.0, 3.5),
-                (14.8, 14.4, 4.2),
-            ];
-            draw_round_rect(cr, 4.6, 4.6, 15.0, 15.0, 2.0);
+            // Pixelation: a checkerboard of solid cells inside a frame.
+            draw_round_rect(cr, 4.5, 4.5, 15.0, 15.0, 2.0);
             let _ = cr.stroke();
-            for (x, y, side) in cells {
-                draw_round_rect(cr, x, y, side, side, 0.8);
+            let cell = 4.7;
+            let origin = 5.0;
+            for row in 0..3 {
+                for col in 0..3 {
+                    if (row + col) % 2 == 0 {
+                        cr.rectangle(
+                            origin + col as f64 * cell,
+                            origin + row as f64 * cell,
+                            cell,
+                            cell,
+                        );
+                    }
+                }
             }
             let _ = cr.fill();
         }
         DefaultTool::Blur => {
-            draw_round_rect(cr, 5.5, 6.0, 13.0, 12.0, 2.4);
+            // Soft, wavy ripples inside a frame (distinct from the sharp mosaic).
+            draw_round_rect(cr, 4.8, 5.5, 14.4, 13.0, 2.6);
             let _ = cr.stroke();
-            for y in [8.0, 11.0, 14.0, 17.0] {
-                cr.move_to(4.6, y);
-                cr.curve_to(8.0, y - 1.5, 11.2, y + 1.5, 14.6, y);
-                cr.curve_to(16.8, y - 0.8, 18.2, y - 0.4, 20.0, y + 0.8);
+            for y in [9.0, 12.0, 15.0] {
+                cr.move_to(6.8, y);
+                cr.curve_to(8.8, y - 1.7, 10.8, y + 1.7, 12.8, y);
+                cr.curve_to(14.2, y - 1.2, 15.6, y - 0.6, 17.2, y + 0.6);
             }
-            cr.move_to(7.0, 5.0);
-            cr.line_to(17.0, 19.0);
             let _ = cr.stroke();
         }
         DefaultTool::FilledBox => {
-            draw_round_rect(cr, 6.0, 7.0, 12.0, 10.0, 2.0);
+            draw_round_rect(cr, 5.0, 6.5, 14.0, 11.0, 2.4);
             let _ = cr.fill();
         }
         DefaultTool::Ocr => {
@@ -4848,7 +4880,7 @@ fn draw_tool_icon(
 }
 
 fn tool_icon_stroke_width() -> f64 {
-    1.55
+    1.8
 }
 
 fn ocr_language_menu(
@@ -6946,6 +6978,7 @@ fn apply_canvas_hover_cursor(
     document: &Document,
     point: Point,
     tolerance: f32,
+    pannable: bool,
 ) {
     if document.active_tool != DefaultTool::Select {
         apply_editor_cursor(canvas, document.active_tool);
@@ -6957,9 +6990,23 @@ fn apply_canvas_hover_cursor(
     }
     if selected_annotation_bounds(document).is_some_and(|bounds| bounds.contains(point)) {
         canvas.set_cursor_from_name(Some("move"));
+    } else if pannable {
+        // Over empty canvas with content larger than the viewport: hint that
+        // dragging will pan the view.
+        canvas.set_cursor_from_name(Some("grab"));
     } else {
         canvas.set_cursor(None);
     }
+}
+
+/// True when the editor viewport can scroll in either axis (the screenshot is
+/// larger than the visible area, e.g. after zooming in), meaning a Select-tool
+/// drag on empty canvas would pan.
+fn editor_view_is_pannable(scrolled: &ScrolledWindow) -> bool {
+    let hadjustment = scrolled.hadjustment();
+    let vadjustment = scrolled.vadjustment();
+    hadjustment.upper() - hadjustment.page_size() > 1.0
+        || vadjustment.upper() - vadjustment.page_size() > 1.0
 }
 
 fn cursor_name_for_resize_handle(handle: ResizeHandle) -> &'static str {
@@ -8960,7 +9007,8 @@ mod tests {
         assert_eq!((SIDEBAR_TOOL_BUTTON_WIDTH, SIDEBAR_TOOL_BUTTON_HEIGHT), (42, 34));
         assert_eq!((SIDEBAR_ACTION_BUTTON_WIDTH, SIDEBAR_ACTION_BUTTON_HEIGHT), (40, 34));
         assert_eq!(TOOL_ICON_CANVAS_SIZE, 22);
-        assert!(tool_icon_stroke_width() < 1.7);
+        // Icons stay crisp but compact (slightly heavier after the redesign).
+        assert!((1.4..2.0).contains(&tool_icon_stroke_width()));
     }
 
     #[test]
