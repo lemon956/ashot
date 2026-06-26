@@ -1109,17 +1109,18 @@ fn pixelate_region(image: &mut RgbaImage, rect: Rect, pixel_size: u32) {
                     count += 1;
                 }
             }
-            if count > 0 {
-                let average = Rgba([
-                    (total[0] / count).min(u8::MAX as u32) as u8,
-                    (total[1] / count).min(u8::MAX as u32) as u8,
-                    (total[2] / count).min(u8::MAX as u32) as u8,
-                    (total[3] / count).min(u8::MAX as u32) as u8,
-                ]);
-                for yy in y..y_limit {
-                    for xx in x..x_limit {
-                        image.put_pixel(xx, yy, average);
-                    }
+            // The block always covers at least one pixel; `max(1)` keeps the
+            // division total without a manual zero-check.
+            let count = count.max(1);
+            let average = Rgba([
+                (total[0] / count).min(u8::MAX as u32) as u8,
+                (total[1] / count).min(u8::MAX as u32) as u8,
+                (total[2] / count).min(u8::MAX as u32) as u8,
+                (total[3] / count).min(u8::MAX as u32) as u8,
+            ]);
+            for yy in y..y_limit {
+                for xx in x..x_limit {
+                    image.put_pixel(xx, yy, average);
                 }
             }
             y += block;

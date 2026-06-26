@@ -10,6 +10,12 @@ updates:
         update-types:
           - minor
           - patch
+    ignore:
+      # Major bumps are pinned to the GTK4/GLib stack and other system-coupled
+      # crates; they break the build when bumped in isolation, so they must be
+      # done deliberately rather than via automatic PRs.
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
 
   - package-ecosystem: github-actions
     directory: "/"

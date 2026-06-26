@@ -28,8 +28,12 @@ jobs:
             libssl-dev
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+        # Pin the toolchain so the `-D warnings` clippy/fmt gate is deterministic:
+        # a newer stable clippy must be adopted on purpose (bump this version),
+        # instead of silently breaking CI on every Rust release.
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: "1.96.0"
           components: clippy, rustfmt
 
       - name: Cache cargo registry
