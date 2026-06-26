@@ -31,7 +31,7 @@ clap = { version = "4.5.50", features = ["derive"] }
 directories = "6.0.0"
 font8x8 = "0.3.1"
 gio = "0.20.12"
-glib = "0.20.12"
+glib = "0.22.7"
 gtk4 = "0.9.7"
 image = { version = "0.25.8", default-features = false, features = ["jpeg", "png", "webp"] }
 libadwaita = "0.7.2"
