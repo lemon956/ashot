@@ -134,8 +134,18 @@ mkdir -p %{buildroot}
 cp -a ${payload_root}/usr %{buildroot}/
 
 %files
-/usr
 EOF
+  # Own only this package's own files (and its private leaf directories). Listing
+  # shared system directories such as /usr or /usr/bin makes the package claim
+  # ownership of them, which conflicts with the `filesystem` package at install
+  # time ("file /usr/bin ... conflicts with file from package filesystem").
+  ( cd "${payload_root}" && find usr \( -type f -o -type l \) -printf '/%p\n' ) \
+    >>"${spec_path}"
+  if [ -d "${payload_root}/usr/share/gnome-shell/extensions/${EXT_UUID}" ]; then
+    ( cd "${payload_root}" \
+      && find "usr/share/gnome-shell/extensions/${EXT_UUID}" -type d -printf '%%dir /%p\n' ) \
+      >>"${spec_path}"
+  fi
 }
 
 build_rpm_package() {
