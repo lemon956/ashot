@@ -7,7 +7,11 @@ use chrono::{DateTime, Local};
 use image::DynamicImage;
 use thiserror::Error;
 
-use crate::{Annotation, AppConfig, export::save_document_png, filename::render_filename};
+use crate::{
+    Annotation, AppConfig,
+    export::save_document_png,
+    filename::{deduplicated_path, render_filename},
+};
 
 #[derive(Debug, Error)]
 pub enum SaveWorkflowError {
@@ -55,7 +59,7 @@ pub fn save_with_config(
         SaveWorkflowError::CreateDir { path: config.default_save_dir.clone(), source }
     })?;
     let filename = render_filename(&config.filename_template, now);
-    let output = config.default_save_dir.join(filename);
+    let output = deduplicated_path(&config.default_save_dir.join(filename));
     save_document_png(base, annotations, &output)
         .map_err(|source| SaveWorkflowError::Save { path: output.clone(), source })?;
     Ok(output)

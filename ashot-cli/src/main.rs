@@ -258,10 +258,10 @@ fn outcome_to_exit_code(kind: OutcomeKind) -> ExitCode {
 }
 
 async fn ensure_service() -> Result<Connection> {
-    if let Ok(connection) = Connection::session().await {
-        if current_service_is_running(&connection).await? {
-            return Ok(connection);
-        }
+    if let Ok(connection) = Connection::session().await
+        && current_service_is_running(&connection).await?
+    {
+        return Ok(connection);
     }
 
     Command::new(resolve_app_binary()?)
@@ -271,10 +271,10 @@ async fn ensure_service() -> Result<Connection> {
 
     for _ in 0..40 {
         sleep(Duration::from_millis(250)).await;
-        if let Ok(connection) = Connection::session().await {
-            if current_service_is_running(&connection).await? {
-                return Ok(connection);
-            }
+        if let Ok(connection) = Connection::session().await
+            && current_service_is_running(&connection).await?
+        {
+            return Ok(connection);
         }
     }
 

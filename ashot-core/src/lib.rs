@@ -12,8 +12,11 @@ pub use document::{
     MARKER_MULTI_FIBER_MIN_WIDTH, MARKER_STROKE_MULTIPLIER, MarkerFiber, Point, Rect, ResizeHandle,
     TextStyle, TextWeight, marker_fiber_layout, marker_highlight_color, marker_visual_stroke_width,
 };
-pub use export::{draw_text_cairo, render_document, save_document_png};
-pub use filename::render_filename;
+pub use export::{
+    ExportFormat, default_export_format, default_jpeg_quality, draw_text_cairo, encode_image_bytes,
+    render_document, save_document_png, transcode_png_bytes,
+};
+pub use filename::{deduplicated_path, render_filename};
 pub use history::EditorHistory;
 pub use ocr::{
     LinuxDistroFamily, OcrBackend, OcrLanguage, OcrLanguagePackages, default_ocr_filter_symbols,

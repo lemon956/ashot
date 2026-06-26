@@ -4,8 +4,11 @@ use std::{
 };
 
 use ashot_core::{
-    Annotation,
-    export::{encode_png_bytes, render_document_from_rgba, update_rendered_image},
+    Annotation, deduplicated_path,
+    export::{
+        ExportFormat, encode_png_bytes, render_document_from_rgba, transcode_png_bytes,
+        update_rendered_image,
+    },
 };
 use image::RgbaImage;
 use tokio::runtime::Handle;
@@ -261,25 +264,38 @@ pub fn save_png_bytes_to_dir_with_filename(
     save_dir: &Path,
     png_bytes: &[u8],
     requested_filename: &str,
+    jpeg_quality: u8,
 ) -> std::result::Result<PathBuf, String> {
-    let filename = normalized_png_filename(requested_filename)
+    let filename = normalized_image_filename(requested_filename)
         .ok_or_else(|| "Enter a file name".to_string())?;
+    let format = Path::new(&filename)
+        .extension()
+        .and_then(|extension| ExportFormat::from_extension(&extension.to_string_lossy()))
+        .unwrap_or(ExportFormat::Png);
+    // The render cache hands us PNG bytes; re-encode them to the chosen format
+    // only when the user asked for something other than PNG.
+    let bytes = transcode_png_bytes(png_bytes, format, jpeg_quality)
+        .map_err(|source| format!("failed to encode {} image: {source}", format.extension()))?;
     std::fs::create_dir_all(save_dir).map_err(|source| {
         format!("failed to create screenshot directory {}: {source}", save_dir.display())
     })?;
-    let output = save_dir.join(filename);
-    std::fs::write(&output, png_bytes)
+    let output = deduplicated_path(&save_dir.join(filename));
+    std::fs::write(&output, &bytes)
         .map_err(|source| format!("failed to save screenshot at {}: {source}", output.display()))?;
     Ok(output)
 }
 
-fn normalized_png_filename(input: &str) -> Option<String> {
+fn normalized_image_filename(input: &str) -> Option<String> {
     let trimmed = input.trim();
     if trimmed.is_empty() {
         return None;
     }
     let mut path = PathBuf::from(trimmed);
-    if path.extension().is_none_or(|extension| extension != "png" && extension != "PNG") {
+    let has_known_extension = path
+        .extension()
+        .and_then(|extension| ExportFormat::from_extension(&extension.to_string_lossy()))
+        .is_some();
+    if !has_known_extension {
         path.set_extension("png");
     }
     path.file_name().map(|name| name.to_string_lossy().to_string())
@@ -351,15 +367,60 @@ mod tests {
     }
 
     #[test]
-    fn save_png_bytes_to_dir_normalizes_filename() {
+    fn save_png_bytes_to_dir_defaults_unknown_extension_to_png() {
         let dir =
             std::env::temp_dir().join(format!("ashot-render-cache-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let output = save_png_bytes_to_dir_with_filename(&dir, b"fake png bytes", "example.jpg")
-            .expect("write bytes");
+        // An unknown extension falls back to PNG and the bytes pass through
+        // unchanged (no decode/re-encode for the PNG target).
+        let output =
+            save_png_bytes_to_dir_with_filename(&dir, b"fake png bytes", "example.txt", 90)
+                .expect("write bytes");
 
         assert_eq!(output, dir.join(Path::new("example.png")));
         assert_eq!(std::fs::read(output).expect("read output"), b"fake png bytes");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn save_png_bytes_to_dir_transcodes_for_jpg_filename() {
+        use ashot_core::export::encode_png_bytes;
+        use image::{DynamicImage, Rgba};
+
+        let mut canvas = DynamicImage::new_rgba8(4, 4).to_rgba8();
+        for pixel in canvas.pixels_mut() {
+            *pixel = Rgba([12, 34, 56, 255]);
+        }
+        let png = encode_png_bytes(&canvas).expect("png bytes");
+
+        let dir = std::env::temp_dir()
+            .join(format!("ashot-render-cache-jpeg-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let output =
+            save_png_bytes_to_dir_with_filename(&dir, &png, "shot.jpg", 80).expect("write bytes");
+
+        assert_eq!(output, dir.join(Path::new("shot.jpg")));
+        let bytes = std::fs::read(&output).expect("read output");
+        assert_eq!(&bytes[0..3], &[0xFF, 0xD8, 0xFF]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn save_png_bytes_to_dir_dedupes_existing_file() {
+        let dir = std::env::temp_dir()
+            .join(format!("ashot-render-cache-dedup-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let first =
+            save_png_bytes_to_dir_with_filename(&dir, b"first", "Shot.txt", 90).expect("first");
+        assert_eq!(first, dir.join(Path::new("Shot.png")));
+
+        let second =
+            save_png_bytes_to_dir_with_filename(&dir, b"second", "Shot.txt", 90).expect("second");
+        assert_eq!(second, dir.join(Path::new("Shot (1).png")));
+        assert_eq!(std::fs::read(first).expect("read first"), b"first");
+        assert_eq!(std::fs::read(second).expect("read second"), b"second");
+
         let _ = std::fs::remove_dir_all(dir);
     }
 }

@@ -9,6 +9,7 @@ use thiserror::Error;
 
 use crate::{
     document::{Color, DefaultTool},
+    export::{ExportFormat, default_export_format, default_jpeg_quality},
     ocr::{
         OcrBackend, default_ocr_backend, default_ocr_filter_symbols, default_ocr_languages,
         default_ocr_space_engine,
@@ -99,6 +100,10 @@ pub struct AppConfig {
     pub ocr_space_engine: u8,
     #[serde(default = "default_ocr_filter_symbols")]
     pub ocr_filter_symbols: bool,
+    #[serde(default = "default_export_format")]
+    pub default_export_format: ExportFormat,
+    #[serde(default = "default_jpeg_quality")]
+    pub jpeg_quality: u8,
 }
 
 impl Default for AppConfig {
@@ -126,6 +131,8 @@ impl Default for AppConfig {
             ocr_space_api_key: String::new(),
             ocr_space_engine: default_ocr_space_engine(),
             ocr_filter_symbols: default_ocr_filter_symbols(),
+            default_export_format: default_export_format(),
+            jpeg_quality: default_jpeg_quality(),
         }
     }
 }

@@ -16,10 +16,11 @@ use anyhow::{Context, Result};
 use ashot_capture::{CaptureClient, CaptureError};
 use ashot_core::{
     Annotation, AnnotationData, AppConfig, AppearanceMode, Color, DefaultTool, Document,
-    EditorHistory, LinuxDistroFamily, OcrBackend, Point, Rect, ResizeHandle, TextStyle, TextWeight,
-    default_ocr_languages, detect_linux_distro_family, finalize_capture_with_config,
-    language_install_command, language_package_for_distro, marker_fiber_layout,
-    marker_highlight_color, marker_visual_stroke_width, render_filename, search_ocr_languages,
+    EditorHistory, ExportFormat, LinuxDistroFamily, OcrBackend, Point, Rect, ResizeHandle,
+    TextStyle, TextWeight, default_ocr_languages, detect_linux_distro_family,
+    finalize_capture_with_config, language_install_command, language_package_for_distro,
+    marker_fiber_layout, marker_highlight_color, marker_visual_stroke_width, render_filename,
+    search_ocr_languages,
 };
 use ashot_ipc::{
     APP_ID, CaptureMode, CaptureOutcome, CommandOutcome, DBUS_NAME, DBUS_PATH, OutcomeKind,
@@ -36,7 +37,7 @@ use gtk::prelude::{
     WidgetExt,
 };
 use gtk::{
-    Adjustment, Align, Box as GtkBox, Button, DrawingArea, Entry, Grid, HeaderBar, Label,
+    Adjustment, Align, Box as GtkBox, Button, DrawingArea, DropDown, Entry, Grid, HeaderBar, Label,
     MenuButton, Orientation, Overlay, Picture, PolicyType, Popover, Scale, ScrolledWindow,
     SpinButton,
 };
@@ -367,10 +368,10 @@ impl ServiceState {
         match result {
             Ok(uri) => {
                 let config = self.config_snapshot();
-                if mode == CaptureMode::Area || config.post_capture_open_editor {
-                    if let Ok(path) = uri.to_file_path() {
-                        let _ = self.ui_tx.send(UiCommand::OpenEditor(path));
-                    }
+                if (mode == CaptureMode::Area || config.post_capture_open_editor)
+                    && let Ok(path) = uri.to_file_path()
+                {
+                    let _ = self.ui_tx.send(UiCommand::OpenEditor(path));
                 }
                 CaptureOutcome::ok(uri, capture_message(mode))
             }
@@ -809,7 +810,7 @@ fn fit_scale(
     let image_height = image_height.max(1) as f64;
     let viewport_width = viewport_width.max(1) as f64;
     let viewport_height = viewport_height.max(1) as f64;
-    (viewport_width / image_width).min(viewport_height / image_height).min(1.0).max(0.05)
+    (viewport_width / image_width).min(viewport_height / image_height).clamp(0.05, 1.0)
 }
 
 fn scaled_image_size(image_width: u32, image_height: u32, scale: f64) -> (i32, i32) {
@@ -2396,6 +2397,8 @@ fn present_editor(
         if tool_picks_canvas_color(active_tool) {
             let color = image_color_at(&image_for_click, point);
             color_for_click.set(color);
+            // Picking a color also copies its hex so it can be pasted directly.
+            copy_text_to_clipboard(&color_to_hex(color));
             if let Some(refresh) = color_ui_refresh_for_click.borrow().as_ref().cloned() {
                 refresh(color);
             }
@@ -2469,10 +2472,8 @@ fn present_editor(
                 .and_then(|mut document| document.select_at(point))
                 .is_some();
             canvas_for_click.queue_draw();
-            if selected {
-                if let Ok(mut draft) = draft_for_click.try_borrow_mut() {
-                    *draft = None;
-                }
+            if selected && let Ok(mut draft) = draft_for_click.try_borrow_mut() {
+                *draft = None;
             }
         }
     });
@@ -2603,7 +2604,13 @@ fn present_editor(
 
         if tool_picks_canvas_color(tool) {
             let color = image_color_at(&image_for_drag, point);
+            // Only refresh the clipboard when the sampled color actually changes
+            // during a drag, so we do not spam the clipboard on every motion.
+            let color_changed = color_for_drag.get() != color;
             color_for_drag.set(color);
+            if color_changed {
+                copy_text_to_clipboard(&color_to_hex(color));
+            }
             if let Some(refresh) = color_ui_refresh_for_drag.borrow().as_ref().cloned() {
                 refresh(color);
             }
@@ -3028,6 +3035,7 @@ fn present_editor(
                 refresh_status_for_confirm(Some("Saving...".to_string()));
                 let save_dir = config.default_save_dir.clone();
                 let auto_copy = config.auto_copy;
+                let jpeg_quality = config.jpeg_quality;
                 let runtime_for_write = runtime_for_confirm.clone();
                 let path_for_result = path_for_confirm.clone();
                 let refresh_status_for_result = refresh_status_for_confirm.clone();
@@ -3041,6 +3049,7 @@ fn present_editor(
                             save_dir,
                             png_bytes,
                             requested_filename,
+                            jpeg_quality,
                             move |save_result| match save_result {
                                 Ok(output) => {
                                     if auto_copy
@@ -3117,6 +3126,7 @@ fn present_editor(
                 let save_dir = config.default_save_dir.clone();
                 let auto_copy = config.auto_copy;
                 let pin_after_save = config.pin_after_save;
+                let jpeg_quality = config.jpeg_quality;
                 let runtime_for_write = runtime_for_confirm.clone();
                 let state_for_result = state_for_confirm.clone();
                 let app_for_result = app_for_confirm.clone();
@@ -3132,6 +3142,7 @@ fn present_editor(
                             save_dir,
                             png_bytes,
                             requested_filename,
+                            jpeg_quality,
                             move |save_result| match save_result {
                                 Ok(output) => {
                                     if auto_copy
@@ -3247,6 +3258,7 @@ fn present_editor(
                     refresh_status_for_confirm(Some("Saving...".to_string()));
                     let auto_copy = config.auto_copy;
                     let save_dir = folder_path.clone();
+                    let jpeg_quality = config.jpeg_quality;
                     let runtime_for_write = runtime_for_confirm.clone();
                     let state_for_result = state_for_confirm.clone();
                     let path_for_result = path_for_confirm.clone();
@@ -3261,6 +3273,7 @@ fn present_editor(
                                 save_dir.clone(),
                                 png_bytes,
                                 requested_filename,
+                                jpeg_quality,
                                 move |save_result| match save_result {
                                     Ok(output) => {
                                         config.default_save_dir = save_dir.clone();
@@ -3408,6 +3421,7 @@ fn present_editor(
                     std::env::temp_dir(),
                     png_bytes,
                     temp_filename,
+                    ashot_core::default_jpeg_quality(),
                     move |save_result| {
                         match save_result {
                             Ok(output) => {
@@ -5425,7 +5439,7 @@ fn show_favorite_remove_popover(
     delete.connect_clicked(move |_| {
         let mut removed = false;
         if let Ok(mut favorites) = favorites.try_borrow_mut() {
-            removed = favorites.iter().any(|favorite| *favorite == color);
+            removed = favorites.contains(&color);
             remove_favorite_color(&mut favorites, color);
             update_color_memory_buttons(&favorites, &favorite_buttons);
             let persisted = favorites.clone();
@@ -5714,6 +5728,7 @@ fn draw_eyedropper_magnifier(
     let _ = cr.restore();
 }
 
+#[allow(clippy::too_many_arguments)]
 fn color_picker_section(
     active_color: Rc<Cell<Color>>,
     stroke_previews: Rc<RefCell<Vec<DrawingArea>>>,
@@ -6040,7 +6055,7 @@ fn color_picker_section(
             }
             if let Ok(favorites) = favorite_colors.try_borrow() {
                 update_color_memory_buttons(&favorites, &favorite_buttons);
-                if favorites.iter().any(|favorite| *favorite == color) {
+                if favorites.contains(&color) {
                     add_favorite.set_label("★");
                     add_favorite.add_css_class("suggested-action");
                 } else {
@@ -6074,6 +6089,7 @@ fn color_picker_section(
         })
     });
 
+    #[allow(clippy::type_complexity)]
     let apply_hsv_from_position: Rc<dyn Fn(&DrawingArea, f64, f64)> = {
         let hsv_state = hsv_state.clone();
         let alpha_state = alpha_state.clone();
@@ -6104,6 +6120,7 @@ fn color_picker_section(
     });
     hsv_area.add_controller(hsv_drag);
 
+    #[allow(clippy::type_complexity)]
     let apply_hue_from_position: Rc<dyn Fn(&DrawingArea, f64)> = {
         let refresh = refresh_ui.clone();
         let hsv_state = hsv_state.clone();
@@ -6129,6 +6146,7 @@ fn color_picker_section(
     });
     hue_bar.add_controller(hue_drag);
 
+    #[allow(clippy::type_complexity)]
     let apply_opacity_from_position: Rc<dyn Fn(&DrawingArea, f64)> = {
         let refresh = refresh_ui.clone();
         let hsv_state = hsv_state.clone();
@@ -6275,7 +6293,7 @@ fn color_picker_section(
         let mut should_refresh = false;
         let mut favorite_limit = None;
         if let Ok(mut favorites) = favorites_for_add.try_borrow_mut() {
-            if favorites.iter().any(|favorite| *favorite == color) {
+            if favorites.contains(&color) {
                 remove_favorite_color(&mut favorites, color);
                 update_color_memory_buttons(&favorites, &favorite_buttons_for_add);
                 let persisted = favorites.clone();
@@ -6798,6 +6816,7 @@ fn fixed_stroke_preview(width: u32, active_color: Rc<Cell<Color>>) -> DrawingAre
     area
 }
 
+#[allow(clippy::too_many_arguments)]
 fn stroke_width_dropdown(
     active_stroke: Rc<Cell<u32>>,
     active_color: Rc<Cell<Color>>,
@@ -7315,6 +7334,7 @@ fn take_active_text_edit(
     active_text_edit.try_borrow_mut().ok().and_then(|mut edit| edit.take())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn commit_text_entry(
     entry: &Entry,
     document: &Rc<RefCell<Document>>,
@@ -7997,15 +8017,27 @@ fn normalized_save_filename(input: &str) -> Option<String> {
     }
 
     let mut path = PathBuf::from(file_name);
-    if !path.extension().is_some_and(|extension| extension.eq_ignore_ascii_case("png")) {
+    let has_known_format = path
+        .extension()
+        .and_then(|extension| {
+            ashot_core::ExportFormat::from_extension(&extension.to_string_lossy())
+        })
+        .is_some();
+    if !has_known_format {
         path.set_extension("png");
     }
     path.file_name().map(|name| name.to_string_lossy().to_string())
 }
 
 fn suggested_save_filename_at(config: &AppConfig, now: chrono::DateTime<chrono::Local>) -> String {
-    normalized_save_filename(&render_filename(&config.filename_template, now))
-        .unwrap_or_else(|| "Screenshot.png".to_string())
+    let extension = config.default_export_format.extension();
+    let base = normalized_save_filename(&render_filename(&config.filename_template, now))
+        .unwrap_or_else(|| "Screenshot.png".to_string());
+    let mut path = PathBuf::from(base);
+    path.set_extension(extension);
+    path.file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| format!("Screenshot.{extension}"))
 }
 
 fn unique_temp_png_filename(prefix: &str) -> String {
@@ -8039,14 +8071,19 @@ fn save_png_bytes_to_dir_async<F>(
     save_dir: PathBuf,
     png_bytes: Arc<Vec<u8>>,
     requested_filename: String,
+    jpeg_quality: u8,
     on_done: F,
 ) where
     F: FnOnce(std::result::Result<PathBuf, String>) + 'static,
 {
     let (tx, rx) = std::sync::mpsc::channel();
     runtime.spawn_blocking(move || {
-        let result =
-            save_png_bytes_to_dir_with_filename(&save_dir, png_bytes.as_ref(), &requested_filename);
+        let result = save_png_bytes_to_dir_with_filename(
+            &save_dir,
+            png_bytes.as_ref(),
+            &requested_filename,
+            jpeg_quality,
+        );
         let _ = tx.send(result);
     });
 
@@ -8086,6 +8123,7 @@ fn crop_image_region(base: &image::DynamicImage, rect: Rect) -> Option<image::Dy
     Some(base.crop_imm(x, y, right - x, bottom - y))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn begin_ocr_request(
     parent: &ApplicationWindow,
     state: Arc<ServiceState>,
@@ -8365,6 +8403,13 @@ fn show_ocr_result_dialog(parent: &ApplicationWindow, result: Result<String, Str
         }
     });
 
+    if is_success {
+        // Recognized text is copied automatically so it is ready to paste; the
+        // copy buttons remain for selecting a subset or re-copying.
+        copy_text_to_clipboard(&text);
+        feedback.set_text("Copied to clipboard");
+    }
+
     window.set_child(Some(&root));
     window.present();
 }
@@ -8450,10 +8495,10 @@ fn normalize_ocr_languages(languages: Vec<String>) -> Vec<String> {
 }
 
 fn ocr_space_language_arg(languages: &[String]) -> String {
-    if languages.len() == 1 {
-        if let Some(language) = ashot_core::ocr_language_by_tesseract_code(&languages[0]) {
-            return language.ocr_space_code.to_string();
-        }
+    if languages.len() == 1
+        && let Some(language) = ashot_core::ocr_language_by_tesseract_code(&languages[0])
+    {
+        return language.ocr_space_code.to_string();
     }
     "auto".to_string()
 }
@@ -8569,6 +8614,30 @@ impl SaveFilenamePopoverHandle {
     }
 }
 
+fn export_format_dropdown_index(format: ExportFormat) -> u32 {
+    match format {
+        ExportFormat::Png => 0,
+        ExportFormat::Jpeg => 1,
+        ExportFormat::Webp => 2,
+    }
+}
+
+fn export_format_for_dropdown_index(index: u32) -> ExportFormat {
+    match index {
+        1 => ExportFormat::Jpeg,
+        2 => ExportFormat::Webp,
+        _ => ExportFormat::Png,
+    }
+}
+
+/// Replaces (or adds) the file-name extension to match `format`, keeping the
+/// user-entered stem. The save layer validates and normalizes the result.
+fn apply_export_extension(input: &str, format: ExportFormat) -> String {
+    let mut path = PathBuf::from(input.trim());
+    path.set_extension(format.extension());
+    path.to_string_lossy().to_string()
+}
+
 fn show_save_filename_popover<F>(
     anchor: &Button,
     initial_filename: String,
@@ -8591,11 +8660,28 @@ fn show_save_filename_popover<F>(
     title.set_xalign(0.0);
     root.append(&title);
 
+    let initial_format = Path::new(&initial_filename)
+        .extension()
+        .and_then(|extension| ExportFormat::from_extension(&extension.to_string_lossy()))
+        .unwrap_or(ExportFormat::Png);
+    let initial_stem = Path::new(&initial_filename)
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().to_string())
+        .unwrap_or_else(|| initial_filename.clone());
+
+    let name_row = GtkBox::new(Orientation::Horizontal, 6);
     let entry = Entry::new();
-    entry.set_width_chars(32);
-    entry.set_text(&initial_filename);
+    entry.set_width_chars(26);
+    entry.set_hexpand(true);
+    entry.set_text(&initial_stem);
     entry.set_activates_default(true);
-    root.append(&entry);
+    name_row.append(&entry);
+
+    let format_dropdown = DropDown::from_strings(&["PNG", "JPEG", "WebP"]);
+    format_dropdown.set_selected(export_format_dropdown_index(initial_format));
+    format_dropdown.set_tooltip_text(Some("Image format"));
+    name_row.append(&format_dropdown);
+    root.append(&name_row);
 
     let error = Label::new(None);
     error.add_css_class("error");
@@ -8627,10 +8713,12 @@ fn show_save_filename_popover<F>(
         let error = error.clone();
         let handle = handle.clone();
         let on_confirm = on_confirm.clone();
+        let format_dropdown = format_dropdown.clone();
         move || {
-            let filename = entry.text().to_string();
+            let format = export_format_for_dropdown_index(format_dropdown.selected());
+            let filename = apply_export_extension(&entry.text(), format);
             if normalized_save_filename(&filename).is_none() {
-                error.set_text("Enter a valid PNG file name");
+                error.set_text("Enter a valid file name");
                 entry.grab_focus();
                 return;
             }
@@ -8670,7 +8758,7 @@ mod tests {
 
     use ashot_core::{
         Annotation, AnnotationData, AppConfig, AppearanceMode, Color, DefaultTool, Document,
-        MARKER_HIGHLIGHT_ALPHA, Point, Rect, ResizeHandle,
+        ExportFormat, MARKER_HIGHLIGHT_ALPHA, Point, Rect, ResizeHandle,
     };
     use ashot_ipc::APP_ID;
 
@@ -8684,8 +8772,8 @@ mod tests {
         STROKE_PREVIEW_WIDTH, TOOL_ICON_CANVAS_SIZE, add_favorite_color,
         annotation_keeps_selection_after_creation, annotation_snapshot_for_draw,
         app_startup_behavior, appearance_color_scheme, appearance_mode_from_index,
-        appearance_mode_index, appearance_mode_labels, arrow_head_geometry, arrow_head_points,
-        arrow_shape_geometry, arrow_visual_stroke_width, blur_radius_for_stroke,
+        appearance_mode_index, appearance_mode_labels, apply_export_extension, arrow_head_geometry,
+        arrow_head_points, arrow_shape_geometry, arrow_visual_stroke_width, blur_radius_for_stroke,
         capture_should_use_fresh_anchor, clamp_magnifier_zoom, clamp_text_size, crop_image_region,
         cursor_name_for_resize_handle, cursor_name_for_surface_edge, draft_preview_for_draw,
         draft_tool_can_draw, editor_adjustment_value_after_scroll, editor_base_surface,
@@ -10102,12 +10190,37 @@ mod tests {
     }
 
     #[test]
-    fn normalized_save_filename_always_targets_png() {
+    fn normalized_save_filename_keeps_known_image_extensions() {
         assert_eq!(normalized_save_filename(" shot "), Some("shot.png".into()));
         assert_eq!(normalized_save_filename("shot.PNG"), Some("shot.PNG".into()));
-        assert_eq!(normalized_save_filename("shot.jpg"), Some("shot.png".into()));
+        // Known image extensions are preserved so the save layer can pick the
+        // matching encoder.
+        assert_eq!(normalized_save_filename("shot.jpg"), Some("shot.jpg".into()));
+        assert_eq!(normalized_save_filename("shot.jpeg"), Some("shot.jpeg".into()));
+        assert_eq!(normalized_save_filename("shot.webp"), Some("shot.webp".into()));
+        // Unknown extensions fall back to PNG.
+        assert_eq!(normalized_save_filename("shot.txt"), Some("shot.png".into()));
         assert_eq!(normalized_save_filename("/tmp/final-name"), Some("final-name.png".into()));
         assert_eq!(normalized_save_filename("   "), None);
+    }
+
+    #[test]
+    fn suggested_save_filename_uses_configured_format() {
+        let config = AppConfig {
+            filename_template: "Capture_%Y%m%d_%H%M%S".into(),
+            default_export_format: ExportFormat::Jpeg,
+            ..AppConfig::default()
+        };
+        let now = Local.with_ymd_and_hms(2026, 4, 27, 12, 34, 56).unwrap();
+
+        assert_eq!(suggested_save_filename_at(&config, now), "Capture_20260427_123456.jpg");
+    }
+
+    #[test]
+    fn apply_export_extension_swaps_extension() {
+        assert_eq!(apply_export_extension("shot", ExportFormat::Jpeg), "shot.jpg");
+        assert_eq!(apply_export_extension("shot.png", ExportFormat::Webp), "shot.webp");
+        assert_eq!(apply_export_extension("  shot.jpeg  ", ExportFormat::Png), "shot.png");
     }
 
     #[test]

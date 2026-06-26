@@ -69,6 +69,89 @@ pub fn encode_png_bytes(image: &RgbaImage) -> image::ImageResult<Vec<u8>> {
     Ok(cursor.into_inner())
 }
 
+/// Output image formats aShot can encode a finished screenshot to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ExportFormat {
+    Png,
+    Jpeg,
+    Webp,
+}
+
+impl ExportFormat {
+    /// The lowercase file extension (without a leading dot) for this format.
+    pub fn extension(self) -> &'static str {
+        match self {
+            ExportFormat::Png => "png",
+            ExportFormat::Jpeg => "jpg",
+            ExportFormat::Webp => "webp",
+        }
+    }
+
+    /// Maps a file extension (case-insensitive, without a dot) to a format.
+    pub fn from_extension(extension: &str) -> Option<Self> {
+        match extension.to_ascii_lowercase().as_str() {
+            "png" => Some(ExportFormat::Png),
+            "jpg" | "jpeg" => Some(ExportFormat::Jpeg),
+            "webp" => Some(ExportFormat::Webp),
+            _ => None,
+        }
+    }
+}
+
+pub fn default_export_format() -> ExportFormat {
+    ExportFormat::Png
+}
+
+pub fn default_jpeg_quality() -> u8 {
+    90
+}
+
+/// Encodes an already-rendered image into `format`. `quality` only affects JPEG
+/// (clamped to 1-100); PNG and lossless WebP ignore it.
+pub fn encode_image_bytes(
+    image: &RgbaImage,
+    format: ExportFormat,
+    quality: u8,
+) -> image::ImageResult<Vec<u8>> {
+    match format {
+        ExportFormat::Png => encode_png_bytes(image),
+        ExportFormat::Jpeg => encode_jpeg_bytes(image, quality),
+        ExportFormat::Webp => encode_webp_bytes(image),
+    }
+}
+
+pub fn encode_jpeg_bytes(image: &RgbaImage, quality: u8) -> image::ImageResult<Vec<u8>> {
+    // JPEG has no alpha channel, so flatten onto an opaque RGB buffer first.
+    let rgb = DynamicImage::ImageRgba8(image.clone()).to_rgb8();
+    let mut cursor = Cursor::new(Vec::new());
+    let mut encoder =
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut cursor, quality.clamp(1, 100));
+    encoder.encode_image(&rgb)?;
+    Ok(cursor.into_inner())
+}
+
+pub fn encode_webp_bytes(image: &RgbaImage) -> image::ImageResult<Vec<u8>> {
+    let mut cursor = Cursor::new(Vec::new());
+    DynamicImage::ImageRgba8(image.clone()).write_to(&mut cursor, image::ImageFormat::WebP)?;
+    Ok(cursor.into_inner())
+}
+
+/// Re-encodes already-encoded PNG bytes (the editor's render cache) into
+/// `format`, so a save can target JPEG/WebP without re-rendering the document.
+/// PNG targets short-circuit and reuse the input bytes unchanged.
+pub fn transcode_png_bytes(
+    png_bytes: &[u8],
+    format: ExportFormat,
+    quality: u8,
+) -> image::ImageResult<Vec<u8>> {
+    if format == ExportFormat::Png {
+        return Ok(png_bytes.to_vec());
+    }
+    let image = image::load_from_memory(png_bytes)?.to_rgba8();
+    encode_image_bytes(&image, format, quality)
+}
+
 pub fn save_document_png(
     base: &DynamicImage,
     annotations: &[Annotation],
@@ -1005,7 +1088,9 @@ fn pixelate_region(image: &mut RgbaImage, rect: Rect, pixel_size: u32) {
     let end_x = (rect.x + rect.width).min(image.width() as f32).ceil() as u32;
     let end_y = (rect.y + rect.height).min(image.height() as f32).ceil() as u32;
 
-    let mut output: ImageBuffer<Rgba<u8>, Vec<u8>> = image.clone();
+    // Each block reads its own pixels then overwrites them with their average.
+    // Blocks are disjoint, so we can write back into `image` directly instead of
+    // cloning the whole image for a region-local effect.
     let mut x = start_x;
     while x < end_x {
         let mut y = start_y;
@@ -1033,7 +1118,7 @@ fn pixelate_region(image: &mut RgbaImage, rect: Rect, pixel_size: u32) {
                 ]);
                 for yy in y..y_limit {
                     for xx in x..x_limit {
-                        output.put_pixel(xx, yy, average);
+                        image.put_pixel(xx, yy, average);
                     }
                 }
             }
@@ -1041,57 +1126,68 @@ fn pixelate_region(image: &mut RgbaImage, rect: Rect, pixel_size: u32) {
         }
         x += block;
     }
-
-    *image = output;
 }
 
 fn blur_region(image: &mut RgbaImage, rect: Rect, radius: u32) {
-    let radius = radius.max(1) as i32;
+    let radius = radius.max(1) as usize;
     let start_x = rect.x.max(0.0).floor() as u32;
     let start_y = rect.y.max(0.0).floor() as u32;
     let end_x = (rect.x + rect.width).min(image.width() as f32).ceil() as u32;
     let end_y = (rect.y + rect.height).min(image.height() as f32).ceil() as u32;
-    let mut output = image.clone();
+    if end_x <= start_x || end_y <= start_y {
+        return;
+    }
+    let region_w = (end_x - start_x) as usize;
+    let region_h = (end_y - start_y) as usize;
 
-    for y in start_y..end_y {
-        for x in start_x..end_x {
-            let mut total = [0u32; 4];
-            let mut count = 0u32;
-            for dy in -radius..=radius {
-                for dx in -radius..=radius {
-                    let xx = x as i32 + dx;
-                    let yy = y as i32 + dy;
-                    if xx < start_x as i32
-                        || yy < start_y as i32
-                        || xx >= end_x as i32
-                        || yy >= end_y as i32
-                    {
-                        continue;
-                    }
-                    let pixel = image.get_pixel(xx as u32, yy as u32);
-                    total[0] += pixel[0] as u32;
-                    total[1] += pixel[1] as u32;
-                    total[2] += pixel[2] as u32;
-                    total[3] += pixel[3] as u32;
-                    count += 1;
-                }
+    // Separable box blur evaluated with per-line prefix sums. Each pass costs
+    // O(region pixels) regardless of `radius`, replacing the previous
+    // O(radius^2 * region) box convolution. Only a region-sized scratch buffer is
+    // allocated (the horizontal pass result); the previous code cloned the whole
+    // image even for a small selection. The horizontal averages feed the vertical
+    // pass, which writes the final blur back into `image`.
+    let mut horizontal = vec![[0u8; 4]; region_w * region_h];
+
+    let mut prefix = vec![[0u32; 4]; region_w + 1];
+    for j in 0..region_h {
+        let y = start_y + j as u32;
+        for i in 0..region_w {
+            let pixel = image.get_pixel(start_x + i as u32, y);
+            for c in 0..4 {
+                prefix[i + 1][c] = prefix[i][c] + pixel[c] as u32;
             }
-            if count > 0 {
-                output.put_pixel(
-                    x,
-                    y,
-                    Rgba([
-                        (total[0] / count).min(u8::MAX as u32) as u8,
-                        (total[1] / count).min(u8::MAX as u32) as u8,
-                        (total[2] / count).min(u8::MAX as u32) as u8,
-                        (total[3] / count).min(u8::MAX as u32) as u8,
-                    ]),
-                );
+        }
+        for i in 0..region_w {
+            let lo = i.saturating_sub(radius);
+            let hi = (i + radius + 1).min(region_w);
+            let count = (hi - lo) as u32;
+            let mut out = [0u8; 4];
+            for c in 0..4 {
+                out[c] = ((prefix[hi][c] - prefix[lo][c]) / count) as u8;
             }
+            horizontal[j * region_w + i] = out;
         }
     }
 
-    *image = output;
+    let mut prefix = vec![[0u32; 4]; region_h + 1];
+    for i in 0..region_w {
+        for j in 0..region_h {
+            let src = horizontal[j * region_w + i];
+            for c in 0..4 {
+                prefix[j + 1][c] = prefix[j][c] + src[c] as u32;
+            }
+        }
+        for j in 0..region_h {
+            let lo = j.saturating_sub(radius);
+            let hi = (j + radius + 1).min(region_h);
+            let count = (hi - lo) as u32;
+            let mut out = [0u8; 4];
+            for c in 0..4 {
+                out[c] = ((prefix[hi][c] - prefix[lo][c]) / count) as u8;
+            }
+            image.put_pixel(start_x + i as u32, start_y + j as u32, Rgba(out));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1101,9 +1197,9 @@ mod tests {
     use crate::document::{Annotation, AnnotationData, Color, Point, Rect, TextStyle, TextWeight};
 
     use super::{
-        RenderUpdateKind, arrow_head_geometry, arrow_shape_geometry, arrow_visual_stroke_width,
-        encode_png_bytes, incremental_render_plan, render_document, render_document_from_rgba,
-        update_rendered_image,
+        ExportFormat, RenderUpdateKind, arrow_head_geometry, arrow_shape_geometry,
+        arrow_visual_stroke_width, encode_image_bytes, encode_png_bytes, incremental_render_plan,
+        render_document, render_document_from_rgba, transcode_png_bytes, update_rendered_image,
     };
 
     #[test]
@@ -1327,6 +1423,97 @@ mod tests {
         let rendered = render_document(&base, &annotations);
 
         assert_ne!(*rendered.get_pixel(4, 1), Rgba([100, 0, 0, 255]));
+    }
+
+    #[test]
+    fn blur_keeps_uniform_region_unchanged() {
+        // A box blur of a constant field is the same constant, and pixels outside
+        // the blur rect must not be touched.
+        let mut canvas = DynamicImage::new_rgba8(8, 8).to_rgba8();
+        for pixel in canvas.pixels_mut() {
+            *pixel = Rgba([40, 80, 120, 255]);
+        }
+        let base = DynamicImage::ImageRgba8(canvas);
+        let annotations = vec![Annotation::new(AnnotationData::Blur {
+            rect: Rect { x: 1.0, y: 1.0, width: 6.0, height: 6.0 },
+            radius: 2,
+        })];
+
+        let rendered = render_document(&base, &annotations);
+
+        for y in 0..8 {
+            for x in 0..8 {
+                assert_eq!(*rendered.get_pixel(x, y), Rgba([40, 80, 120, 255]));
+            }
+        }
+    }
+
+    #[test]
+    fn blur_interior_matches_box_average() {
+        // For an interior pixel whose full (2r+1)^2 window lies inside the blur
+        // rect, the separable box blur equals the true 2D box average. The image
+        // is a separable gradient (red = x*10, green = y*10) so the expected
+        // average is exact and easy to derive.
+        let size = 11u32;
+        let mut canvas = DynamicImage::new_rgba8(size, size).to_rgba8();
+        for y in 0..size {
+            for x in 0..size {
+                canvas.put_pixel(x, y, Rgba([(x * 10) as u8, (y * 10) as u8, 0, 255]));
+            }
+        }
+        let base = DynamicImage::ImageRgba8(canvas);
+        let annotations = vec![Annotation::new(AnnotationData::Blur {
+            rect: Rect { x: 0.0, y: 0.0, width: size as f32, height: size as f32 },
+            radius: 2,
+        })];
+
+        let rendered = render_document(&base, &annotations);
+
+        // At (5,5): red = mean(30,40,50,60,70) = 50, green = 50 by symmetry.
+        assert_eq!(*rendered.get_pixel(5, 5), Rgba([50, 50, 0, 255]));
+    }
+
+    fn solid_image(r: u8, g: u8, b: u8) -> RgbaImage {
+        let mut canvas = DynamicImage::new_rgba8(4, 4).to_rgba8();
+        for pixel in canvas.pixels_mut() {
+            *pixel = Rgba([r, g, b, 255]);
+        }
+        canvas
+    }
+
+    #[test]
+    fn encodes_jpeg_and_webp_with_expected_magic() {
+        let canvas = solid_image(10, 120, 200);
+
+        let jpeg = encode_image_bytes(&canvas, ExportFormat::Jpeg, 80).expect("jpeg");
+        assert_eq!(&jpeg[0..3], &[0xFF, 0xD8, 0xFF]);
+
+        let webp = encode_image_bytes(&canvas, ExportFormat::Webp, 0).expect("webp");
+        assert_eq!(&webp[0..4], b"RIFF");
+        assert_eq!(&webp[8..12], b"WEBP");
+    }
+
+    #[test]
+    fn transcode_png_reuses_png_and_converts_jpeg() {
+        let png = encode_png_bytes(&solid_image(200, 30, 40)).expect("png");
+
+        // PNG target reuses the input bytes unchanged (no decode/re-encode).
+        assert_eq!(transcode_png_bytes(&png, ExportFormat::Png, 90).expect("png"), png);
+
+        // JPEG target decodes then re-encodes into a valid JPEG.
+        let jpeg = transcode_png_bytes(&png, ExportFormat::Jpeg, 85).expect("jpeg");
+        assert_eq!(&jpeg[0..3], &[0xFF, 0xD8, 0xFF]);
+    }
+
+    #[test]
+    fn export_format_extension_mapping() {
+        assert_eq!(ExportFormat::from_extension("PNG"), Some(ExportFormat::Png));
+        assert_eq!(ExportFormat::from_extension("jpeg"), Some(ExportFormat::Jpeg));
+        assert_eq!(ExportFormat::from_extension("JPG"), Some(ExportFormat::Jpeg));
+        assert_eq!(ExportFormat::from_extension("webp"), Some(ExportFormat::Webp));
+        assert_eq!(ExportFormat::from_extension("gif"), None);
+        assert_eq!(ExportFormat::Jpeg.extension(), "jpg");
+        assert_eq!(ExportFormat::Webp.extension(), "webp");
     }
 
     #[test]
