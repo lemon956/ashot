@@ -63,6 +63,41 @@ pub fn render_annotation_into(canvas: &mut RgbaImage, annotation: &Annotation) {
     }
 }
 
+/// Renders only the pixels a Mosaic or Blur annotation affects, returning the
+/// integer top-left origin and the rendered region. Used for live draft previews
+/// so the editor can show the real effect (matching the export) instead of a
+/// placeholder, without cloning the whole image. Returns `None` for other tools
+/// or an empty/out-of-bounds region.
+pub fn render_effect_region(
+    base: &RgbaImage,
+    annotation: &Annotation,
+) -> Option<(u32, u32, RgbaImage)> {
+    let rect = match &annotation.data {
+        AnnotationData::Mosaic { rect, .. } | AnnotationData::Blur { rect, .. } => *rect,
+        _ => return None,
+    };
+    let start_x = rect.x.max(0.0).floor() as u32;
+    let start_y = rect.y.max(0.0).floor() as u32;
+    let end_x = (rect.x + rect.width).min(base.width() as f32).ceil() as u32;
+    let end_y = (rect.y + rect.height).min(base.height() as f32).ceil() as u32;
+    if end_x <= start_x || end_y <= start_y {
+        return None;
+    }
+    let region_w = end_x - start_x;
+    let region_h = end_y - start_y;
+    let mut region =
+        image::imageops::crop_imm(base, start_x, start_y, region_w, region_h).to_image();
+    let full = Rect { x: 0.0, y: 0.0, width: region_w as f32, height: region_h as f32 };
+    match &annotation.data {
+        AnnotationData::Mosaic { pixel_size, .. } => {
+            pixelate_region(&mut region, full, *pixel_size)
+        }
+        AnnotationData::Blur { radius, .. } => blur_region(&mut region, full, *radius),
+        _ => return None,
+    }
+    Some((start_x, start_y, region))
+}
+
 pub fn encode_png_bytes(image: &RgbaImage) -> image::ImageResult<Vec<u8>> {
     let mut cursor = Cursor::new(Vec::new());
     DynamicImage::ImageRgba8(image.clone()).write_to(&mut cursor, image::ImageFormat::Png)?;
@@ -1200,7 +1235,8 @@ mod tests {
     use super::{
         ExportFormat, RenderUpdateKind, arrow_head_geometry, arrow_shape_geometry,
         arrow_visual_stroke_width, encode_image_bytes, encode_png_bytes, incremental_render_plan,
-        render_document, render_document_from_rgba, transcode_png_bytes, update_rendered_image,
+        render_document, render_document_from_rgba, render_effect_region, transcode_png_bytes,
+        update_rendered_image,
     };
 
     #[test]
@@ -1504,6 +1540,35 @@ mod tests {
         // JPEG target decodes then re-encodes into a valid JPEG.
         let jpeg = transcode_png_bytes(&png, ExportFormat::Jpeg, 85).expect("jpeg");
         assert_eq!(&jpeg[0..3], &[0xFF, 0xD8, 0xFF]);
+    }
+
+    #[test]
+    fn render_effect_region_covers_only_the_region() {
+        let mut canvas = DynamicImage::new_rgba8(10, 10).to_rgba8();
+        for (i, pixel) in canvas.pixels_mut().enumerate() {
+            *pixel = Rgba([(i * 7 % 256) as u8, (i * 3 % 256) as u8, 0, 255]);
+        }
+        let mosaic = Annotation::new(AnnotationData::Mosaic {
+            rect: Rect { x: 2.0, y: 2.0, width: 4.0, height: 4.0 },
+            pixel_size: 4,
+        });
+
+        let (origin_x, origin_y, region) =
+            render_effect_region(&canvas, &mosaic).expect("mosaic region");
+        assert_eq!((origin_x, origin_y), (2, 2));
+        assert_eq!((region.width(), region.height()), (4, 4));
+        // A single block covering the whole region collapses to one color.
+        let first = *region.get_pixel(0, 0);
+        assert!(region.pixels().all(|pixel| *pixel == first));
+
+        // Non-region tools have no effect region.
+        let line = Annotation::new(AnnotationData::Line {
+            start: Point::new(0.0, 0.0),
+            end: Point::new(5.0, 5.0),
+            color: Color::rgba(255, 0, 0, 255),
+            stroke_width: 2,
+        });
+        assert!(render_effect_region(&canvas, &line).is_none());
     }
 
     #[test]

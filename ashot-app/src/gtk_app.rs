@@ -933,12 +933,20 @@ fn cairo_argb32_bytes_from_rgba(image: &image::RgbaImage, stride: usize) -> Vec<
 fn editor_base_surface(
     image: &image::DynamicImage,
 ) -> std::result::Result<gtk::cairo::ImageSurface, gtk::cairo::Error> {
-    let base_image = image.to_rgba8();
-    let width = base_image.width() as i32;
-    let height = base_image.height() as i32;
+    editor_surface_from_rgba(&image.to_rgba8())
+}
+
+/// Builds a 1:1 Cairo surface from a rendered RGBA image. Used for the canvas
+/// display surface (the rendered document), so the preview shows the same pixels
+/// the export pipeline produces.
+fn editor_surface_from_rgba(
+    rgba: &image::RgbaImage,
+) -> std::result::Result<gtk::cairo::ImageSurface, gtk::cairo::Error> {
+    let width = rgba.width() as i32;
+    let height = rgba.height() as i32;
     let format = gtk::cairo::Format::ARgb32;
-    let stride = format.stride_for_width(base_image.width())?;
-    let bytes = cairo_argb32_bytes_from_rgba(&base_image, stride as usize);
+    let stride = format.stride_for_width(rgba.width())?;
+    let bytes = cairo_argb32_bytes_from_rgba(rgba, stride as usize);
     gtk::cairo::ImageSurface::create_for_data(bytes, format, width, height, stride)
 }
 
@@ -1662,15 +1670,20 @@ fn present_editor(
     let base_rgba = Arc::new(image.to_rgba8());
     let base_image = Rc::new(image);
     let render_cache = Rc::new(RefCell::new(RenderCache::new(runtime.clone(), base_rgba.clone())));
+    // Synchronously-maintained "display image": the rendered document (base +
+    // committed annotations) painted by the canvas, so the editor preview is
+    // pixel-identical to the export. `refresh_display` (installed after the
+    // display surface and hiq cache exist) updates it incrementally; the render
+    // cache above stays dedicated to the save/clipboard path.
+    let display_rgba = Rc::new(RefCell::new((*base_rgba).clone()));
+    let display_prev_annotations: Rc<RefCell<Vec<Annotation>>> = Rc::new(RefCell::new(Vec::new()));
+    #[allow(clippy::type_complexity)]
+    let refresh_display_hook: Rc<RefCell<Option<Rc<dyn Fn()>>>> = Rc::new(RefCell::new(None));
     let queue_render_cache: Rc<dyn Fn()> = {
-        let render_cache = render_cache.clone();
-        let document = document.clone();
+        let refresh_display_hook = refresh_display_hook.clone();
         Rc::new(move || {
-            let Some(annotations) = annotation_snapshot_for_draw(&document) else {
-                return;
-            };
-            if let Ok(mut render_cache) = render_cache.try_borrow_mut() {
-                render_cache.request_update(annotations);
+            if let Some(refresh) = refresh_display_hook.borrow().as_ref().cloned() {
+                refresh();
             }
         })
     };
@@ -1791,6 +1804,9 @@ fn present_editor(
     let base_surface = Rc::new(
         editor_base_surface(&base_image).context("failed to prepare editor display surface")?,
     );
+    // The canvas fast path paints this surface (the rendered document); it starts
+    // as the bare base image and `refresh_display` swaps it on every change.
+    let display_surface = Rc::new(RefCell::new(base_surface.clone()));
 
     let canvas = DrawingArea::new();
     canvas.set_halign(Align::Start);
@@ -1813,7 +1829,7 @@ fn present_editor(
     let hiq_cache: Rc<RefCell<HiqImageCache>> = Rc::new(RefCell::new(HiqImageCache::default()));
     let hiq_rebuild_gen = Rc::new(Cell::new(0u64));
     let request_hiq_rebuild: Rc<dyn Fn()> = {
-        let base_rgba = base_rgba.clone();
+        let display_rgba = display_rgba.clone();
         let image_scale = image_scale.clone();
         let canvas = canvas.clone();
         let hiq_cache = hiq_cache.clone();
@@ -1823,7 +1839,7 @@ fn present_editor(
         Rc::new(move || {
             let generation = hiq_rebuild_gen.get().wrapping_add(1);
             hiq_rebuild_gen.set(generation);
-            let base_rgba = base_rgba.clone();
+            let display_rgba = display_rgba.clone();
             let image_scale = image_scale.clone();
             let canvas = canvas.clone();
             let hiq_cache = hiq_cache.clone();
@@ -1838,7 +1854,7 @@ fn present_editor(
                     return;
                 }
                 if let Some(surface) = build_hiq_surface(
-                    base_rgba.as_ref(),
+                    &display_rgba.borrow(),
                     image_width,
                     image_height,
                     scale,
@@ -1858,6 +1874,47 @@ fn present_editor(
         let request_hiq_rebuild = request_hiq_rebuild.clone();
         canvas.connect_scale_factor_notify(move |_| request_hiq_rebuild());
     }
+
+    // Re-render the document into the display image/surface whenever the
+    // annotations change, so the canvas shows the exact export pixels for every
+    // tool. Installed as the `queue_render_cache` hook; the heavy work only runs
+    // on discrete commit/undo events (drafts are previewed live without it).
+    let refresh_display: Rc<dyn Fn()> = {
+        let document = document.clone();
+        let base_rgba = base_rgba.clone();
+        let display_rgba = display_rgba.clone();
+        let display_prev_annotations = display_prev_annotations.clone();
+        let display_surface = display_surface.clone();
+        let hiq_cache = hiq_cache.clone();
+        let request_hiq_rebuild = request_hiq_rebuild.clone();
+        let canvas = canvas.clone();
+        Rc::new(move || {
+            let Some(annotations) = annotation_snapshot_for_draw(&document) else {
+                return;
+            };
+            {
+                let mut cached = display_rgba.borrow_mut();
+                let mut prev = display_prev_annotations.borrow_mut();
+                ashot_core::export::update_rendered_image(
+                    base_rgba.as_ref(),
+                    &mut cached,
+                    &prev,
+                    &annotations,
+                );
+                *prev = annotations;
+            }
+            if let Ok(surface) = editor_surface_from_rgba(&display_rgba.borrow()) {
+                *display_surface.borrow_mut() = Rc::new(surface);
+            }
+            // The crisp cache is keyed only by zoom, so invalidate it on content
+            // change and let the debounced rebuild redo it from the new pixels.
+            *hiq_cache.borrow_mut() = HiqImageCache::default();
+            request_hiq_rebuild();
+            canvas.queue_draw();
+        })
+    };
+    *refresh_display_hook.borrow_mut() = Some(refresh_display.clone());
+    refresh_display();
 
     // Live zoom percentage readout, shared by the wheel, buttons and shortcuts.
     let zoom_percent_label =
@@ -2278,7 +2335,9 @@ fn present_editor(
     let active_magnifier_enabled_for_draw = active_magnifier_enabled.clone();
     let active_magnifier_zoom_for_draw = active_magnifier_zoom.clone();
     let base_rgba_for_magnifier = base_rgba.clone();
-    let base_surface_for_draw = base_surface.clone();
+    let display_surface_for_draw = display_surface.clone();
+    let effect_draft_cache_for_draw: Rc<RefCell<Option<EffectDraftPreview>>> =
+        Rc::new(RefCell::new(None));
     let hiq_cache_for_draw = hiq_cache.clone();
     let image_width_for_draw = base_image.width();
     let image_height_for_draw = base_image.height();
@@ -2307,7 +2366,8 @@ fn present_editor(
             .is_some();
         if !painted_hiq {
             cr.scale(scale, scale);
-            if set_editor_image_source(cr, base_surface_for_draw.as_ref(), scale).is_ok() {
+            let current_surface = display_surface_for_draw.borrow();
+            if set_editor_image_source(cr, &current_surface, scale).is_ok() {
                 let _ = cr.paint();
             }
         }
@@ -2320,11 +2380,8 @@ fn present_editor(
         cr.scale(scale, scale);
         cr.set_line_join(gtk::cairo::LineJoin::Round);
         cr.set_line_cap(gtk::cairo::LineCap::Round);
-        if let Some(annotations) = annotation_snapshot_for_draw(&doc_for_draw) {
-            for annotation in &annotations {
-                draw_annotation(cr, annotation, marker_animation_time);
-            }
-        }
+        // Committed annotations are already baked into the display surface above
+        // (the real export pixels); only the live overlays are drawn here.
         if let Ok(document) = doc_for_draw.try_borrow()
             && let Some(bounds) = selected_annotation_bounds(&document)
         {
@@ -2332,7 +2389,20 @@ fn present_editor(
             draw_selection_overlay(cr, bounds, &handles);
         }
         if let Some(annotation) = draft_preview_for_draw(&draft_for_draw) {
-            draw_annotation(cr, &annotation, marker_animation_time);
+            if matches!(
+                annotation.data,
+                AnnotationData::Mosaic { .. } | AnnotationData::Blur { .. }
+            ) {
+                draw_effect_draft_preview(
+                    cr,
+                    &base_rgba_for_magnifier,
+                    &annotation,
+                    scale,
+                    &effect_draft_cache_for_draw,
+                );
+            } else {
+                draw_annotation(cr, &annotation, marker_animation_time);
+            }
         }
         if let Ok(document) = doc_for_draw.try_borrow()
             && matches!(document.active_tool, DefaultTool::Brush | DefaultTool::Marker)
@@ -3582,31 +3652,56 @@ fn present_pin_window(app: &adw::Application, state: Arc<ServiceState>, image_pa
     let scale_for_scroll = scale.clone();
     let state_for_scroll = state.clone();
     let save_generation_for_scroll = pin_scale_save_generation.clone();
+    let pin_zoom_apply_pending = Rc::new(Cell::new(false));
     scroll.connect_scroll(move |_, _, dy| {
         let next = pin_zoom_from_scroll(scale_for_scroll.get(), dy);
         if (next - scale_for_scroll.get()).abs() < 0.000_001 {
             return glib::Propagation::Stop;
         }
         scale_for_scroll.set(next);
-        apply_pin_zoom(
-            &window_for_scroll,
-            &image_overlay_for_scroll,
-            &pin_content_for_scroll,
-            &picture_for_scroll,
-            &dimension_label_for_scroll,
-            image_width,
-            image_height,
-            next,
-        );
-        if policy.represent_after_interaction {
-            present_pin_window_front(&window_for_scroll);
+
+        // Coalesce the expensive window resize/relayout to at most once per
+        // event burst. Previously every scroll event ran `apply_pin_zoom`
+        // synchronously (a Wayland round trip + four `queue_resize` calls),
+        // which stuttered under fast scrolling. The scale is updated above so
+        // consecutive events accumulate; a single idle callback then applies the
+        // latest scale.
+        if !pin_zoom_apply_pending.replace(true) {
+            let window_for_apply = window_for_scroll.clone();
+            let image_overlay_for_apply = image_overlay_for_scroll.clone();
+            let pin_content_for_apply = pin_content_for_scroll.clone();
+            let picture_for_apply = picture_for_scroll.clone();
+            let dimension_label_for_apply = dimension_label_for_scroll.clone();
+            let scale_for_apply = scale_for_scroll.clone();
+            let pending_for_apply = pin_zoom_apply_pending.clone();
+            glib::idle_add_local_once(move || {
+                pending_for_apply.set(false);
+                apply_pin_zoom(
+                    &window_for_apply,
+                    &image_overlay_for_apply,
+                    &pin_content_for_apply,
+                    &picture_for_apply,
+                    &dimension_label_for_apply,
+                    image_width,
+                    image_height,
+                    scale_for_apply.get(),
+                );
+            });
         }
+
+        // After scrolling settles, re-assert the window stays in front (once,
+        // instead of on every event) and persist the chosen scale.
         let generation = next_pin_scale_save_generation(save_generation_for_scroll.get());
         save_generation_for_scroll.set(generation);
         let state_for_save = state_for_scroll.clone();
         let save_generation_for_timeout = save_generation_for_scroll.clone();
+        let window_for_settle = window_for_scroll.clone();
+        let represent_after_interaction = policy.represent_after_interaction;
         glib::timeout_add_local_once(Duration::from_millis(220), move || {
             if pin_scale_save_generation_is_current(save_generation_for_timeout.get(), generation) {
+                if represent_after_interaction {
+                    present_pin_window_front(&window_for_settle);
+                }
                 persist_config_change(&state_for_save, |config| {
                     config.last_pin_scale = next;
                 });
@@ -7632,100 +7727,79 @@ fn draw_cairo_arrow(
     let _ = cr.restore();
 }
 
-fn draw_mosaic_preview(cr: &gtk::cairo::Context, rect: Rect, pixel_size: u32) {
-    if rect.width <= 0.0 || rect.height <= 0.0 {
-        return;
-    }
-
-    let block = pixel_size.max(4) as f64;
-    let strength = ((pixel_size as f64 - 6.0) / 22.0).clamp(0.0, 1.0);
-    let light_alpha = 0.24 + strength * 0.14;
-    let dark_alpha = 0.34 + strength * 0.22;
-    let x0 = rect.x as f64;
-    let y0 = rect.y as f64;
-    let x1 = x0 + rect.width as f64;
-    let y1 = y0 + rect.height as f64;
-
-    let _ = cr.save();
-    cr.rectangle(x0, y0, rect.width as f64, rect.height as f64);
-    cr.clip();
-
-    let mut y = y0;
-    let mut row = 0;
-    while y < y1 {
-        let mut x = x0;
-        let mut column = 0;
-        while x < x1 {
-            if (row + column) % 2 == 0 {
-                cr.set_source_rgba(0.04, 0.05, 0.06, dark_alpha);
-            } else {
-                cr.set_source_rgba(0.88, 0.90, 0.94, light_alpha);
-            }
-            cr.rectangle(x, y, block.min(x1 - x), block.min(y1 - y));
-            let _ = cr.fill();
-            x += block;
-            column += 1;
-        }
-        y += block;
-        row += 1;
-    }
-
-    let _ = cr.restore();
-    cr.set_source_rgba(0.04, 0.05, 0.06, 0.56);
-    cr.set_line_width(1.0);
-    cr.rectangle(x0 + 0.5, y0 + 0.5, rect.width as f64 - 1.0, rect.height as f64 - 1.0);
-    let _ = cr.stroke();
+/// Cached real-effect preview for the in-progress Mosaic/Blur draft, so the
+/// (potentially expensive) effect is only recomputed when the draft region or
+/// strength changes — not on every animation-driven redraw.
+struct EffectDraftPreview {
+    key: EffectDraftKey,
+    origin_x: f64,
+    origin_y: f64,
+    surface: gtk::cairo::ImageSurface,
 }
 
-fn draw_blur_preview(cr: &gtk::cairo::Context, rect: Rect, radius: u32) {
-    if rect.width <= 0.0 || rect.height <= 0.0 {
+#[derive(PartialEq, Eq)]
+struct EffectDraftKey {
+    is_blur: bool,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+    strength: u32,
+}
+
+fn effect_draft_key(annotation: &Annotation) -> Option<EffectDraftKey> {
+    let (is_blur, rect, strength) = match &annotation.data {
+        AnnotationData::Mosaic { rect, pixel_size } => (false, *rect, *pixel_size),
+        AnnotationData::Blur { rect, radius } => (true, *rect, *radius),
+        _ => return None,
+    };
+    Some(EffectDraftKey {
+        is_blur,
+        x: rect.x.round() as i32,
+        y: rect.y.round() as i32,
+        width: rect.width.round() as i32,
+        height: rect.height.round() as i32,
+        strength,
+    })
+}
+
+/// Paints the in-progress Mosaic/Blur draft with its real effect (matching the
+/// export) instead of a placeholder. Runs inside the canvas' scaled context, so
+/// the region surface is painted at image coordinates.
+fn draw_effect_draft_preview(
+    cr: &gtk::cairo::Context,
+    base_rgba: &image::RgbaImage,
+    annotation: &Annotation,
+    scale: f64,
+    cache: &RefCell<Option<EffectDraftPreview>>,
+) {
+    let Some(key) = effect_draft_key(annotation) else {
         return;
-    }
-
-    let radius = radius.max(1) as f64;
-    let x0 = rect.x as f64;
-    let y0 = rect.y as f64;
-    let width = rect.width as f64;
-    let height = rect.height as f64;
-    let x1 = x0 + width;
-    let y1 = y0 + height;
-    let spacing = (radius * 1.6).clamp(8.0, 22.0);
-    let line_width = (radius * 0.45).clamp(2.0, 7.0);
-
-    let _ = cr.save();
-    cr.rectangle(x0, y0, width, height);
-    cr.clip();
-
-    cr.set_source_rgba(0.12, 0.42, 0.90, 0.14);
-    cr.rectangle(x0, y0, width, height);
-    let _ = cr.fill();
-
-    let mut y = y0 + spacing * 0.7;
-    let mut row = 0.0;
-    while y < y1 {
-        let inset = 6.0 + (row % 2.0) * spacing * 0.5;
-        cr.set_source_rgba(0.45, 0.76, 1.0, 0.28);
-        cr.set_line_width(line_width);
-        cr.set_line_cap(gtk::cairo::LineCap::Round);
-        cr.move_to((x0 + inset).min(x1), y);
-        cr.curve_to(
-            x0 + width * 0.32,
-            y - spacing * 0.35,
-            x0 + width * 0.66,
-            y + spacing * 0.35,
-            (x1 - inset).max(x0),
-            y,
+    };
+    if cache.borrow().as_ref().map(|cached| &cached.key) != Some(&key) {
+        let rebuilt = ashot_core::export::render_effect_region(base_rgba, annotation).and_then(
+            |(origin_x, origin_y, region)| {
+                let surface = editor_surface_from_rgba(&region).ok()?;
+                Some(EffectDraftPreview {
+                    key,
+                    origin_x: origin_x as f64,
+                    origin_y: origin_y as f64,
+                    surface,
+                })
+            },
         );
-        let _ = cr.stroke();
-        y += spacing;
-        row += 1.0;
+        *cache.borrow_mut() = rebuilt;
     }
-
-    let _ = cr.restore();
-    cr.set_source_rgba(0.12, 0.42, 0.90, 0.54);
-    cr.set_line_width(1.2);
-    cr.rectangle(x0 + 0.5, y0 + 0.5, width - 1.0, height - 1.0);
-    let _ = cr.stroke();
+    if let Some(preview) = cache.borrow().as_ref() {
+        let width = preview.surface.width() as f64;
+        let height = preview.surface.height() as f64;
+        let _ = cr.set_source_surface(&preview.surface, preview.origin_x, preview.origin_y);
+        let filter =
+            if scale >= 1.0 { gtk::cairo::Filter::Nearest } else { gtk::cairo::Filter::Good };
+        cr.source().set_filter(filter);
+        cr.rectangle(preview.origin_x, preview.origin_y, width, height);
+        let _ = cr.fill();
+    }
 }
 
 fn draw_annotation(cr: &gtk::cairo::Context, annotation: &Annotation, marker_animation_time: f64) {
@@ -7773,12 +7847,10 @@ fn draw_annotation(cr: &gtk::cairo::Context, annotation: &Annotation, marker_ani
             let _ = cr.restore();
             let _ = cr.stroke();
         }
-        AnnotationData::Mosaic { rect, pixel_size } => {
-            draw_mosaic_preview(cr, *rect, *pixel_size);
-        }
-        AnnotationData::Blur { rect, radius } => {
-            draw_blur_preview(cr, *rect, *radius);
-        }
+        // Mosaic/Blur drafts are rendered with their real effect by
+        // `draw_effect_draft_preview`, so this dispatcher (used only for the live
+        // draft) is never reached for them.
+        AnnotationData::Mosaic { .. } | AnnotationData::Blur { .. } => {}
         AnnotationData::Counter { center, number, color, radius } => {
             set_cairo_color(cr, *color);
             cr.arc(center.x as f64, center.y as f64, *radius as f64, 0.0, std::f64::consts::TAU);

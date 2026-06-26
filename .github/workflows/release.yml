@@ -96,9 +96,19 @@ jobs:
 
       - name: Create changelog
         run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          : > /tmp/changelog.md
           if [ -f CHANGELOG.md ]; then
-            cp CHANGELOG.md /tmp/changelog.md
-          else
+            # Extract only this version's section (from "## [VERSION]" up to the
+            # next "## [" heading) so the release notes do not include the whole
+            # file or the "[Unreleased]" block.
+            awk -v target="## [${VERSION}]" '
+              index($0, target) == 1 { capture = 1; next }
+              capture && /^## \[/ { exit }
+              capture { print }
+            ' CHANGELOG.md > /tmp/changelog.md
+          fi
+          if [ ! -s /tmp/changelog.md ]; then
             git log --pretty=format:"- %s" -10 > /tmp/changelog.md
           fi
 

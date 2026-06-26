@@ -52,6 +52,19 @@
 - Matches pin windows by the `ashot-pin` tag
 - Calls `Meta.Window.make_above()` and `stick()` so GNOME Shell/Mutter, not GTK, owns the global stacking behavior
 
+#### Why a Shell extension is required (Wayland always-on-top)
+
+There is no portable, client-side way to keep a window always on top under
+Wayland — the core protocol (xdg-shell) intentionally leaves window stacking to
+the compositor. The `wlr-layer-shell` protocol can do it and is implemented by
+most compositors (wlroots-based ones such as Sway/Hyprland, KDE/KWin, COSMIC,
+Mir), but **GNOME/Mutter does not implement it** (mutter issue #973), and
+`gtk4-layer-shell` therefore does not work on GNOME-on-Wayland. GNOME only
+exposes the necessary stacking control to its own Shell extensions, so the
+tagged-window + `make_above()` extension is the only reliable approach on GNOME
+Wayland. (On layer-shell compositors a native, extension-free implementation
+would be possible; that cross-compositor path is deliberately out of scope.)
+
 ## Data Flow
 
 1. `ashot gui` runs in the CLI.
@@ -70,6 +83,7 @@
 - Overlay annotations are tracked separately
 - Undo/redo stores lightweight snapshots of the annotation list
 - Export is a rasterization pass over the immutable base image plus overlays
+- The editor canvas paints that same rendered document (the export pixels) for committed annotations, so the preview is WYSIWYG for every tool; only the in-progress draft, selection handles, and cursors are drawn as live overlays
 - Supported local tools include text, line, arrow, brush, rectangle, ellipse, marker, mosaic, blur, counter, and filled boxes
 
 ## Known Gaps

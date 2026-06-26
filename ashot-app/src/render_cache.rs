@@ -152,14 +152,6 @@ impl RenderCache {
         }
     }
 
-    pub fn request_update(&mut self, annotations: Vec<Annotation>) {
-        if self.pending_is_waited_on() {
-            return;
-        }
-        let action = self.state.request_update(annotations);
-        self.handle_action(action);
-    }
-
     pub fn request_latest(&mut self, annotations: Vec<Annotation>, callback: RenderCacheCallback) {
         if let Some(bytes) = self.state.completed_bytes_for(&annotations) {
             callback(Ok(bytes));
@@ -250,13 +242,6 @@ impl RenderCache {
             }
         }
         self.waiters = remaining;
-    }
-
-    fn pending_is_waited_on(&self) -> bool {
-        self.state
-            .pending
-            .as_ref()
-            .is_some_and(|pending| self.waiters.iter().any(|waiter| waiter.annotations == *pending))
     }
 }
 
