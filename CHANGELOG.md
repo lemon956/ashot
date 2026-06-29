@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The sidebar setting controls now follow the active tool: color, stroke/effect
+  strength, and text controls grey out when the current tool doesn't use them
+  (the eyedropper stays available, and the Select tool keeps everything enabled).
+- The hover size-preview ring now also appears for the Mosaic brush, sized to its
+  actual stroke footprint, so the cursor reflects the current effect size.
+- The Mosaic tool is now a brush: paint over an area and it pixelates along the
+  stroke in real time, instead of dragging out a rectangle.
+- The highlighter (Marker) is redesigned as a clean flat translucent band with a
+  soft animated gloss sweeping along it; the band matches the exported result
+  exactly while the gloss is a canvas-only decoration.
+- Selecting an annotation no longer draws a selection box or handles; selection
+  stays functional (move, delete, recolour) and sizing moves to the sidebar.
+- The number/counter badge is resizable from the sidebar size control (and new
+  badges use the current size).
 - The editor canvas now shows the real export result for every tool: committed
   annotations are painted from the rendered document, so Mosaic, Blur, Counter,
   and Marker look exactly like the saved image (WYSIWYG).

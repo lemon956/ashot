@@ -53,65 +53,11 @@ pub fn marker_visual_stroke_width(user_width: u32) -> u32 {
     user_width.max(1).saturating_mul(MARKER_STROKE_MULTIPLIER)
 }
 
-pub const MARKER_MULTI_FIBER_MIN_WIDTH: u32 = 36;
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct MarkerFiber {
-    pub offset: f32,
-    pub stroke_width: f32,
-    pub opacity: u8,
-    pub dash: f32,
-    pub gap: f32,
-    pub phase: f32,
-    pub period: f32,
-}
-
-pub fn marker_fiber_layout(stroke_width: u32) -> Vec<MarkerFiber> {
-    let stroke = stroke_width.max(1) as f32;
-    let count = if stroke_width < MARKER_MULTI_FIBER_MIN_WIDTH {
-        1
-    } else {
-        ((stroke / 18.0).round() as usize).clamp(2, 6)
-    };
-    let line_width = (stroke * 0.075).clamp(1.6, 5.5);
-    let max_offset = (stroke * 0.5 - line_width * 0.65).max(0.0);
-
-    (0..count)
-        .map(|index| {
-            let offset = if count == 1 {
-                0.0
-            } else {
-                let t = index as f32 / (count - 1) as f32;
-                (t - 0.5) * 2.0 * max_offset * 0.72
-            };
-            let seed = marker_fiber_seed(index as u32, stroke_width);
-            let width_jitter = 0.82 + unit_noise(seed, 0) * 0.34;
-            let stroke_width = line_width * width_jitter;
-            let opacity = (78.0 + unit_noise(seed, 1) * 64.0).round() as u8;
-            let dash = (stroke * (0.52 + unit_noise(seed, 2) * 0.34)).clamp(12.0, 64.0);
-            let gap = (stroke * (0.22 + unit_noise(seed, 3) * 0.24)).clamp(7.0, 34.0);
-            let phase = unit_noise(seed, 4);
-            let period = 1.25 + unit_noise(seed, 5) * 1.35;
-            MarkerFiber { offset, stroke_width, opacity, dash, gap, phase, period }
-        })
-        .collect()
-}
-
-fn marker_fiber_seed(index: u32, stroke_width: u32) -> u32 {
-    index
-        .wrapping_mul(0x9E37_79B9)
-        .wrapping_add(stroke_width.rotate_left(13))
-        .wrapping_add(0xA511_E9B3)
-}
-
-fn unit_noise(seed: u32, salt: u32) -> f32 {
-    let mut value = seed.wrapping_add(salt.wrapping_mul(0x85EB_CA6B));
-    value ^= value >> 16;
-    value = value.wrapping_mul(0x7FEB_352D);
-    value ^= value >> 15;
-    value = value.wrapping_mul(0x846C_A68B);
-    value ^= value >> 16;
-    value as f32 / u32::MAX as f32
+/// Maps the sidebar size value to a counter (numbered badge) radius. Lets the
+/// size control scale the badge over a usable range (size 4 keeps the previous
+/// default radius of 12).
+pub fn counter_radius_for_size(size: u32) -> u32 {
+    size.max(1).saturating_mul(3).max(8)
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
@@ -203,17 +149,67 @@ pub struct TextStyle {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum AnnotationData {
-    Text { origin: Point, text: String, style: TextStyle },
-    Line { start: Point, end: Point, color: Color, stroke_width: u32 },
-    Arrow { start: Point, end: Point, color: Color, stroke_width: u32 },
-    Brush { points: Vec<Point>, color: Color, stroke_width: u32 },
-    Rectangle { rect: Rect, color: Color, stroke_width: u32 },
-    Ellipse { rect: Rect, color: Color, stroke_width: u32 },
-    Marker { points: Vec<Point>, color: Color, stroke_width: u32 },
-    Mosaic { rect: Rect, pixel_size: u32 },
-    Blur { rect: Rect, radius: u32 },
-    Counter { center: Point, number: u32, color: Color, radius: u32 },
-    FilledBox { rect: Rect, color: Color },
+    Text {
+        origin: Point,
+        text: String,
+        style: TextStyle,
+    },
+    Line {
+        start: Point,
+        end: Point,
+        color: Color,
+        stroke_width: u32,
+    },
+    Arrow {
+        start: Point,
+        end: Point,
+        color: Color,
+        stroke_width: u32,
+    },
+    Brush {
+        points: Vec<Point>,
+        color: Color,
+        stroke_width: u32,
+    },
+    Rectangle {
+        rect: Rect,
+        color: Color,
+        stroke_width: u32,
+    },
+    Ellipse {
+        rect: Rect,
+        color: Color,
+        stroke_width: u32,
+    },
+    Marker {
+        points: Vec<Point>,
+        color: Color,
+        stroke_width: u32,
+    },
+    Mosaic {
+        rect: Rect,
+        pixel_size: u32,
+    },
+    /// Brush-style mosaic: pixelates along a painted stroke instead of a rect.
+    MosaicBrush {
+        points: Vec<Point>,
+        pixel_size: u32,
+        stroke_width: u32,
+    },
+    Blur {
+        rect: Rect,
+        radius: u32,
+    },
+    Counter {
+        center: Point,
+        number: u32,
+        color: Color,
+        radius: u32,
+    },
+    FilledBox {
+        rect: Rect,
+        color: Color,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -237,7 +233,9 @@ impl Annotation {
             AnnotationData::Line { start, end, .. } | AnnotationData::Arrow { start, end, .. } => {
                 Rect::from_points(*start, *end)
             }
-            AnnotationData::Brush { points, .. } | AnnotationData::Marker { points, .. } => {
+            AnnotationData::Brush { points, .. }
+            | AnnotationData::Marker { points, .. }
+            | AnnotationData::MosaicBrush { points, .. } => {
                 let mut min_x = f32::MAX;
                 let mut min_y = f32::MAX;
                 let mut max_x = f32::MIN;
@@ -277,7 +275,9 @@ impl Annotation {
                 *start = start.offset(dx, dy);
                 *end = end.offset(dx, dy);
             }
-            AnnotationData::Brush { points, .. } | AnnotationData::Marker { points, .. } => {
+            AnnotationData::Brush { points, .. }
+            | AnnotationData::Marker { points, .. }
+            | AnnotationData::MosaicBrush { points, .. } => {
                 for point in points {
                     *point = point.offset(dx, dy);
                 }
@@ -320,7 +320,8 @@ impl Annotation {
             }
             AnnotationData::Text { .. }
             | AnnotationData::Brush { .. }
-            | AnnotationData::Marker { .. } => false,
+            | AnnotationData::Marker { .. }
+            | AnnotationData::MosaicBrush { .. } => false,
         }
     }
 
@@ -335,7 +336,9 @@ impl Annotation {
             | AnnotationData::Marker { color: current, .. }
             | AnnotationData::Counter { color: current, .. }
             | AnnotationData::FilledBox { color: current, .. } => *current = color,
-            AnnotationData::Mosaic { .. } | AnnotationData::Blur { .. } => return false,
+            AnnotationData::Mosaic { .. }
+            | AnnotationData::MosaicBrush { .. }
+            | AnnotationData::Blur { .. } => return false,
         }
         true
     }
@@ -352,8 +355,9 @@ impl Annotation {
                 *stroke_width = marker_visual_stroke_width(width)
             }
             AnnotationData::Mosaic { pixel_size, .. } => *pixel_size = width,
+            AnnotationData::MosaicBrush { stroke_width, .. } => *stroke_width = width,
             AnnotationData::Blur { radius, .. } => *radius = width,
-            AnnotationData::Counter { radius, .. } => *radius = width,
+            AnnotationData::Counter { radius, .. } => *radius = counter_radius_for_size(width),
             AnnotationData::Text { style, .. } => style.size = width,
             AnnotationData::FilledBox { .. } => return false,
         }
@@ -543,7 +547,7 @@ impl Document {
 mod tests {
     use super::{
         Annotation, AnnotationData, Color, DefaultTool, Document, Point, Rect, ResizeHandle,
-        TextStyle, TextWeight, marker_fiber_layout, marker_visual_stroke_width,
+        TextStyle, TextWeight, counter_radius_for_size, marker_visual_stroke_width,
     };
 
     #[test]
@@ -651,35 +655,20 @@ mod tests {
     }
 
     #[test]
-    fn marker_fiber_layout_uses_one_strand_for_thin_marker() {
-        let fibers = marker_fiber_layout(24);
+    fn counter_radius_scales_with_size_and_resizes_via_stroke() {
+        // Size 4 keeps the previous default radius; bigger sizes grow the badge.
+        assert_eq!(counter_radius_for_size(4), 12);
+        assert_eq!(counter_radius_for_size(1), 8);
+        assert_eq!(counter_radius_for_size(16), 48);
 
-        assert_eq!(fibers.len(), 1);
-        assert_eq!(fibers[0].offset, 0.0);
-    }
-
-    #[test]
-    fn marker_fiber_layout_uses_multiple_strands_for_thick_marker() {
-        let fibers = marker_fiber_layout(80);
-
-        assert!(fibers.len() >= 3, "thick markers should split into multiple inner strands");
-        assert!(
-            fibers.iter().any(|fiber| fiber.offset < 0.0)
-                && fibers.iter().any(|fiber| fiber.offset > 0.0),
-            "multiple strands should be distributed across the marker width"
-        );
-    }
-
-    #[test]
-    fn marker_fiber_layout_keeps_strands_inside_marker_width() {
-        let stroke_width = marker_visual_stroke_width(8);
-        let radius = stroke_width as f32 * 0.5;
-        let fibers = marker_fiber_layout(stroke_width);
-
-        assert!(
-            fibers.iter().all(|fiber| fiber.offset.abs() + fiber.stroke_width * 0.5 <= radius),
-            "fibers must stay inside the marker stroke mask"
-        );
+        let mut counter = Annotation::new(AnnotationData::Counter {
+            center: Point::new(20.0, 20.0),
+            number: 1,
+            color: Color::rgba(0, 0, 0, 255),
+            radius: 12,
+        });
+        assert!(counter.apply_stroke_width(10));
+        assert!(matches!(counter.data, AnnotationData::Counter { radius: 30, .. }));
     }
 
     #[test]

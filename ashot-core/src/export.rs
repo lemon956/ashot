@@ -5,8 +5,7 @@ use image::{DynamicImage, ImageBuffer, Rgba, RgbaImage};
 use pango::glib::translate::{ToGlibPtr, from_glib_full};
 
 use crate::document::{
-    Annotation, AnnotationData, Color, MarkerFiber, Point, Rect, TextStyle, TextWeight,
-    marker_fiber_layout,
+    Annotation, AnnotationData, Color, MARKER_HIGHLIGHT_ALPHA, Point, Rect, TextStyle, TextWeight,
 };
 
 #[link(name = "pangocairo-1.0")]
@@ -51,6 +50,9 @@ pub fn render_annotation_into(canvas: &mut RgbaImage, annotation: &Annotation) {
         AnnotationData::Mosaic { rect, pixel_size } => {
             pixelate_region(canvas, *rect, *pixel_size);
         }
+        AnnotationData::MosaicBrush { points, pixel_size, stroke_width } => {
+            pixelate_along_brush_path(canvas, points, *pixel_size, *stroke_width);
+        }
         AnnotationData::Blur { rect, radius } => {
             blur_region(canvas, *rect, *radius);
         }
@@ -74,6 +76,17 @@ pub fn render_effect_region(
 ) -> Option<(u32, u32, RgbaImage)> {
     let rect = match &annotation.data {
         AnnotationData::Mosaic { rect, .. } | AnnotationData::Blur { rect, .. } => *rect,
+        AnnotationData::MosaicBrush { points, stroke_width, .. } => {
+            if points.is_empty() {
+                return None;
+            }
+            let pad = *stroke_width as f32 / 2.0 + 1.0;
+            let min_x = points.iter().map(|point| point.x).fold(f32::INFINITY, f32::min) - pad;
+            let min_y = points.iter().map(|point| point.y).fold(f32::INFINITY, f32::min) - pad;
+            let max_x = points.iter().map(|point| point.x).fold(f32::NEG_INFINITY, f32::max) + pad;
+            let max_y = points.iter().map(|point| point.y).fold(f32::NEG_INFINITY, f32::max) + pad;
+            Rect { x: min_x, y: min_y, width: max_x - min_x, height: max_y - min_y }
+        }
         _ => return None,
     };
     let start_x = rect.x.max(0.0).floor() as u32;
@@ -93,6 +106,13 @@ pub fn render_effect_region(
             pixelate_region(&mut region, full, *pixel_size)
         }
         AnnotationData::Blur { radius, .. } => blur_region(&mut region, full, *radius),
+        AnnotationData::MosaicBrush { points, pixel_size, stroke_width } => {
+            let local: Vec<Point> = points
+                .iter()
+                .map(|point| Point::new(point.x - start_x as f32, point.y - start_y as f32))
+                .collect();
+            pixelate_along_brush_path(&mut region, &local, *pixel_size, *stroke_width);
+        }
         _ => return None,
     }
     Some((start_x, start_y, region))
@@ -385,7 +405,8 @@ fn annotation_render_padding(annotation: &Annotation) -> f32 {
         | AnnotationData::Brush { stroke_width, .. }
         | AnnotationData::Rectangle { stroke_width, .. }
         | AnnotationData::Ellipse { stroke_width, .. }
-        | AnnotationData::Marker { stroke_width, .. } => *stroke_width as f32 + 3.0,
+        | AnnotationData::Marker { stroke_width, .. }
+        | AnnotationData::MosaicBrush { stroke_width, .. } => *stroke_width as f32 + 3.0,
         AnnotationData::Arrow { stroke_width, .. } => {
             let visual = arrow_visual_stroke_width(*stroke_width);
             let (_, head_width) = arrow_head_dimensions(visual);
@@ -400,7 +421,12 @@ fn annotation_render_padding(annotation: &Annotation) -> f32 {
 }
 
 fn annotation_is_complex_effect(annotation: &Annotation) -> bool {
-    matches!(annotation.data, AnnotationData::Mosaic { .. } | AnnotationData::Blur { .. })
+    matches!(
+        annotation.data,
+        AnnotationData::Mosaic { .. }
+            | AnnotationData::MosaicBrush { .. }
+            | AnnotationData::Blur { .. }
+    )
 }
 
 fn color_to_rgba(color: Color) -> Rgba<u8> {
@@ -692,148 +718,18 @@ fn draw_marker(image: &mut RgbaImage, points: &[Point], color: Color, stroke_wid
         );
     }
 
-    paint_marker_trace(image, &mask, bounds, color);
-    for fiber in marker_fiber_layout(stroke_width) {
-        paint_marker_fiber(image, &mask, bounds, points, color, fiber);
-    }
-}
-
-fn paint_marker_trace(image: &mut RgbaImage, mask: &[bool], bounds: PixelRect, color: Color) {
-    let base_alpha = color.a.min(72) as f32;
-    let fill = Rgba([color.r, color.g, color.b, (base_alpha * 0.34).round() as u8]);
-    let edge = Rgba([color.r, color.g, color.b, (base_alpha * 0.68).round() as u8]);
+    // A clean translucent highlighter band: paint every masked pixel exactly once
+    // with a single alpha, so overlapping passes within one stroke never compound
+    // and there are no fibers or dashes.
+    let band = Rgba([color.r, color.g, color.b, color.a.min(MARKER_HIGHLIGHT_ALPHA)]);
     for y in 0..bounds.height {
         for x in 0..bounds.width {
             let idx = y as usize * bounds.width as usize + x as usize;
             if !mask.get(idx).copied().unwrap_or(false) {
                 continue;
             }
-            let source = if marker_mask_pixel_is_edge(mask, bounds.width, bounds.height, x, y) {
-                edge
-            } else {
-                fill
-            };
             if let Some(pixel) = image.get_pixel_mut_checked(bounds.x + x, bounds.y + y) {
-                blend_pixel(pixel, source);
-            }
-        }
-    }
-}
-
-fn marker_mask_pixel_is_edge(mask: &[bool], width: u32, height: u32, x: u32, y: u32) -> bool {
-    for dy in -1..=1 {
-        for dx in -1..=1 {
-            if dx == 0 && dy == 0 {
-                continue;
-            }
-            let nx = x as i32 + dx;
-            let ny = y as i32 + dy;
-            if nx < 0 || ny < 0 || nx as u32 >= width || ny as u32 >= height {
-                return true;
-            }
-            let idx = ny as usize * width as usize + nx as usize;
-            if !mask.get(idx).copied().unwrap_or(false) {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-fn paint_marker_fiber(
-    image: &mut RgbaImage,
-    mask: &[bool],
-    bounds: PixelRect,
-    points: &[Point],
-    color: Color,
-    fiber: MarkerFiber,
-) {
-    let alpha = color.a.min(72).saturating_add((fiber.opacity as f32 * 0.22).round() as u8);
-    let rgba = Rgba([color.r, color.g, color.b, alpha.min(112)]);
-    let radius = (fiber.stroke_width * 0.5).ceil().max(1.0) as i32;
-    let cycle = (fiber.dash + fiber.gap).max(1.0);
-    let dash_offset = fiber.phase * cycle;
-    let mut total_distance = 0.0;
-    let mut fiber_mask = vec![false; bounds.width as usize * bounds.height as usize];
-
-    for window in points.windows(2) {
-        let start = window[0];
-        let end = window[1];
-        let dx = end.x - start.x;
-        let dy = end.y - start.y;
-        let length = (dx * dx + dy * dy).sqrt();
-        if length <= f32::EPSILON {
-            continue;
-        }
-        let normal_x = -dy / length;
-        let normal_y = dx / length;
-        let offset_start =
-            Point::new(start.x + normal_x * fiber.offset, start.y + normal_y * fiber.offset);
-        let offset_end =
-            Point::new(end.x + normal_x * fiber.offset, end.y + normal_y * fiber.offset);
-        let steps = length.ceil().max(1.0) as i32;
-
-        for step in 0..=steps {
-            let t = step as f32 / steps as f32;
-            let distance = total_distance + length * t;
-            if (distance + dash_offset).rem_euclid(cycle) > fiber.dash {
-                continue;
-            }
-            let x = offset_start.x + (offset_end.x - offset_start.x) * t;
-            let y = offset_start.y + (offset_end.y - offset_start.y) * t;
-            mark_marker_fiber_circle(
-                &mut fiber_mask,
-                bounds,
-                x.round() as i32,
-                y.round() as i32,
-                radius,
-            );
-        }
-
-        total_distance += length;
-    }
-
-    for y in 0..bounds.height {
-        for x in 0..bounds.width {
-            let idx = y as usize * bounds.width as usize + x as usize;
-            if !fiber_mask.get(idx).copied().unwrap_or(false)
-                || !mask.get(idx).copied().unwrap_or(false)
-            {
-                continue;
-            }
-            if let Some(pixel) = image.get_pixel_mut_checked(bounds.x + x, bounds.y + y) {
-                blend_pixel(pixel, rgba);
-            }
-        }
-    }
-}
-
-fn mark_marker_fiber_circle(
-    fiber_mask: &mut [bool],
-    bounds: PixelRect,
-    center_x: i32,
-    center_y: i32,
-    radius: i32,
-) {
-    for dy in -radius..=radius {
-        for dx in -radius..=radius {
-            if dx * dx + dy * dy > radius * radius {
-                continue;
-            }
-            let x = center_x + dx;
-            let y = center_y + dy;
-            if x < bounds.x as i32
-                || y < bounds.y as i32
-                || x >= (bounds.x + bounds.width) as i32
-                || y >= (bounds.y + bounds.height) as i32
-            {
-                continue;
-            }
-            let local_x = x - bounds.x as i32;
-            let local_y = y - bounds.y as i32;
-            let idx = local_y as usize * bounds.width as usize + local_x as usize;
-            if let Some(cell) = fiber_mask.get_mut(idx) {
-                *cell = true;
+                blend_pixel(pixel, band);
             }
         }
     }
@@ -1164,6 +1060,103 @@ fn pixelate_region(image: &mut RgbaImage, rect: Rect, pixel_size: u32) {
     }
 }
 
+/// Pixelates along a painted brush stroke: marks the thick stroke into a
+/// region-local mask, then for each pixel block the stroke touches, replaces the
+/// masked pixels with the block average. The mosaic therefore follows the brush
+/// outline instead of a rectangle.
+fn pixelate_along_brush_path(
+    image: &mut RgbaImage,
+    points: &[Point],
+    pixel_size: u32,
+    stroke_width: u32,
+) {
+    if points.is_empty() || image.width() == 0 || image.height() == 0 {
+        return;
+    }
+    let block = pixel_size.max(1);
+    let pad = stroke_width.max(1) as f32 / 2.0 + 1.0;
+    let min_x = points.iter().map(|point| point.x).fold(f32::INFINITY, f32::min) - pad;
+    let min_y = points.iter().map(|point| point.y).fold(f32::INFINITY, f32::min) - pad;
+    let max_x = points.iter().map(|point| point.x).fold(f32::NEG_INFINITY, f32::max) + pad;
+    let max_y = points.iter().map(|point| point.y).fold(f32::NEG_INFINITY, f32::max) + pad;
+    let start_x = min_x.max(0.0).floor() as u32;
+    let start_y = min_y.max(0.0).floor() as u32;
+    let end_x = max_x.min(image.width() as f32).ceil() as u32;
+    let end_y = max_y.min(image.height() as f32).ceil() as u32;
+    if end_x <= start_x || end_y <= start_y {
+        return;
+    }
+    let region_w = (end_x - start_x) as usize;
+    let mask_idx = |x: u32, y: u32| (y - start_y) as usize * region_w + (x - start_x) as usize;
+
+    let mut mask = vec![false; region_w * (end_y - start_y) as usize];
+    if points.len() == 1 {
+        mark_thick_line(
+            &mut mask,
+            end_x - start_x,
+            end_y - start_y,
+            start_x as i32,
+            start_y as i32,
+            points[0],
+            points[0],
+            stroke_width,
+        );
+    } else {
+        for window in points.windows(2) {
+            mark_thick_line(
+                &mut mask,
+                end_x - start_x,
+                end_y - start_y,
+                start_x as i32,
+                start_y as i32,
+                window[0],
+                window[1],
+                stroke_width,
+            );
+        }
+    }
+
+    let mut y = start_y;
+    while y < end_y {
+        let mut x = start_x;
+        while x < end_x {
+            let x_limit = (x + block).min(end_x);
+            let y_limit = (y + block).min(end_y);
+            let touches = (y..y_limit).any(|yy| (x..x_limit).any(|xx| mask[mask_idx(xx, yy)]));
+            if touches {
+                let mut total = [0u32; 4];
+                let mut count = 0u32;
+                for yy in y..y_limit {
+                    for xx in x..x_limit {
+                        let pixel = image.get_pixel(xx, yy);
+                        total[0] += pixel[0] as u32;
+                        total[1] += pixel[1] as u32;
+                        total[2] += pixel[2] as u32;
+                        total[3] += pixel[3] as u32;
+                        count += 1;
+                    }
+                }
+                let count = count.max(1);
+                let average = Rgba([
+                    (total[0] / count).min(u8::MAX as u32) as u8,
+                    (total[1] / count).min(u8::MAX as u32) as u8,
+                    (total[2] / count).min(u8::MAX as u32) as u8,
+                    (total[3] / count).min(u8::MAX as u32) as u8,
+                ]);
+                for yy in y..y_limit {
+                    for xx in x..x_limit {
+                        if mask[mask_idx(xx, yy)] {
+                            image.put_pixel(xx, yy, average);
+                        }
+                    }
+                }
+            }
+            x += block;
+        }
+        y += block;
+    }
+}
+
 fn blur_region(image: &mut RgbaImage, rect: Rect, radius: u32) {
     let radius = radius.max(1) as usize;
     let start_x = rect.x.max(0.0).floor() as u32;
@@ -1356,6 +1349,30 @@ mod tests {
     }
 
     #[test]
+    fn export_pixelates_along_a_brush_stroke() {
+        let mut base = DynamicImage::new_rgba8(20, 20).to_rgba8();
+        for y in 0..20 {
+            for x in 0..20 {
+                base.put_pixel(x, y, Rgba([(x * 12) as u8, (y * 12) as u8, 0, 255]));
+            }
+        }
+        let base = DynamicImage::ImageRgba8(base);
+        let original = base.to_rgba8();
+        let annotations = vec![Annotation::new(AnnotationData::MosaicBrush {
+            points: vec![Point::new(3.0, 10.0), Point::new(17.0, 10.0)],
+            pixel_size: 4,
+            stroke_width: 6,
+        })];
+
+        let rendered = render_document(&base, &annotations);
+        // A pixel under the stroke is pixelated; a corner far from the stroke is
+        // left untouched (the mosaic follows the brush, not a rectangle).
+        assert_ne!(rendered.get_pixel(10, 10), original.get_pixel(10, 10));
+        assert_eq!(rendered.get_pixel(0, 0), original.get_pixel(0, 0));
+        assert_eq!(rendered.get_pixel(19, 0), original.get_pixel(19, 0));
+    }
+
+    #[test]
     fn export_renders_flameshot_style_tools() {
         let base = DynamicImage::new_rgba8(96, 96);
         let annotations = vec![
@@ -1411,7 +1428,7 @@ mod tests {
     }
 
     #[test]
-    fn marker_export_draws_same_color_fibers_inside_marker_trace() {
+    fn marker_export_draws_a_flat_translucent_band() {
         let base = RgbaImage::from_pixel(96, 32, Rgba([255, 255, 255, 255]));
         let annotations = vec![Annotation::new(AnnotationData::Marker {
             points: vec![Point::new(8.0, 16.0), Point::new(88.0, 16.0)],
@@ -1425,23 +1442,24 @@ mod tests {
             .filter(|pixel| **pixel != Rgba([255, 255, 255, 255]))
             .collect::<Vec<_>>();
 
-        assert!(!changed.is_empty(), "marker should render visible fiber strokes on white");
+        assert!(!changed.is_empty(), "marker should render a visible band on white");
         assert!(
             changed.iter().all(|pixel| pixel[0] >= pixel[1] && pixel[0] >= pixel[2]),
-            "all marker fiber lines should use the selected marker hue"
+            "the band should use the selected marker hue"
+        );
+        // The clean highlighter is a single flat alpha (no fibers/dashes), so over a
+        // uniform background every painted pixel is exactly the same colour.
+        let band_color = *changed[0];
+        assert!(
+            changed.iter().all(|pixel| **pixel == band_color),
+            "the highlighter band should be one flat translucent colour"
         );
         let center = rendered.get_pixel(48, 16);
-        assert_ne!(
-            center,
-            &Rgba([255, 255, 255, 255]),
-            "marker center should show the original marker stroke trace"
-        );
-        let edge = rendered.get_pixel(48, 7);
-        assert_ne!(edge, &Rgba([255, 255, 255, 255]), "marker edge should show a visible boundary");
+        assert_ne!(center, &Rgba([255, 255, 255, 255]), "the band centre should be painted");
         assert_eq!(
             rendered.get_pixel(48, 2),
             &Rgba([255, 255, 255, 255]),
-            "fibers should not render outside the marker stroke area"
+            "nothing should render outside the marker band"
         );
     }
 

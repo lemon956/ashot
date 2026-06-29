@@ -16,11 +16,11 @@ use anyhow::{Context, Result};
 use ashot_capture::{CaptureClient, CaptureError};
 use ashot_core::{
     Annotation, AnnotationData, AppConfig, AppearanceMode, Color, DefaultTool, Document,
-    EditorHistory, ExportFormat, LinuxDistroFamily, OcrBackend, Point, Rect, ResizeHandle,
-    TextStyle, TextWeight, default_ocr_languages, detect_linux_distro_family,
-    finalize_capture_with_config, language_install_command, language_package_for_distro,
-    marker_fiber_layout, marker_highlight_color, marker_visual_stroke_width, render_filename,
-    search_ocr_languages,
+    EditorHistory, ExportFormat, LinuxDistroFamily, MARKER_HIGHLIGHT_ALPHA, OcrBackend, Point,
+    Rect, TextStyle, TextWeight, counter_radius_for_size, default_ocr_languages,
+    detect_linux_distro_family, finalize_capture_with_config, language_install_command,
+    language_package_for_distro, marker_highlight_color, marker_visual_stroke_width,
+    render_filename, search_ocr_languages,
 };
 use ashot_ipc::{
     APP_ID, CaptureMode, CaptureOutcome, CommandOutcome, DBUS_NAME, DBUS_PATH, OutcomeKind,
@@ -61,8 +61,6 @@ use std::io::Cursor;
 
 const EDITOR_HISTORY_LIMIT: usize = 64;
 const COLOR_ROW_LIMIT: usize = 6;
-const SELECTION_HANDLE_RADIUS: f64 = 6.4;
-const SELECTION_HANDLE_HIT_TOLERANCE: f32 = 13.0;
 const SIDEBAR_TOOL_BUTTON_WIDTH: i32 = 42;
 const SIDEBAR_TOOL_BUTTON_HEIGHT: i32 = 34;
 const SIDEBAR_ACTION_BUTTON_WIDTH: i32 = 40;
@@ -102,6 +100,8 @@ type ColorCallback = Rc<dyn Fn(Color)>;
 type ColorMemoryButtons = Rc<RefCell<Vec<(Rc<Cell<Color>>, DrawingArea, Button)>>>;
 type StatusCallback = Rc<dyn Fn(Option<String>)>;
 type ToastCallback = Rc<dyn Fn(&str)>;
+/// Deferred callback that greys the side-panel setting controls for the active tool.
+type ToolUiRefresh = Rc<RefCell<Option<Rc<dyn Fn(DefaultTool)>>>>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum AppStartupMode {
@@ -1653,7 +1653,6 @@ fn present_editor(
     info!("present_editor history created");
     let draft = Rc::new(RefCell::new(None::<DraftAnnotation>));
     let moving = Rc::new(RefCell::new(None::<Point>));
-    let resizing = Rc::new(RefCell::new(None::<ResizeHandle>));
     // Select-tool drag on empty canvas pans the view (hand tool).
     let panning = Rc::new(Cell::new(false));
     let brush_cursor_preview = Rc::new(Cell::new(None::<Point>));
@@ -2083,6 +2082,9 @@ fn present_editor(
     tool_grid.set_row_spacing(5);
     tool_grid.set_column_spacing(5);
     let tool_buttons = Rc::new(RefCell::new(Vec::<(DefaultTool, Button)>::new()));
+    // Populated once the side-panel setting controls exist (further below); invoked
+    // on every tool change to grey out the controls the active tool doesn't use.
+    let tool_ui_refresh: ToolUiRefresh = Rc::new(RefCell::new(None));
     for (index, (label, tool)) in editor_tool_layout().iter().enumerate() {
         let button = Button::new();
         let icon = tool_icon_area(*tool);
@@ -2098,6 +2100,7 @@ fn present_editor(
         let canvas_for_tool = canvas.clone();
         let state_for_tool = state.clone();
         let refresh_status_for_tool = refresh_status.clone();
+        let tool_ui_refresh_for_click = tool_ui_refresh.clone();
         let tool = *tool;
         button.connect_clicked(move |_| {
             if let Ok(mut document) = document.try_borrow_mut() {
@@ -2105,6 +2108,9 @@ fn present_editor(
             }
             update_tool_button_selection(&tool_buttons_for_click, tool);
             apply_editor_cursor(&canvas_for_tool, tool);
+            if let Some(refresh) = tool_ui_refresh_for_click.borrow().as_ref() {
+                refresh(tool);
+            }
             persist_config_change(&state_for_tool, |config| {
                 config.default_tool = tool;
             });
@@ -2206,12 +2212,16 @@ fn present_editor(
     let canvas_for_ocr_button = canvas.clone();
     let state_for_ocr_button = state.clone();
     let refresh_status_for_ocr = refresh_status.clone();
+    let tool_ui_refresh_for_ocr = tool_ui_refresh.clone();
     ocr_tool_button.connect_clicked(move |_| {
         if let Ok(mut document) = document_for_ocr_button.try_borrow_mut() {
             document.active_tool = DefaultTool::Ocr;
         }
         update_tool_button_selection(&tool_buttons_for_ocr, DefaultTool::Ocr);
         apply_editor_cursor(&canvas_for_ocr_button, DefaultTool::Ocr);
+        if let Some(refresh) = tool_ui_refresh_for_ocr.borrow().as_ref() {
+            refresh(DefaultTool::Ocr);
+        }
         persist_config_change(&state_for_ocr_button, |config| {
             config.default_tool = DefaultTool::Ocr;
         });
@@ -2242,7 +2252,7 @@ fn present_editor(
     let stroke_previews = Rc::new(RefCell::new(Vec::<DrawingArea>::new()));
     let color_ui_refresh = Rc::new(RefCell::new(None::<ColorCallback>));
     let recent_color_recorder = Rc::new(RefCell::new(None::<ColorCallback>));
-    let color_picker = color_picker_section(
+    let (color_picker, color_setting_controls) = color_picker_section(
         active_color.clone(),
         stroke_previews.clone(),
         document.clone(),
@@ -2259,6 +2269,7 @@ fn present_editor(
         queue_render_cache.clone(),
         active_magnifier_enabled.clone(),
         active_magnifier_zoom.clone(),
+        tool_ui_refresh.clone(),
     );
     left_panel.append(&color_picker);
     info!("present_editor color section added");
@@ -2310,6 +2321,24 @@ fn present_editor(
     text_controls.append(&text_size_menu);
     left_panel.append(&text_controls);
     info!("present_editor text font section added");
+
+    // Grey out the setting controls the active tool doesn't use. Stored so every
+    // tool-change path can refresh it; applied once now for the initial tool.
+    let refresh_tool_controls: Rc<dyn Fn(DefaultTool)> = {
+        let stroke_menu = stroke_menu.clone();
+        let text_controls = text_controls.clone();
+        Rc::new(move |tool: DefaultTool| {
+            for control in &color_setting_controls {
+                control.set_sensitive(tool_uses_color(tool));
+            }
+            stroke_menu.set_sensitive(tool_uses_size(tool));
+            text_controls.set_sensitive(tool_uses_text(tool));
+        })
+    };
+    if let Ok(document) = document.try_borrow() {
+        refresh_tool_controls(document.active_tool);
+    }
+    *tool_ui_refresh.borrow_mut() = Some(refresh_tool_controls);
 
     let left_scrolled = ScrolledWindow::builder()
         .hscrollbar_policy(PolicyType::Never)
@@ -2382,16 +2411,25 @@ fn present_editor(
         cr.set_line_cap(gtk::cairo::LineCap::Round);
         // Committed annotations are already baked into the display surface above
         // (the real export pixels); only the live overlays are drawn here.
-        if let Ok(document) = doc_for_draw.try_borrow()
-            && let Some(bounds) = selected_annotation_bounds(&document)
-        {
-            let handles = selected_resize_handle_points(&document).unwrap_or_default();
-            draw_selection_overlay(cr, bounds, &handles);
+        // Selection has no visual indicator by design; it stays purely functional
+        // (move / delete / recolour / resize-via-sidebar).
+        //
+        // The committed highlighter bands live in the display surface (= export);
+        // overlay only the animated gloss on top so the marker stays "alive" while
+        // what you see still equals what you save.
+        if let Ok(document) = doc_for_draw.try_borrow() {
+            for annotation in &document.annotations {
+                if let AnnotationData::Marker { points, stroke_width, .. } = &annotation.data {
+                    draw_marker_sheen(cr, points, *stroke_width, marker_animation_time);
+                }
+            }
         }
         if let Some(annotation) = draft_preview_for_draw(&draft_for_draw) {
             if matches!(
                 annotation.data,
-                AnnotationData::Mosaic { .. } | AnnotationData::Blur { .. }
+                AnnotationData::Mosaic { .. }
+                    | AnnotationData::MosaicBrush { .. }
+                    | AnnotationData::Blur { .. }
             ) {
                 draw_effect_draft_preview(
                     cr,
@@ -2405,16 +2443,25 @@ fn present_editor(
             }
         }
         if let Ok(document) = doc_for_draw.try_borrow()
-            && matches!(document.active_tool, DefaultTool::Brush | DefaultTool::Marker)
+            && matches!(
+                document.active_tool,
+                DefaultTool::Brush | DefaultTool::Marker | DefaultTool::Mosaic
+            )
             && draft_for_draw.try_borrow().is_ok_and(|draft| draft.is_none())
             && let Some(point) = brush_cursor_for_draw.get()
         {
-            let cursor_width = if document.active_tool == DefaultTool::Marker {
-                marker_visual_stroke_width(active_stroke_for_draw.get())
-            } else {
-                active_stroke_for_draw.get()
+            let stroke = active_stroke_for_draw.get();
+            let (cursor_width, cursor_color) = match document.active_tool {
+                DefaultTool::Marker => {
+                    (marker_visual_stroke_width(stroke), active_color_for_draw.get())
+                }
+                // Mosaic has no color; show its brush footprint with a neutral ring.
+                DefaultTool::Mosaic => {
+                    (mosaic_brush_stroke_width(stroke), Color { r: 130, g: 130, b: 130, a: 255 })
+                }
+                _ => (stroke, active_color_for_draw.get()),
             };
-            draw_brush_cursor_preview(cr, point, active_color_for_draw.get(), cursor_width);
+            draw_brush_cursor_preview(cr, point, cursor_color, cursor_width);
         }
         let _ = cr.restore();
         if let Ok(document) = doc_for_draw.try_borrow()
@@ -2446,6 +2493,7 @@ fn present_editor(
     let image_for_click = base_image.clone();
     let canvas_for_click = canvas.clone();
     let color_for_click = active_color.clone();
+    let stroke_for_click = active_stroke.clone();
     let color_ui_refresh_for_click = color_ui_refresh.clone();
     let recent_for_click = recent_color_recorder.clone();
     let text_family_for_click = active_text_family.clone();
@@ -2514,7 +2562,7 @@ fn present_editor(
                     center: point,
                     number,
                     color: color_for_click.get(),
-                    radius: 12,
+                    radius: counter_radius_for_size(stroke_for_click.get()),
                 }));
                 true
             } else {
@@ -2569,8 +2617,6 @@ fn present_editor(
             apply_canvas_hover_cursor(
                 &canvas_for_motion,
                 &document,
-                point,
-                SELECTION_HANDLE_HIT_TOLERANCE / (scale_for_motion.get().max(0.1) as f32),
                 editor_view_is_pannable(&scrolled_for_motion),
             );
         }
@@ -2644,7 +2690,6 @@ fn present_editor(
     let doc_for_drag = document.clone();
     let draft_for_drag = draft.clone();
     let moving_for_drag = moving.clone();
-    let resizing_for_drag = resizing.clone();
     let panning_for_drag = panning.clone();
     let history_for_drag = history.clone();
     let color_for_drag = active_color.clone();
@@ -2657,17 +2702,11 @@ fn present_editor(
     let redo_for_drag = redo.clone();
     drag.connect_drag_begin(move |_, x, y| {
         let point = scaled_canvas_point(x, y, scale_for_drag.get());
-        let Some((annotations, tool, resize_handle)) = ({
+        let Some((annotations, tool)) = ({
             let Ok(document) = doc_for_drag.try_borrow() else {
                 return;
             };
-            let handle_tolerance =
-                SELECTION_HANDLE_HIT_TOLERANCE / (scale_for_drag.get().max(0.1) as f32);
-            Some((
-                document.annotations.clone(),
-                document.active_tool,
-                resize_handle_at(&document, point, handle_tolerance),
-            ))
+            Some((document.annotations.clone(), document.active_tool))
         }) else {
             return;
         };
@@ -2693,17 +2732,6 @@ fn present_editor(
         }
 
         if tool_can_select_existing(tool) {
-            if let Some(handle) = resize_handle {
-                if let Ok(mut history) = history_for_drag.try_borrow_mut() {
-                    history.snapshot(&annotations);
-                }
-                update_history_action_buttons(&history_for_drag, &undo_for_drag, &redo_for_drag);
-                if let Ok(mut resizing) = resizing_for_drag.try_borrow_mut() {
-                    *resizing = Some(handle);
-                }
-                return;
-            }
-
             let selected = doc_for_drag
                 .try_borrow_mut()
                 .ok()
@@ -2745,7 +2773,6 @@ fn present_editor(
     let doc_for_update = document.clone();
     let draft_for_update = draft.clone();
     let moving_for_update = moving.clone();
-    let resizing_for_update = resizing.clone();
     let panning_for_update = panning.clone();
     let scrolled_for_update = scrolled.clone();
     let canvas_for_update = canvas.clone();
@@ -2763,15 +2790,6 @@ fn present_editor(
         }
         let (start_x, start_y) = gesture.start_point().unwrap_or((0.0, 0.0));
         let current = scaled_canvas_point(start_x + dx, start_y + dy, scale_for_update.get());
-        let resize_handle = resizing_for_update.try_borrow().ok().and_then(|handle| *handle);
-        if let Some(handle) = resize_handle {
-            if let Ok(mut document) = doc_for_update.try_borrow_mut() {
-                document.resize_selected(handle, current);
-            }
-            canvas_for_update.queue_draw();
-            return;
-        }
-
         if let Some((delta_x, delta_y)) = moving_delta_and_update(&moving_for_update, current) {
             if let Ok(mut document) = doc_for_update.try_borrow_mut() {
                 document.move_selected(delta_x, delta_y);
@@ -2798,7 +2816,6 @@ fn present_editor(
     let doc_for_end = document.clone();
     let draft_for_end = draft.clone();
     let moving_for_end = moving.clone();
-    let resizing_for_end = resizing.clone();
     let panning_for_end = panning.clone();
     let canvas_for_end = canvas.clone();
     let state_for_ocr = state.clone();
@@ -2820,17 +2837,12 @@ fn present_editor(
             return;
         }
         let was_moving = moving_for_end.try_borrow().ok().and_then(|moving| *moving).is_some();
-        let was_resizing =
-            resizing_for_end.try_borrow().ok().and_then(|resizing| *resizing).is_some();
         if let Ok(mut moving) = moving_for_end.try_borrow_mut() {
             *moving = None;
         }
-        if let Ok(mut resizing) = resizing_for_end.try_borrow_mut() {
-            *resizing = None;
-        }
         let draft = draft_for_end.try_borrow_mut().ok().and_then(|mut draft| draft.take());
         let Some(draft) = draft else {
-            if was_moving || was_resizing {
+            if was_moving {
                 queue_render_cache_for_end();
             }
             canvas_for_end.queue_draw();
@@ -2930,12 +2942,16 @@ fn present_editor(
         let canvas = canvas.clone();
         let state = state.clone();
         let refresh_status = refresh_status.clone();
+        let tool_ui_refresh = tool_ui_refresh.clone();
         Rc::new(move |tool: DefaultTool| {
             if let Ok(mut document) = document.try_borrow_mut() {
                 document.active_tool = tool;
             }
             update_tool_button_selection(&tool_buttons, tool);
             apply_editor_cursor(&canvas, tool);
+            if let Some(refresh) = tool_ui_refresh.borrow().as_ref() {
+                refresh(tool);
+            }
             persist_config_change(&state, |config| {
                 config.default_tool = tool;
             });
@@ -5841,7 +5857,8 @@ fn color_picker_section(
     queue_render_cache: Rc<dyn Fn()>,
     active_magnifier_enabled: Rc<Cell<bool>>,
     active_magnifier_zoom: Rc<Cell<f64>>,
-) -> GtkBox {
+    tool_ui_refresh: ToolUiRefresh,
+) -> (GtkBox, Vec<gtk::Widget>) {
     let container = GtkBox::new(Orientation::Vertical, 5);
     container.add_css_class("ashot-color-section");
     let header = GtkBox::new(Orientation::Horizontal, 5);
@@ -5862,12 +5879,16 @@ fn color_picker_section(
     let canvas_for_pick = canvas.clone();
     let state_for_pick = state.clone();
     let refresh_status_for_pick = refresh_status.clone();
+    let tool_ui_refresh_for_pick = tool_ui_refresh.clone();
     eyedropper_button.connect_clicked(move |_| {
         if let Ok(mut document) = document_for_pick.try_borrow_mut() {
             document.active_tool = DefaultTool::ColorPicker;
         }
         update_tool_button_selection(&tool_buttons_for_pick, DefaultTool::ColorPicker);
         apply_editor_cursor(&canvas_for_pick, DefaultTool::ColorPicker);
+        if let Some(refresh) = tool_ui_refresh_for_pick.borrow().as_ref() {
+            refresh(DefaultTool::ColorPicker);
+        }
         persist_config_change(&state_for_pick, |config| {
             config.default_tool = DefaultTool::ColorPicker;
         });
@@ -6427,7 +6448,11 @@ fn color_picker_section(
     menu_button.connect_clicked(move |_| {
         popover_for_click.popup();
     });
-    container
+    // The color swatch + value/picker button are the toggle-able "color setting"
+    // controls; the eyedropper button is a tool selector and stays enabled.
+    let color_setting_controls: Vec<gtk::Widget> =
+        vec![header_preview.upcast::<gtk::Widget>(), menu_button.upcast::<gtk::Widget>()];
+    (container, color_setting_controls)
 }
 
 fn text_font_label(family: Option<&str>) -> String {
@@ -7065,6 +7090,23 @@ fn editor_cursor_kind_for_tool(tool: DefaultTool) -> EditorCursorKind {
     }
 }
 
+/// Whether the active tool draws something colored, so the color controls apply.
+/// Effect tools (mosaic/blur) and region-only tools (ocr) have no color.
+fn tool_uses_color(tool: DefaultTool) -> bool {
+    !matches!(tool, DefaultTool::Mosaic | DefaultTool::Blur | DefaultTool::Ocr)
+}
+
+/// Whether the active tool uses the shared stroke-width / effect-strength dropdown.
+/// Text has its own size control; ocr/color-picker have no size.
+fn tool_uses_size(tool: DefaultTool) -> bool {
+    !matches!(tool, DefaultTool::Text | DefaultTool::Ocr | DefaultTool::ColorPicker)
+}
+
+/// Whether the active tool uses the text font/size controls.
+fn tool_uses_text(tool: DefaultTool) -> bool {
+    matches!(tool, DefaultTool::Select | DefaultTool::Text)
+}
+
 #[cfg(test)]
 fn editor_cursor_for_tool(tool: DefaultTool) -> Option<&'static str> {
     match editor_cursor_kind_for_tool(tool) {
@@ -7087,26 +7129,14 @@ fn apply_editor_cursor(canvas: &DrawingArea, tool: DefaultTool) {
     }
 }
 
-fn apply_canvas_hover_cursor(
-    canvas: &DrawingArea,
-    document: &Document,
-    point: Point,
-    tolerance: f32,
-    pannable: bool,
-) {
+fn apply_canvas_hover_cursor(canvas: &DrawingArea, document: &Document, pannable: bool) {
     if document.active_tool != DefaultTool::Select {
         apply_editor_cursor(canvas, document.active_tool);
         return;
     }
-    if let Some(handle) = resize_handle_at(document, point, tolerance) {
-        canvas.set_cursor_from_name(Some(cursor_name_for_resize_handle(handle)));
-        return;
-    }
-    if selected_annotation_bounds(document).is_some_and(|bounds| bounds.contains(point)) {
-        canvas.set_cursor_from_name(Some("move"));
-    } else if pannable {
-        // Over empty canvas with content larger than the viewport: hint that
-        // dragging will pan the view.
+    // Selection is invisible by design, so the Select tool gives no per-annotation
+    // cursor feedback; only hint that an empty-canvas drag will pan the view.
+    if pannable {
         canvas.set_cursor_from_name(Some("grab"));
     } else {
         canvas.set_cursor(None);
@@ -7121,15 +7151,6 @@ fn editor_view_is_pannable(scrolled: &ScrolledWindow) -> bool {
     let vadjustment = scrolled.vadjustment();
     hadjustment.upper() - hadjustment.page_size() > 1.0
         || vadjustment.upper() - vadjustment.page_size() > 1.0
-}
-
-fn cursor_name_for_resize_handle(handle: ResizeHandle) -> &'static str {
-    match handle {
-        ResizeHandle::TopLeft | ResizeHandle::BottomRight => "nwse-resize",
-        ResizeHandle::TopRight | ResizeHandle::BottomLeft => "nesw-resize",
-        ResizeHandle::Top | ResizeHandle::Bottom => "ns-resize",
-        ResizeHandle::Left | ResizeHandle::Right => "ew-resize",
-    }
 }
 
 fn editor_eyedropper_cursor() -> gtk::gdk::Cursor {
@@ -7229,21 +7250,6 @@ fn tool_picks_canvas_color(tool: DefaultTool) -> bool {
     tool == DefaultTool::ColorPicker
 }
 
-fn annotation_shows_selection_overlay(annotation: &Annotation) -> bool {
-    matches!(
-        annotation.data,
-        AnnotationData::Text { .. }
-            | AnnotationData::Line { .. }
-            | AnnotationData::Arrow { .. }
-            | AnnotationData::Rectangle { .. }
-            | AnnotationData::Ellipse { .. }
-            | AnnotationData::Mosaic { .. }
-            | AnnotationData::Blur { .. }
-            | AnnotationData::Counter { .. }
-            | AnnotationData::FilledBox { .. }
-    )
-}
-
 fn annotation_has_resize_handles(annotation: &Annotation) -> bool {
     matches!(
         annotation.data,
@@ -7260,107 +7266,6 @@ fn annotation_has_resize_handles(annotation: &Annotation) -> bool {
 
 fn annotation_keeps_selection_after_creation(annotation: &Annotation) -> bool {
     annotation_has_resize_handles(annotation)
-}
-
-fn selected_annotation_bounds(document: &Document) -> Option<Rect> {
-    let id = document.selected?;
-    document
-        .annotations
-        .iter()
-        .find(|annotation| annotation.id == id && annotation_shows_selection_overlay(annotation))
-        .map(Annotation::bounds)
-}
-
-fn resize_handle_points(rect: Rect) -> [(ResizeHandle, Point); 8] {
-    let left = rect.x;
-    let center_x = rect.x + rect.width * 0.5;
-    let right = rect.x + rect.width;
-    let top = rect.y;
-    let center_y = rect.y + rect.height * 0.5;
-    let bottom = rect.y + rect.height;
-    [
-        (ResizeHandle::TopLeft, Point::new(left, top)),
-        (ResizeHandle::Top, Point::new(center_x, top)),
-        (ResizeHandle::TopRight, Point::new(right, top)),
-        (ResizeHandle::Right, Point::new(right, center_y)),
-        (ResizeHandle::BottomRight, Point::new(right, bottom)),
-        (ResizeHandle::Bottom, Point::new(center_x, bottom)),
-        (ResizeHandle::BottomLeft, Point::new(left, bottom)),
-        (ResizeHandle::Left, Point::new(left, center_y)),
-    ]
-}
-
-fn resize_handle_points_for_annotation(annotation: &Annotation) -> Vec<(ResizeHandle, Point)> {
-    match annotation.data {
-        AnnotationData::Line { start, end, .. } | AnnotationData::Arrow { start, end, .. } => {
-            vec![(ResizeHandle::Left, start), (ResizeHandle::Right, end)]
-        }
-        AnnotationData::Rectangle { rect, .. }
-        | AnnotationData::Ellipse { rect, .. }
-        | AnnotationData::Mosaic { rect, .. }
-        | AnnotationData::Blur { rect, .. }
-        | AnnotationData::FilledBox { rect, .. } => resize_handle_points(rect).to_vec(),
-        AnnotationData::Counter { center, radius, .. } => {
-            let diameter = radius as f32 * 2.0;
-            resize_handle_points(Rect {
-                x: center.x - radius as f32,
-                y: center.y - radius as f32,
-                width: diameter,
-                height: diameter,
-            })
-            .to_vec()
-        }
-        AnnotationData::Text { .. }
-        | AnnotationData::Brush { .. }
-        | AnnotationData::Marker { .. } => Vec::new(),
-    }
-}
-
-fn selected_resize_handle_points(document: &Document) -> Option<Vec<(ResizeHandle, Point)>> {
-    let id = document.selected?;
-    document
-        .annotations
-        .iter()
-        .find(|annotation| annotation.id == id && annotation_has_resize_handles(annotation))
-        .map(resize_handle_points_for_annotation)
-}
-
-fn resize_handle_at(document: &Document, point: Point, tolerance: f32) -> Option<ResizeHandle> {
-    let handles = selected_resize_handle_points(document)?;
-    handles.iter().find_map(|(handle, center)| {
-        let dx = point.x - center.x;
-        let dy = point.y - center.y;
-        ((dx * dx + dy * dy).sqrt() <= tolerance).then_some(*handle)
-    })
-}
-
-fn draw_selection_overlay(cr: &gtk::cairo::Context, rect: Rect, handles: &[(ResizeHandle, Point)]) {
-    let _ = cr.save();
-    cr.set_source_rgba(0.13, 0.48, 0.95, 0.88);
-    cr.set_line_width(1.4);
-    cr.rectangle(rect.x as f64, rect.y as f64, rect.width as f64, rect.height as f64);
-    let _ = cr.stroke();
-
-    if handles.is_empty() {
-        let _ = cr.restore();
-        return;
-    }
-
-    for (_, center) in handles {
-        cr.set_source_rgba(1.0, 1.0, 1.0, 0.96);
-        cr.arc(
-            center.x as f64,
-            center.y as f64,
-            SELECTION_HANDLE_RADIUS,
-            0.0,
-            std::f64::consts::TAU,
-        );
-        let _ = cr.fill_preserve();
-        cr.set_source_rgba(0.13, 0.48, 0.95, 0.95);
-        cr.set_line_width(1.4);
-        let _ = cr.stroke();
-    }
-    let _ = cr.restore();
 }
 
 #[derive(Debug, Clone)]
@@ -7494,7 +7399,7 @@ impl DraftAnnotation {
     }
 
     fn extend(&mut self, point: Point) {
-        if matches!(self.tool, DefaultTool::Brush | DefaultTool::Marker) {
+        if matches!(self.tool, DefaultTool::Brush | DefaultTool::Marker | DefaultTool::Mosaic) {
             self.points.push(point);
         } else {
             self.points.truncate(1);
@@ -7548,9 +7453,10 @@ impl DraftAnnotation {
                 color: marker_highlight_color(self.color),
                 stroke_width: marker_visual_stroke_width(self.stroke_width),
             })),
-            DefaultTool::Mosaic => Some(Annotation::new(AnnotationData::Mosaic {
-                rect: Rect::from_points(self.start, end),
+            DefaultTool::Mosaic => Some(Annotation::new(AnnotationData::MosaicBrush {
+                points: self.points.clone(),
                 pixel_size: mosaic_pixel_size_for_stroke(self.stroke_width),
+                stroke_width: mosaic_brush_stroke_width(self.stroke_width),
             })),
             DefaultTool::Blur => Some(Annotation::new(AnnotationData::Blur {
                 rect: Rect::from_points(self.start, end),
@@ -7679,6 +7585,13 @@ fn mosaic_pixel_size_for_stroke(stroke_width: u32) -> u32 {
     }
 }
 
+/// Footprint width of the mosaic brush stroke: a band a few pixel-blocks wide so
+/// the brushed mosaic reads as a stroke rather than a thin line. Shared by the
+/// committed annotation and the hover size-preview ring so they stay in sync.
+fn mosaic_brush_stroke_width(stroke_width: u32) -> u32 {
+    mosaic_pixel_size_for_stroke(stroke_width).saturating_mul(3).max(16)
+}
+
 fn blur_radius_for_stroke(stroke_width: u32) -> u32 {
     stroke_width.clamp(2, 24)
 }
@@ -7739,27 +7652,33 @@ struct EffectDraftPreview {
 
 #[derive(PartialEq, Eq)]
 struct EffectDraftKey {
-    is_blur: bool,
+    // 0 = mosaic rect, 1 = blur, 2 = brushed mosaic
+    kind: u8,
     x: i32,
     y: i32,
     width: i32,
     height: i32,
     strength: u32,
+    points: usize,
 }
 
 fn effect_draft_key(annotation: &Annotation) -> Option<EffectDraftKey> {
-    let (is_blur, rect, strength) = match &annotation.data {
-        AnnotationData::Mosaic { rect, pixel_size } => (false, *rect, *pixel_size),
-        AnnotationData::Blur { rect, radius } => (true, *rect, *radius),
+    let (kind, rect, strength, points) = match &annotation.data {
+        AnnotationData::Mosaic { rect, pixel_size } => (0u8, *rect, *pixel_size, 0usize),
+        AnnotationData::Blur { rect, radius } => (1, *rect, *radius, 0),
+        AnnotationData::MosaicBrush { points, pixel_size, .. } => {
+            (2, annotation.bounds(), *pixel_size, points.len())
+        }
         _ => return None,
     };
     Some(EffectDraftKey {
-        is_blur,
+        kind,
         x: rect.x.round() as i32,
         y: rect.y.round() as i32,
         width: rect.width.round() as i32,
         height: rect.height.round() as i32,
         strength,
+        points,
     })
 }
 
@@ -7829,7 +7748,7 @@ fn draw_annotation(cr: &gtk::cairo::Context, annotation: &Annotation, marker_ani
             if points.is_empty() {
                 return;
             }
-            draw_marker_fibers_preview(cr, points, *color, *stroke_width, marker_animation_time);
+            draw_marker_preview(cr, points, *color, *stroke_width, marker_animation_time);
         }
         AnnotationData::Rectangle { rect, color, stroke_width } => {
             set_cairo_color(cr, *color);
@@ -7850,7 +7769,9 @@ fn draw_annotation(cr: &gtk::cairo::Context, annotation: &Annotation, marker_ani
         // Mosaic/Blur drafts are rendered with their real effect by
         // `draw_effect_draft_preview`, so this dispatcher (used only for the live
         // draft) is never reached for them.
-        AnnotationData::Mosaic { .. } | AnnotationData::Blur { .. } => {}
+        AnnotationData::Mosaic { .. }
+        | AnnotationData::MosaicBrush { .. }
+        | AnnotationData::Blur { .. } => {}
         AnnotationData::Counter { center, number, color, radius } => {
             set_cairo_color(cr, *color);
             cr.arc(center.x as f64, center.y as f64, *radius as f64, 0.0, std::f64::consts::TAU);
@@ -7884,116 +7805,85 @@ fn marker_animation_time_seconds() -> f64 {
         .unwrap_or(0.0)
 }
 
-fn draw_marker_fibers_preview(
+fn draw_marker_preview(
     cr: &gtk::cairo::Context,
     points: &[Point],
     color: Color,
     stroke_width: u32,
     marker_animation_time: f64,
 ) {
-    draw_marker_trace_preview(cr, points, color, stroke_width);
-    for fiber in marker_fiber_layout(stroke_width) {
-        let offset_points = offset_marker_points(points, fiber.offset);
-        if offset_points.len() < 2 {
-            continue;
-        }
-        let cycle = (fiber.dash + fiber.gap).max(1.0) as f64;
-        let dash_offset =
-            -(marker_animation_time / fiber.period as f64 * cycle + fiber.phase as f64 * cycle);
-        let alpha = (color.a.min(72) as f64 / 255.0)
-            * (0.68 + fiber.opacity as f64 / 255.0 * 0.52).min(1.0);
-        let _ = cr.save();
-        cr.set_line_cap(gtk::cairo::LineCap::Round);
-        cr.set_line_join(gtk::cairo::LineJoin::Round);
-        cr.set_line_width(fiber.stroke_width as f64);
-        cr.set_dash(&[fiber.dash as f64, fiber.gap as f64], dash_offset);
-        set_cairo_color(cr, Color::rgba(color.r, color.g, color.b, (alpha * 255.0).round() as u8));
-        cr.move_to(offset_points[0].x as f64, offset_points[0].y as f64);
-        for point in offset_points.iter().skip(1) {
-            cr.line_to(point.x as f64, point.y as f64);
-        }
-        let _ = cr.stroke();
-        let _ = cr.restore();
-    }
+    draw_marker_band(cr, points, color, stroke_width);
+    draw_marker_sheen(cr, points, stroke_width, marker_animation_time);
 }
 
-fn draw_marker_trace_preview(
-    cr: &gtk::cairo::Context,
-    points: &[Point],
-    color: Color,
-    stroke_width: u32,
-) {
+/// The flat translucent highlighter band. Painted as a single stroke at one
+/// alpha so it matches the exported marker pixel-for-pixel (no fibers, no
+/// dashes) — the canvas always shows the real result.
+fn draw_marker_band(cr: &gtk::cairo::Context, points: &[Point], color: Color, stroke_width: u32) {
     if points.len() < 2 {
         return;
     }
     let _ = cr.save();
     cr.set_line_cap(gtk::cairo::LineCap::Round);
     cr.set_line_join(gtk::cairo::LineJoin::Round);
+    cr.set_line_width(stroke_width.max(1) as f64);
     cr.move_to(points[0].x as f64, points[0].y as f64);
     for point in points.iter().skip(1) {
         cr.line_to(point.x as f64, point.y as f64);
     }
-    cr.set_line_width(stroke_width as f64 + 2.0);
-    cr.set_source_rgba(
-        color.r as f64 / 255.0,
-        color.g as f64 / 255.0,
-        color.b as f64 / 255.0,
-        color.a.min(72) as f64 / 255.0 * 0.68,
-    );
-    let _ = cr.stroke_preserve();
-    cr.set_line_width(stroke_width as f64);
-    cr.set_source_rgba(
-        color.r as f64 / 255.0,
-        color.g as f64 / 255.0,
-        color.b as f64 / 255.0,
-        color.a.min(72) as f64 / 255.0 * 0.34,
+    set_cairo_color(
+        cr,
+        Color::rgba(color.r, color.g, color.b, color.a.min(MARKER_HIGHLIGHT_ALPHA)),
     );
     let _ = cr.stroke();
     let _ = cr.restore();
 }
 
-fn offset_marker_points(points: &[Point], offset: f32) -> Vec<Point> {
-    if offset.abs() <= f32::EPSILON || points.len() < 2 {
-        return points.to_vec();
+/// A soft gloss that slowly sweeps along the stroke — a purely on-canvas
+/// decoration (never exported) that keeps the highlighter "alive" without
+/// changing the flat band beneath it, so what you see still equals what you save.
+fn draw_marker_sheen(
+    cr: &gtk::cairo::Context,
+    points: &[Point],
+    stroke_width: u32,
+    marker_animation_time: f64,
+) {
+    if points.len() < 2 {
+        return;
     }
+    let first = points[0];
+    let last = *points.last().unwrap();
+    let span = (((last.x - first.x).powi(2) + (last.y - first.y).powi(2)) as f64).sqrt();
+    if span < 1.0 {
+        return;
+    }
+    // Position of the bright spot, looping slowly from one end to the other.
+    let period = 2.6;
+    let t = (marker_animation_time / period).rem_euclid(1.0).clamp(0.0001, 0.9999);
+    let half = 0.14;
+    let gradient = gtk::cairo::LinearGradient::new(
+        first.x as f64,
+        first.y as f64,
+        last.x as f64,
+        last.y as f64,
+    );
+    gradient.add_color_stop_rgba(0.0, 1.0, 1.0, 1.0, 0.0);
+    gradient.add_color_stop_rgba((t - half).max(0.0), 1.0, 1.0, 1.0, 0.0);
+    gradient.add_color_stop_rgba(t, 1.0, 1.0, 1.0, 0.20);
+    gradient.add_color_stop_rgba((t + half).min(1.0), 1.0, 1.0, 1.0, 0.0);
+    gradient.add_color_stop_rgba(1.0, 1.0, 1.0, 1.0, 0.0);
 
-    points
-        .iter()
-        .enumerate()
-        .map(|(index, point)| {
-            let mut normal_x = 0.0;
-            let mut normal_y = 0.0;
-            if index > 0 {
-                let previous = points[index - 1];
-                let dx = point.x - previous.x;
-                let dy = point.y - previous.y;
-                let length = (dx * dx + dy * dy).sqrt();
-                if length > f32::EPSILON {
-                    normal_x += -dy / length;
-                    normal_y += dx / length;
-                }
-            }
-            if index + 1 < points.len() {
-                let next = points[index + 1];
-                let dx = next.x - point.x;
-                let dy = next.y - point.y;
-                let length = (dx * dx + dy * dy).sqrt();
-                if length > f32::EPSILON {
-                    normal_x += -dy / length;
-                    normal_y += dx / length;
-                }
-            }
-            let length = (normal_x * normal_x + normal_y * normal_y).sqrt();
-            if length <= f32::EPSILON {
-                *point
-            } else {
-                Point::new(
-                    point.x + normal_x / length * offset,
-                    point.y + normal_y / length * offset,
-                )
-            }
-        })
-        .collect()
+    let _ = cr.save();
+    cr.set_line_cap(gtk::cairo::LineCap::Round);
+    cr.set_line_join(gtk::cairo::LineJoin::Round);
+    cr.set_line_width(stroke_width.max(1) as f64);
+    cr.move_to(first.x as f64, first.y as f64);
+    for point in points.iter().skip(1) {
+        cr.line_to(point.x as f64, point.y as f64);
+    }
+    let _ = cr.set_source(&gradient);
+    let _ = cr.stroke();
+    let _ = cr.restore();
 }
 
 fn draw_brush_cursor_preview(
@@ -8830,7 +8720,7 @@ mod tests {
 
     use ashot_core::{
         Annotation, AnnotationData, AppConfig, AppearanceMode, Color, DefaultTool, Document,
-        ExportFormat, MARKER_HIGHLIGHT_ALPHA, Point, Rect, ResizeHandle,
+        ExportFormat, MARKER_HIGHLIGHT_ALPHA, Point, Rect,
     };
     use ashot_ipc::APP_ID;
 
@@ -8838,25 +8728,25 @@ mod tests {
         ActiveTextEdit, Align, AppStartupBehavior, AppStartupMode, COLOR_MEMORY_BUTTON_SIZE,
         COLOR_MEMORY_SWATCH_SIZE, COLOR_ROW_LIMIT, COLOR_VALUE_BUTTON_HEIGHT,
         COLOR_VALUE_BUTTON_WIDTH, DraftAnnotation, EditorCursorKind, EditorScrollAction, HslColor,
-        PinClickAction, SELECTION_HANDLE_HIT_TOLERANCE, SIDEBAR_ACTION_BUTTON_HEIGHT,
-        SIDEBAR_ACTION_BUTTON_WIDTH, SIDEBAR_TOOL_BUTTON_HEIGHT, SIDEBAR_TOOL_BUTTON_WIDTH,
-        STROKE_MENU_BUTTON_HEIGHT, STROKE_MENU_BUTTON_WIDTH, STROKE_PREVIEW_HEIGHT,
-        STROKE_PREVIEW_WIDTH, TOOL_ICON_CANVAS_SIZE, add_favorite_color,
-        annotation_keeps_selection_after_creation, annotation_snapshot_for_draw,
-        app_startup_behavior, appearance_color_scheme, appearance_mode_from_index,
-        appearance_mode_index, appearance_mode_labels, apply_export_extension, arrow_head_geometry,
-        arrow_head_points, arrow_shape_geometry, arrow_visual_stroke_width, blur_radius_for_stroke,
-        capture_should_use_fresh_anchor, clamp_magnifier_zoom, clamp_text_size, crop_image_region,
-        cursor_name_for_resize_handle, cursor_name_for_surface_edge, draft_preview_for_draw,
-        draft_tool_can_draw, editor_adjustment_value_after_scroll, editor_base_surface,
-        editor_color_palette, editor_cursor_for_tool, editor_cursor_kind_for_tool,
-        editor_favorite_palette, editor_initial_scale, editor_initial_size, editor_scroll_action,
-        editor_status_text, editor_stroke_widths, editor_tool_layout, editor_view_size,
-        editor_zoom_anchor_adjustment_value, editor_zoom_from_scroll, extract_ocr_install_command,
-        eyedropper_magnifier_point, filter_font_families, filter_ocr_symbols, fit_scale,
-        font_family_preview_markup, font_family_row_content_halign, font_family_row_fixed_height,
-        font_family_row_text_xalign, format_magnifier_zoom, hsl_to_color, hsv_to_color,
-        image_color_at, magnifier_geometry, magnifier_size_for_zoom, mosaic_pixel_size_for_stroke,
+        PinClickAction, SIDEBAR_ACTION_BUTTON_HEIGHT, SIDEBAR_ACTION_BUTTON_WIDTH,
+        SIDEBAR_TOOL_BUTTON_HEIGHT, SIDEBAR_TOOL_BUTTON_WIDTH, STROKE_MENU_BUTTON_HEIGHT,
+        STROKE_MENU_BUTTON_WIDTH, STROKE_PREVIEW_HEIGHT, STROKE_PREVIEW_WIDTH,
+        TOOL_ICON_CANVAS_SIZE, add_favorite_color, annotation_keeps_selection_after_creation,
+        annotation_snapshot_for_draw, app_startup_behavior, appearance_color_scheme,
+        appearance_mode_from_index, appearance_mode_index, appearance_mode_labels,
+        apply_export_extension, arrow_head_geometry, arrow_head_points, arrow_shape_geometry,
+        arrow_visual_stroke_width, blur_radius_for_stroke, capture_should_use_fresh_anchor,
+        clamp_magnifier_zoom, clamp_text_size, crop_image_region, cursor_name_for_surface_edge,
+        draft_preview_for_draw, draft_tool_can_draw, editor_adjustment_value_after_scroll,
+        editor_base_surface, editor_color_palette, editor_cursor_for_tool,
+        editor_cursor_kind_for_tool, editor_favorite_palette, editor_initial_scale,
+        editor_initial_size, editor_scroll_action, editor_status_text, editor_stroke_widths,
+        editor_tool_layout, editor_view_size, editor_zoom_anchor_adjustment_value,
+        editor_zoom_from_scroll, extract_ocr_install_command, eyedropper_magnifier_point,
+        filter_font_families, filter_ocr_symbols, fit_scale, font_family_preview_markup,
+        font_family_row_content_halign, font_family_row_fixed_height, font_family_row_text_xalign,
+        format_magnifier_zoom, hsl_to_color, hsv_to_color, image_color_at, magnifier_geometry,
+        magnifier_size_for_zoom, mosaic_brush_stroke_width, mosaic_pixel_size_for_stroke,
         moving_delta_and_update, next_pin_scale_save_generation, normalized_save_filename,
         ocr_language_label, ocr_result_body_text, ocr_result_primary_action, ocr_result_title,
         ocr_space_curl_args, ocr_space_language_arg, output_action_menu_items,
@@ -8868,14 +8758,14 @@ mod tests {
         pin_viewer_launch_command, pin_viewer_launcher_check_command, pin_window_policy,
         pin_window_size, pin_window_size_for_scale, pin_window_tag, pin_zoom_from_scroll,
         pin_zoom_geometry, push_recent_color, remove_favorite_color, render_document_png_bytes,
-        resize_handle_at, rgb_to_hsl, rgb_to_hsv, rgba_color_at,
-        save_editor_document_to_dir_with_filename, scaled_canvas_point, selected_annotation_bounds,
-        set_active_text_edit, set_editor_image_source, startup_mode_from_args,
+        rgb_to_hsl, rgb_to_hsv, rgba_color_at, save_editor_document_to_dir_with_filename,
+        scaled_canvas_point, set_active_text_edit, set_editor_image_source, startup_mode_from_args,
         suggested_save_filename_at, take_active_text_edit, tesseract_command_args,
         tesseract_command_invocation, text_controls_width, text_font_button_width,
         text_for_annotation, text_size_button_width, text_size_options, text_size_wheel_options,
         tool_can_select_existing, tool_for_digit, tool_icon_label, tool_icon_stroke_width,
-        tool_picks_canvas_color, update_ocr_language_selection,
+        tool_picks_canvas_color, tool_uses_color, tool_uses_size, tool_uses_text,
+        update_ocr_language_selection,
     };
 
     use chrono::{Local, TimeZone};
@@ -9331,7 +9221,7 @@ mod tests {
     }
 
     #[test]
-    fn mosaic_uses_stroke_dropdown_as_effect_strength() {
+    fn mosaic_is_a_brush_that_pixelates_along_the_stroke() {
         assert_eq!(mosaic_pixel_size_for_stroke(2), 6);
         assert_eq!(mosaic_pixel_size_for_stroke(4), 10);
         assert_eq!(mosaic_pixel_size_for_stroke(8), 20);
@@ -9343,11 +9233,50 @@ mod tests {
             Color::rgba(232, 62, 38, 255),
             12,
         );
+        // The mosaic tool now accumulates the painted path like a brush.
+        draft.extend(Point::new(35.0, 50.0));
         draft.extend(Point::new(60.0, 80.0));
 
         let preview = draft.preview_annotation().expect("mosaic preview");
 
-        assert!(matches!(preview.data, AnnotationData::Mosaic { pixel_size: 28, .. }));
+        assert!(matches!(
+            preview.data,
+            AnnotationData::MosaicBrush { pixel_size: 28, ref points, .. } if points.len() >= 3
+        ));
+    }
+
+    #[test]
+    fn tool_control_sensitivity_matrix() {
+        // Effect tools have no color; text/ocr/color-picker have no size dropdown;
+        // only Select and Text use the text controls.
+        assert!(!tool_uses_color(DefaultTool::Mosaic));
+        assert!(!tool_uses_color(DefaultTool::Blur));
+        assert!(tool_uses_color(DefaultTool::Brush));
+        assert!(tool_uses_color(DefaultTool::Counter));
+
+        assert!(!tool_uses_size(DefaultTool::Text));
+        assert!(!tool_uses_size(DefaultTool::ColorPicker));
+        assert!(tool_uses_size(DefaultTool::Mosaic));
+        assert!(tool_uses_size(DefaultTool::Brush));
+
+        assert!(!tool_uses_text(DefaultTool::Brush));
+        assert!(!tool_uses_text(DefaultTool::Mosaic));
+        assert!(tool_uses_text(DefaultTool::Text));
+
+        // Select edits any annotation, so every control group stays enabled.
+        assert!(tool_uses_color(DefaultTool::Select));
+        assert!(tool_uses_size(DefaultTool::Select));
+        assert!(tool_uses_text(DefaultTool::Select));
+    }
+
+    #[test]
+    fn mosaic_brush_cursor_width_matches_draft() {
+        // The hover size-ring must use the same footprint formula as the committed
+        // brush stroke so the preview matches what gets painted.
+        for stroke in [1u32, 4, 8, 12, 16] {
+            let expected = mosaic_pixel_size_for_stroke(stroke).saturating_mul(3).max(16);
+            assert_eq!(mosaic_brush_stroke_width(stroke), expected);
+        }
     }
 
     #[test]
@@ -9407,101 +9336,6 @@ mod tests {
     }
 
     #[test]
-    fn resize_handle_hit_testing_uses_selected_bounds() {
-        let mut document = Document::new(120, 80, DefaultTool::Select);
-        let annotation = Annotation::new(AnnotationData::Rectangle {
-            rect: Rect { x: 10.0, y: 20.0, width: 40.0, height: 30.0 },
-            color: Color::rgba(255, 0, 0, 255),
-            stroke_width: 4,
-        });
-        let id = annotation.id;
-        document.add_annotation(annotation);
-        document.selected = Some(id);
-
-        assert_eq!(
-            resize_handle_at(&document, Point::new(50.0, 50.0), 6.0),
-            Some(ResizeHandle::BottomRight)
-        );
-        assert_eq!(resize_handle_at(&document, Point::new(30.0, 35.0), 6.0), None);
-    }
-
-    #[test]
-    fn line_resize_hit_testing_ignores_line_middle() {
-        let mut document = Document::new(160, 90, DefaultTool::Select);
-        let annotation = Annotation::new(AnnotationData::Line {
-            start: Point::new(20.0, 40.0),
-            end: Point::new(120.0, 40.0),
-            color: Color::rgba(255, 0, 0, 255),
-            stroke_width: 4,
-        });
-        let id = annotation.id;
-        document.add_annotation(annotation);
-        document.selected = Some(id);
-
-        assert_eq!(
-            resize_handle_at(&document, Point::new(70.0, 40.0), SELECTION_HANDLE_HIT_TOLERANCE),
-            None
-        );
-        assert_eq!(
-            resize_handle_at(&document, Point::new(20.0, 40.0), SELECTION_HANDLE_HIT_TOLERANCE),
-            Some(ResizeHandle::Left)
-        );
-    }
-
-    #[test]
-    fn selection_overlay_is_only_shown_for_resizable_annotations() {
-        let mut document = Document::new(120, 80, DefaultTool::Select);
-        let brush = Annotation::new(AnnotationData::Brush {
-            points: vec![Point::new(10.0, 20.0), Point::new(50.0, 50.0)],
-            color: Color::rgba(255, 0, 0, 255),
-            stroke_width: 4,
-        });
-        let brush_id = brush.id;
-        document.add_annotation(brush);
-        document.selected = Some(brush_id);
-        assert_eq!(selected_annotation_bounds(&document), None);
-
-        let marker = Annotation::new(AnnotationData::Marker {
-            points: vec![Point::new(15.0, 25.0), Point::new(55.0, 65.0)],
-            color: Color::rgba(255, 220, 0, 96),
-            stroke_width: 12,
-        });
-        let marker_id = marker.id;
-        document.add_annotation(marker);
-        document.selected = Some(marker_id);
-        assert_eq!(selected_annotation_bounds(&document), None);
-
-        let text = Annotation::new(AnnotationData::Text {
-            origin: Point::new(12.0, 18.0),
-            text: "note".into(),
-            style: ashot_core::TextStyle {
-                size: 20,
-                weight: ashot_core::TextWeight::Bold,
-                color: Color::rgba(255, 255, 255, 255),
-                family: None,
-            },
-        });
-        let text_id = text.id;
-        document.add_annotation(text);
-        document.selected = Some(text_id);
-        assert!(selected_annotation_bounds(&document).is_some());
-        assert_eq!(
-            resize_handle_at(&document, Point::new(12.0, 18.0), SELECTION_HANDLE_HIT_TOLERANCE),
-            None
-        );
-
-        let rect = Annotation::new(AnnotationData::Rectangle {
-            rect: Rect { x: 10.0, y: 20.0, width: 40.0, height: 30.0 },
-            color: Color::rgba(255, 0, 0, 255),
-            stroke_width: 4,
-        });
-        let rect_id = rect.id;
-        document.add_annotation(rect);
-        document.selected = Some(rect_id);
-        assert!(selected_annotation_bounds(&document).is_some());
-    }
-
-    #[test]
     fn non_resizable_annotations_do_not_keep_selection_after_creation() {
         let brush = Annotation::new(AnnotationData::Brush {
             points: vec![Point::new(10.0, 20.0), Point::new(50.0, 50.0)],
@@ -9522,24 +9356,6 @@ mod tests {
         assert!(!annotation_keeps_selection_after_creation(&brush));
         assert!(!annotation_keeps_selection_after_creation(&marker));
         assert!(annotation_keeps_selection_after_creation(&rect));
-    }
-
-    #[test]
-    fn resize_handles_use_a_larger_default_hit_target() {
-        let mut document = Document::new(120, 80, DefaultTool::Select);
-        let annotation = Annotation::new(AnnotationData::Rectangle {
-            rect: Rect { x: 10.0, y: 20.0, width: 40.0, height: 30.0 },
-            color: Color::rgba(255, 0, 0, 255),
-            stroke_width: 4,
-        });
-        let id = annotation.id;
-        document.add_annotation(annotation);
-        document.selected = Some(id);
-
-        assert_eq!(
-            resize_handle_at(&document, Point::new(58.5, 58.5), SELECTION_HANDLE_HIT_TOLERANCE),
-            Some(ResizeHandle::BottomRight)
-        );
     }
 
     #[test]
@@ -9624,15 +9440,6 @@ mod tests {
         assert_eq!(editor_cursor_for_tool(DefaultTool::Arrow), Some("crosshair"));
         assert_eq!(editor_cursor_for_tool(DefaultTool::Rectangle), Some("crosshair"));
         assert_eq!(editor_cursor_for_tool(DefaultTool::Ocr), Some("crosshair"));
-    }
-
-    #[test]
-    fn resize_handles_map_to_directional_cursors() {
-        assert_eq!(cursor_name_for_resize_handle(ResizeHandle::TopLeft), "nwse-resize");
-        assert_eq!(cursor_name_for_resize_handle(ResizeHandle::BottomRight), "nwse-resize");
-        assert_eq!(cursor_name_for_resize_handle(ResizeHandle::TopRight), "nesw-resize");
-        assert_eq!(cursor_name_for_resize_handle(ResizeHandle::Left), "ew-resize");
-        assert_eq!(cursor_name_for_resize_handle(ResizeHandle::Bottom), "ns-resize");
     }
 
     #[test]
